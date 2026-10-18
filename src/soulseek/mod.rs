@@ -12,4 +12,7 @@ mod types;
 
 pub use client::SoulseekClient;
 pub use download::rank_search_results;
-pub use types::{ConnectionState, Download, RankedFile, SearchResult, SoulseekConfig};
+pub use types::{
+    ConnectionState, Download, DownloadState, RankedFile, SearchPrefs, SearchResult,
+    SoulseekConfig,
+};

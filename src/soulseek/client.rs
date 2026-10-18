@@ -281,16 +281,40 @@ impl SoulseekClient {
             }
         }
 
-        // connect to the uploader and queue the file on its side
-        self.peer.start_download(id);
+        // starts now if a slot is free, otherwise waits its turn
+        self.schedule().await;
 
         Ok(id)
+    }
+
+    /// Starts waiting downloads while fewer than the limit are running, in list order
+    pub async fn schedule(&self) {
+        for id in self.download_manager.take_startable().await {
+            // connect to the uploader and queue the file on its side
+            self.peer.start_download(id);
+        }
+    }
+
+    pub async fn set_max_concurrent(&self, n: usize) {
+        self.download_manager.set_max_concurrent(n);
+        self.schedule().await;
+    }
+
+    pub async fn move_download(&self, id: u32, up: bool) {
+        self.download_manager.move_download(id, up).await;
     }
 
     /// cancel a download
     pub async fn cancel_download(&self, id: u32) {
         self.peer.cancel(id).await;
         self.download_manager.cancel_download(id).await;
+    }
+
+    /// cancel a download if it's still running, then drop it from the list
+    pub async fn remove_download(&self, id: u32) {
+        self.cancel_download(id).await;
+        self.download_manager.remove(id).await;
+        self.peer.prune().await;
     }
 
     /// clear finished downloads

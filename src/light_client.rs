@@ -1,6 +1,6 @@
 use super::server::RunStatus;
-use zbus::Result;
 use zbus::proxy;
+use zbus::Result;
 
 #[proxy(
     interface = "org.zbus.mplayerServer",

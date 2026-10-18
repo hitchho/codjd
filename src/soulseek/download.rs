@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use super::types::{Download, DownloadState, RankedFile, SearchResult};
+use super::types::{Download, DownloadState, RankedFile, SearchPrefs, SearchResult};
 
 /// events sent from download manager to UI
 #[derive(Debug, Clone)]
@@ -34,8 +34,12 @@ pub struct DownloadManager {
     event_tx: Option<mpsc::UnboundedSender<DownloadEvent>>,
     /// our username for peer connections
     username: String,
-    /// max concurrent downloads
-    max_concurrent: usize,
+    /// max downloads started at once; the rest wait in list order
+    max_concurrent: std::sync::atomic::AtomicUsize,
+    /// list order set by the user, new downloads at the end
+    order: RwLock<Vec<u32>>,
+    /// downloads that have been handed to the peer code
+    started: RwLock<std::collections::HashSet<u32>>,
 }
 
 impl DownloadManager {
@@ -46,7 +50,9 @@ impl DownloadManager {
             download_dir,
             event_tx: None,
             username,
-            max_concurrent: 3,
+            max_concurrent: std::sync::atomic::AtomicUsize::new(3),
+            order: RwLock::new(Vec::new()),
+            started: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -81,8 +87,47 @@ impl DownloadManager {
             let mut downloads = self.downloads.write().await;
             downloads.insert(id, download);
         }
+        self.order.write().await.push(id);
 
         id
+    }
+
+    pub fn set_max_concurrent(&self, n: usize) {
+        self.max_concurrent.store(n.max(1), Ordering::SeqCst);
+    }
+
+    /// Waiting downloads that may start now, topmost first, marked as started
+    pub async fn take_startable(&self) -> Vec<u32> {
+        let downloads = self.downloads.read().await;
+        let order = self.order.read().await;
+        let mut started = self.started.write().await;
+        let running = started
+            .iter()
+            .filter(|id| downloads.get(id).is_some_and(|d| d.is_active()))
+            .count();
+        let free = self.max_concurrent.load(Ordering::SeqCst).saturating_sub(running);
+        let picked: Vec<u32> = order
+            .iter()
+            .filter(|id| !started.contains(id))
+            .filter(|id| downloads.get(id).is_some_and(|d| d.is_active()))
+            .take(free)
+            .copied()
+            .collect();
+        started.extend(picked.iter().copied());
+        picked
+    }
+
+    /// Moves a download one place up (true) or down in the list
+    pub async fn move_download(&self, id: u32, up: bool) {
+        let mut order = self.order.write().await;
+        let Some(pos) = order.iter().position(|&i| i == id) else {
+            return;
+        };
+        if up && pos > 0 {
+            order.swap(pos, pos - 1);
+        } else if !up && pos + 1 < order.len() {
+            order.swap(pos, pos + 1);
+        }
     }
 
     /// cancel a download
@@ -96,31 +141,30 @@ impl DownloadManager {
         }
     }
 
+    /// drop one download from the list
+    pub async fn remove(&self, id: u32) {
+        self.downloads.write().await.remove(&id);
+        self.order.write().await.retain(|&i| i != id);
+        self.started.write().await.remove(&id);
+    }
+
     /// remove completed/failed downloads from list
     pub async fn clear_finished(&self) {
         let mut downloads = self.downloads.write().await;
         downloads.retain(|_, dl| dl.is_active());
+        self.order.write().await.retain(|id| downloads.contains_key(id));
+        self.started.write().await.retain(|id| downloads.contains_key(id));
     }
 
     /// get all downloads for display
     pub async fn get_downloads(&self) -> Vec<Download> {
+        // in the user's order, which is also the order waiting downloads start in
         let downloads = self.downloads.read().await;
-        let mut list: Vec<_> = downloads.values().cloned().collect();
-        // sort by state (active first), then by quality
-        list.sort_by(|a, b| {
-            let state_ord = |s: DownloadState| match s {
-                DownloadState::Downloading => 0,
-                DownloadState::Connecting => 1,
-                DownloadState::Pending => 2,
-                DownloadState::Complete => 3,
-                DownloadState::Failed => 4,
-                DownloadState::Cancelled => 5,
-            };
-            state_ord(a.state)
-                .cmp(&state_ord(b.state))
-                .then(b.quality_score.cmp(&a.quality_score))
-        });
-        list
+        let order = self.order.read().await;
+        order
+            .iter()
+            .filter_map(|id| downloads.get(id).cloned())
+            .collect()
     }
 
     /// get a specific download
@@ -178,25 +222,44 @@ impl DownloadManager {
 }
 
 /// rank and sort search results by quality
-pub fn rank_search_results(results: &[SearchResult]) -> Vec<RankedFile> {
+pub fn rank_search_results(results: &[SearchResult], prefs: &SearchPrefs) -> Vec<RankedFile> {
     let mut ranked: Vec<RankedFile> = Vec::new();
 
     for result in results {
         for file in &result.files {
-            // skip non-audio files
-            let ext = file.extension().unwrap_or("");
-            if !matches!(
-                ext.to_lowercase().as_str(),
-                "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wav" | "wma"
-            ) {
+            let ext = file.extension().unwrap_or("").to_lowercase();
+            let quality_score = if prefs.formats.is_empty() {
+                // skip non-audio files
+                if !matches!(
+                    ext.as_str(),
+                    "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wav" | "wma"
+                ) {
+                    continue;
+                }
+                file.quality_score()
+            } else {
+                // only the configured formats, ranked by their position in the list
+                let Some(pos) = prefs.formats.iter().position(|f| f.eq_ignore_ascii_case(&ext))
+                else {
+                    continue;
+                };
+                (prefs.formats.len() - pos) as u32 * 1000 + file.quality_points()
+            };
+
+            if prefs.min_bitrate > 0
+                && !file.format().is_lossless()
+                && file.bitrate > 0
+                && file.bitrate < prefs.min_bitrate
+            {
+                continue;
+            }
+            if prefs.max_size_mb > 0 && file.size > prefs.max_size_mb as u64 * 1024 * 1024 {
                 continue;
             }
 
-            let quality_score = file.quality_score();
-
             // bonus for free slots and fast upload
             let mut adjusted_score = quality_score;
-            if result.free_slots {
+            if result.free_slots && prefs.prefer_free_slots {
                 adjusted_score += 50;
             }
             if result.upload_speed > 100_000 {
@@ -221,4 +284,152 @@ pub fn rank_search_results(results: &[SearchResult]) -> Vec<RankedFile> {
     ranked.sort_by(|a, b| b.quality_score.cmp(&a.quality_score));
 
     ranked
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn file(name: &str, bitrate: u32, size_mb: u64) -> SharedFile {
+        SharedFile {
+            filename: format!("Music\\{}", name),
+            size: size_mb * 1024 * 1024,
+            bitrate,
+            ..Default::default()
+        }
+    }
+
+    fn result(user: &str, free_slots: bool, files: Vec<SharedFile>) -> SearchResult {
+        SearchResult {
+            username: user.to_string(),
+            token: 1,
+            files,
+            free_slots,
+            upload_speed: 0,
+            queue_size: 1,
+        }
+    }
+
+    fn names(ranked: &[RankedFile]) -> Vec<&str> {
+        ranked.iter().map(|r| r.file.basename()).collect()
+    }
+
+    #[test]
+    fn default_prefs_keep_builtin_ranking() {
+        let results = vec![result(
+            "a",
+            false,
+            vec![file("a.mp3", 320, 8), file("b.flac", 0, 30), file("c.txt", 0, 1)],
+        )];
+        let ranked = rank_search_results(&results, &SearchPrefs::default());
+        assert_eq!(names(&ranked), vec!["b.flac", "a.mp3"]);
+    }
+
+    #[test]
+    fn format_list_filters_and_orders() {
+        let results = vec![result(
+            "a",
+            false,
+            vec![file("a.flac", 0, 30), file("b.mp3", 320, 8), file("c.m4a", 256, 8)],
+        )];
+        let prefs = SearchPrefs {
+            formats: vec!["mp3".into(), "flac".into()],
+            ..Default::default()
+        };
+        // mp3 first because it's first in the list, m4a dropped
+        assert_eq!(names(&rank_search_results(&results, &prefs)), vec!["b.mp3", "a.flac"]);
+    }
+
+    #[test]
+    fn min_bitrate_and_max_size() {
+        let results = vec![result(
+            "a",
+            false,
+            vec![
+                file("low.mp3", 128, 4),
+                file("ok.mp3", 320, 8),
+                file("unknown.mp3", 0, 8),
+                file("big.flac", 0, 120),
+                file("lossless.flac", 0, 30),
+            ],
+        )];
+        let prefs = SearchPrefs {
+            min_bitrate: 256,
+            max_size_mb: 100,
+            ..Default::default()
+        };
+        let ranked = rank_search_results(&results, &prefs);
+        let mut got = names(&ranked);
+        got.sort();
+        // 128k dropped, unknown bitrate and lossless kept, >100MB dropped
+        assert_eq!(got, vec!["lossless.flac", "ok.mp3", "unknown.mp3"]);
+    }
+
+    #[test]
+    fn free_slot_bonus_can_be_turned_off() {
+        let results = vec![
+            result("busy", false, vec![file("x.mp3", 320, 8)]),
+            result("free", true, vec![file("x.mp3", 320, 8)]),
+        ];
+        let on = rank_search_results(&results, &SearchPrefs::default());
+        assert_eq!(on[0].username, "free");
+        let off = rank_search_results(
+            &results,
+            &SearchPrefs {
+                prefer_free_slots: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(off[0].quality_score, off[1].quality_score);
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn ranked(name: &str) -> RankedFile {
+        RankedFile {
+            file: SharedFile {
+                filename: name.to_string(),
+                ..Default::default()
+            },
+            username: "u".to_string(),
+            free_slots: true,
+            upload_speed: 0,
+            queue_size: 0,
+            quality_score: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_up_to_limit_in_list_order() {
+        let dm = DownloadManager::new(std::env::temp_dir(), "me".into());
+        dm.set_max_concurrent(2);
+        let a = dm.queue_download(&ranked("a.mp3")).await;
+        let b = dm.queue_download(&ranked("b.mp3")).await;
+        let c = dm.queue_download(&ranked("c.mp3")).await;
+        let d = dm.queue_download(&ranked("d.mp3")).await;
+
+        // d moved to the top before anything starts
+        for _ in 0..3 {
+            dm.move_download(d, true).await;
+        }
+        let order: Vec<u32> = dm.get_downloads().await.iter().map(|x| x.id).collect();
+        assert_eq!(order, vec![d, a, b, c]);
+
+        assert_eq!(dm.take_startable().await, vec![d, a]);
+        // both slots taken
+        assert!(dm.take_startable().await.is_empty());
+
+        // a finishes, the next waiting one (b) gets its slot
+        dm.downloads.write().await.get_mut(&a).unwrap().state = DownloadState::Complete;
+        assert_eq!(dm.take_startable().await, vec![b]);
+
+        // removing a running one frees its slot too
+        dm.remove(d).await;
+        assert_eq!(dm.take_startable().await, vec![c]);
+    }
 }

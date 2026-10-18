@@ -130,6 +130,16 @@ enum PlayAction {
     Play,
     RenamePlaylist(String, String),
     RemovePlaylist(String),
+    /// a new file appeared in the library folder (e.g. a finished download)
+    AddMusic(PathBuf),
+    /// queue the playlist track at this index, at the front ("play next") or the end
+    QueueAdd(u32, bool),
+    QueueRemove(u32),
+    /// move a queued track one place up (true) or down
+    QueueMove(u32, bool),
+    /// play a queued track now, taking it out of the queue
+    QueuePlay(u32),
+    GetQueue,
 }
 
 #[derive(
@@ -194,10 +204,18 @@ impl Music {
                             genre: String::from(genre),
                         };
                     }
-                    None => Self::default(),
+                    // no tags: still playable, clients show the file name as title
+                    None => Self {
+                        length: tags_read.properties().duration(),
+                        path: FilePath::from(path),
+                        ..Self::default()
+                    },
                 }
             }
-            Err(_) => Self::default(),
+            Err(_) => Self {
+                path: FilePath::from(path),
+                ..Self::default()
+            },
         }
     }
 
@@ -598,6 +616,7 @@ enum Response {
     PlayingStatus(PlayingStatus),
     PlayerStatus(PlayerStatus),
     Playlists(HashMap<String, Playlist>),
+    Queue(Vec<Music>),
 }
 
 struct Player {
@@ -611,13 +630,18 @@ struct Player {
     soulseek_ranked: Vec<crate::soulseek::RankedFile>,
     soulseek_search_token: Option<u32>,
     soulseek_max_results: usize,
+    soulseek_prefs: crate::soulseek::SearchPrefs,
+    soulseek_max_concurrent: usize,
 }
 
 // methods
 #[interface(name = "org.zbus.mplayerServer")]
 impl<'a> Player {
     async fn reload_config(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
-        let config = Config::try_from_env().unwrap_or_default();
+        let config = Config::try_from_env().unwrap_or_else(|e| {
+            eprintln!("{e}\nfalling back to the default config (no music path)");
+            Config::default()
+        });
         // ---------------------------------------------------------------
         self.sender.send(PlayAction::ReloadConfig(config)).unwrap();
         self.config_reloaded(emitter).await.unwrap();
@@ -630,6 +654,10 @@ impl<'a> Player {
     #[zbus(signal)]
     #[allow(unused)]
     async fn config_reloaded(&self, emitter: SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// a finished download was added to the library, clients can select it
+    #[zbus(signal)]
+    async fn music_added(emitter: &SignalEmitter<'_>, path: &str) -> zbus::Result<()>;
 
     #[zbus(signal)]
     #[allow(unused)]
@@ -927,6 +955,50 @@ impl<'a> Player {
         self.sender.send(PlayAction::PlayFromIndex(index)).unwrap();
         self.music_played(emitter).await.unwrap();
         RunStatus::ok()
+    }
+
+    /// queue the playlist track at `index`; `front` makes it play next
+    async fn queue_add(&mut self, index: u32, front: bool) -> RunStatus {
+        self.sender.send(PlayAction::QueueAdd(index, front)).unwrap();
+        RunStatus::ok()
+    }
+
+    async fn queue_remove(&mut self, pos: u32) -> RunStatus {
+        self.sender.send(PlayAction::QueueRemove(pos)).unwrap();
+        RunStatus::ok()
+    }
+
+    /// move the queued track at `pos` one place up or down
+    async fn queue_move(&mut self, pos: u32, up: bool) -> RunStatus {
+        self.sender.send(PlayAction::QueueMove(pos, up)).unwrap();
+        RunStatus::ok()
+    }
+
+    /// play the queued track at `pos` now
+    async fn queue_play(
+        &mut self,
+        pos: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> RunStatus {
+        self.sender.send(PlayAction::QueuePlay(pos)).unwrap();
+        self.music_played(emitter).await.unwrap();
+        RunStatus::ok()
+    }
+
+    async fn get_queue(&mut self) -> Vec<Music> {
+        self.sender.send(PlayAction::GetQueue).unwrap_or_default();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            match self.response_reciver.recv().await {
+                Some(Response::Queue(queue)) => queue,
+                Some(other) => {
+                    error!(response=?other, "Got unexpected response");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn playlist(&mut self) -> Playlist {
@@ -1331,6 +1403,7 @@ impl<'a> Player {
         server_port: u32,
         listen_port: u32,
         max_results: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
         use crate::soulseek::{SoulseekClient, SoulseekConfig};
         use std::path::PathBuf;
@@ -1377,6 +1450,12 @@ impl<'a> Player {
                     if response.success {
                         let client_clone = Arc::clone(&client);
                         client_clone.spawn_receiver();
+                        client.set_max_concurrent(self.soulseek_max_concurrent).await;
+                        spawn_download_watcher(
+                            Arc::clone(&client),
+                            self.sender.clone(),
+                            emitter.to_owned(),
+                        );
                         self.soulseek_max_results = max_results;
                         self.soulseek = Some(client);
                         if response.is_new_account() {
@@ -1440,7 +1519,8 @@ impl<'a> Player {
             let results = client.get_search_results(token).await;
             if !results.is_empty() {
                 self.soulseek_results = results;
-                self.soulseek_ranked = rank_search_results(&self.soulseek_results);
+                self.soulseek_ranked =
+                    rank_search_results(&self.soulseek_results, &self.soulseek_prefs);
             }
         }
         self.soulseek_ranked
@@ -1484,6 +1564,56 @@ impl<'a> Player {
         if let Some(client) = &self.soulseek {
             client.cancel_download(id).await;
             "cancelled".to_string()
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// set how search results are filtered and ranked (see SearchPrefs); applies to the next
+    /// results fetch
+    async fn slsk_set_preferences(
+        &mut self,
+        formats: Vec<String>,
+        min_bitrate: u32,
+        max_size_mb: u32,
+        prefer_free_slots: bool,
+        max_concurrent_downloads: u32,
+    ) -> String {
+        self.soulseek_max_concurrent = (max_concurrent_downloads as usize).max(1);
+        if let Some(client) = &self.soulseek {
+            client.set_max_concurrent(self.soulseek_max_concurrent).await;
+        }
+        self.soulseek_prefs = crate::soulseek::SearchPrefs {
+            formats: formats
+                .into_iter()
+                .map(|f| f.trim().trim_start_matches('.').to_lowercase())
+                .filter(|f| !f.is_empty())
+                .collect(),
+            min_bitrate,
+            max_size_mb,
+            prefer_free_slots,
+        };
+        // re-rank what we already have
+        self.soulseek_ranked =
+            crate::soulseek::rank_search_results(&self.soulseek_results, &self.soulseek_prefs);
+        "preferences set".to_string()
+    }
+
+    /// move a download one place up or down; waiting downloads start in list order
+    async fn slsk_move_download(&self, id: u32, up: bool) -> String {
+        if let Some(client) = &self.soulseek {
+            client.move_download(id, up).await;
+            "moved".to_string()
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// cancel a download if it's running and remove it from the list
+    async fn slsk_remove_download(&self, id: u32) -> String {
+        if let Some(client) = &self.soulseek {
+            client.remove_download(id).await;
+            "removed".to_string()
         } else {
             "not connected".to_string()
         }
@@ -1562,13 +1692,18 @@ impl Server {
                 soulseek_ranked: Vec::new(),
                 soulseek_search_token: None,
                 soulseek_max_results: 50,
+                soulseek_prefs: Default::default(),
+                soulseek_max_concurrent: 3,
             },
         }
     }
 
     #[instrument(name = "AudioThread", skip_all)]
     pub async fn default() -> Self {
-        let config = Config::try_from_env().unwrap_or_default();
+        let config = Config::try_from_env().unwrap_or_else(|e| {
+            eprintln!("{e}\nfalling back to the default config (no music path)");
+            Config::default()
+        });
         let playlist = Playlist::from_config(&config);
 
         let (sender, reciver) = tokio::sync::mpsc::unbounded_channel::<PlayAction>();
@@ -1592,6 +1727,8 @@ impl Server {
                 soulseek_ranked: Vec::new(),
                 soulseek_search_token: None,
                 soulseek_max_results: 50,
+                soulseek_prefs: Default::default(),
+                soulseek_max_concurrent: 3,
             },
         }
     }
@@ -1744,6 +1881,30 @@ impl Playlist {
         playlist
     }
 
+    /// Adds a file to the list in sort order, keeping the playing track playing. Returns false if
+    /// it's already listed.
+    fn add_music(&mut self, path: PathBuf) -> bool {
+        let music = Music::from_path(path);
+        if self.musics.iter().any(|m| m.path == music.path) {
+            return false;
+        }
+        let playing = self
+            .musics
+            .get(self.playing_index as usize)
+            .map(|m| m.path.clone());
+        self.musics.push(music);
+        if !matches!(self.sort, Sort::Shuffle) {
+            let sort = self.sort;
+            self.musics.sort_by(|a, b| a.compare_by(sort, b));
+        }
+        if let Some(playing) = playing {
+            if let Some(i) = self.musics.iter().position(|m| m.path == playing) {
+                self.playing_index = i as u32;
+            }
+        }
+        true
+    }
+
     fn reload_from_config(&mut self, cfg: &Config) {
         let mut playlist = Self::visit_dirs(&PathBuf::from_str(&cfg.path).unwrap(), cfg);
         playlist.sort(cfg.sort);
@@ -1833,6 +1994,48 @@ enum FileFormat {
     Flac,
     #[serde(alias = "webm", alias = "WEBM")]
     Webm,
+}
+
+/// Whether the file's extension is one of the configured formats (any file when unset)
+fn format_allowed(path: &std::path::Path, allow_formats: &Option<Vec<FileFormat>>) -> bool {
+    let Some(formats) = allow_formats else {
+        return true;
+    };
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    formats.iter().any(|f| f.to_str().eq_ignore_ascii_case(ext))
+}
+
+/// Adds finished soulseek downloads to the library and tells clients, until disconnected
+fn spawn_download_watcher(
+    client: std::sync::Arc<crate::soulseek::SoulseekClient>,
+    sender: UnboundedSender<PlayAction>,
+    emitter: SignalEmitter<'static>,
+) {
+    use crate::soulseek::{ConnectionState, DownloadState};
+    tokio::spawn(async move {
+        let mut added = std::collections::HashSet::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if client.state().await == ConnectionState::Disconnected {
+                break;
+            }
+            // a finished download frees a slot for the next waiting one
+            client.schedule().await;
+            for dl in client.get_downloads().await {
+                if dl.state == DownloadState::Complete && added.insert(dl.id) {
+                    // the action is queued before the signal, so a client that fetches the
+                    // playlist on the signal already sees the new music
+                    if sender.send(PlayAction::AddMusic(dl.local_path.clone())).is_err() {
+                        return;
+                    }
+                    let path = dl.local_path.to_string_lossy();
+                    let _ = Player::music_added(&emitter, &path).await;
+                }
+            }
+        }
+    });
 }
 
 impl FileFormat {
@@ -1933,6 +2136,7 @@ pub enum Repeat {
     /// cyclye through all the playlist
     AllMusics,
     /// stop after the currently playing music
+    #[serde(alias = "None")]
     Dont,
 }
 
@@ -1962,6 +2166,11 @@ struct AudioThread {
     data_sender: UnboundedSender<Response>,
     extra: Extra,
     playlist_save_path: String,
+    allow_formats: Option<Vec<FileFormat>>,
+    /// tracks to play before continuing the playlist
+    queue: std::collections::VecDeque<Music>,
+    /// playlist position to continue after once the queue has played
+    resume_after_queue: Option<u32>,
 }
 
 unsafe impl std::marker::Send for AudioThread {}
@@ -1988,7 +2197,29 @@ impl AudioThread {
             playlist_save_path,
             data_sender,
             extra,
+            allow_formats: config.allow_formats.clone(),
+            queue: std::collections::VecDeque::new(),
+            resume_after_queue: None,
         }
+    }
+
+    /// Position of a queued track in the current playlist (it may have been removed since)
+    fn playlist_index_of(&self, music: &Music) -> Option<u32> {
+        self.playlist
+            .musics
+            .iter()
+            .position(|m| m.path == music.path)
+            .map(|i| i as u32)
+    }
+
+    /// Takes queued tracks off the front until one is still in the playlist
+    fn pop_queued_index(&mut self) -> Option<u32> {
+        while let Some(music) = self.queue.pop_front() {
+            if let Some(index) = self.playlist_index_of(&music) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     pub async fn spawn_thread(self) {
@@ -2079,8 +2310,56 @@ impl AudioThread {
     #[instrument(name = "AudioThread", skip_all)]
     pub async fn handle_action(&mut self, action: PlayAction) -> std::io::Result<()> {
         match action {
+            PlayAction::AddMusic(path) => {
+                // only the library playlist follows the folder; named playlists are curated
+                if self.playlist.name == "default"
+                    && path.is_file()
+                    && format_allowed(&path, &self.allow_formats)
+                    && self.playlist.add_music(path)
+                {
+                    let save_path = PathBuf::from(&self.playlist_save_path);
+                    if let Err(e) = self.playlist.save(&save_path) {
+                        tracing::warn!("failed to save playlist: {}", e);
+                    }
+                }
+            }
             PlayAction::PlayFromIndex(index) => {
+                // a track picked by hand: the list continues from here, the queue stays
+                self.resume_after_queue = None;
                 self.play_from_index(index).await;
+            }
+            PlayAction::QueueAdd(index, front) => {
+                if let Some(music) = self.playlist.musics.get(index as usize).cloned() {
+                    if front {
+                        self.queue.push_front(music);
+                    } else {
+                        self.queue.push_back(music);
+                    }
+                }
+            }
+            PlayAction::QueueRemove(pos) => {
+                self.queue.remove(pos as usize);
+            }
+            PlayAction::QueueMove(pos, up) => {
+                let pos = pos as usize;
+                if up && pos > 0 && pos < self.queue.len() {
+                    self.queue.swap(pos, pos - 1);
+                } else if !up && pos + 1 < self.queue.len() {
+                    self.queue.swap(pos, pos + 1);
+                }
+            }
+            PlayAction::QueuePlay(pos) => {
+                if let Some(music) = self.queue.remove(pos as usize) {
+                    if let Some(index) = self.playlist_index_of(&music) {
+                        self.resume_after_queue.get_or_insert(self.playlist.playing_index);
+                        self.play_from_index(index).await;
+                    }
+                }
+            }
+            PlayAction::GetQueue => {
+                self.data_sender
+                    .send(Response::Queue(self.queue.iter().cloned().collect()))
+                    .unwrap();
             }
             PlayAction::TogglePlay => {
                 if self.sink.is_paused() {
@@ -2088,6 +2367,19 @@ impl AudioThread {
                 } else {
                     self.sink.pause();
                 }
+            }
+            // queued tracks play even with repeat off / repeat one, and the list continues after
+            PlayAction::Ended
+                if !self.queue.is_empty()
+                    || (self.resume_after_queue.is_some()
+                        && !matches!(self.playlist.repeat, Repeat::Dont)) =>
+            {
+                let conn = Connection::session().await.unwrap_or_else(|_| {
+                    panic!("Could not connect to the bus address, aborting...");
+                });
+                let proxy = LightClientProxy::new(&conn).await.unwrap();
+                proxy.play_next().await.unwrap();
+                conn.close().await.unwrap();
             }
             PlayAction::Ended => match self.playlist.repeat {
                 // NOTE: using rt because we hit a `no reactor running` error
@@ -2127,6 +2419,15 @@ impl AudioThread {
                 self.sink.play();
             }
             PlayAction::PlayNextMusic => {
+                if let Some(index) = self.pop_queued_index() {
+                    self.resume_after_queue.get_or_insert(self.playlist.playing_index);
+                    self.play_from_index(index).await;
+                    return Ok(());
+                }
+                if let Some(resume) = self.resume_after_queue.take() {
+                    // queue is done, carry on after the track that was playing before it
+                    self.playlist.playing_index = resume;
+                }
                 let next_index = self.playlist.next_music_index();
                 self.action_sender
                     .send(PlayAction::PlayFromIndex(next_index))
@@ -2539,5 +2840,81 @@ impl SinkAddons for Sink {
         } else {
             return PlayingStatus::Stopped;
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn repeat_none_is_dont() {
+        let cfg: Config = toml::from_str(
+            r#"
+            path = "/home/user/Music"
+            sort = "ByTitleAscending"
+            repeat = "None"
+            volume = 0.5
+            playlist_save_path = "/tmp/playlists.json"
+            allow_formats = ["mp3", "flac", "ogg"]
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(cfg.repeat, Repeat::Dont));
+        assert_eq!(cfg.path, "/home/user/Music");
+    }
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mplayer-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file(dir: &PathBuf, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"not really audio").unwrap();
+        p
+    }
+
+    #[test]
+    fn format_allowed_matches_extension_case_insensitively() {
+        let formats = Some(vec![FileFormat::Mp3, FileFormat::Flac]);
+        assert!(format_allowed(std::path::Path::new("/m/a.mp3"), &formats));
+        assert!(format_allowed(std::path::Path::new("/m/a.FLAC"), &formats));
+        assert!(!format_allowed(std::path::Path::new("/m/a.m4a"), &formats));
+        assert!(!format_allowed(std::path::Path::new("/m/noext"), &formats));
+        assert!(format_allowed(std::path::Path::new("/m/a.m4a"), &None));
+    }
+
+    #[test]
+    fn add_music_skips_duplicates_and_keeps_playing_track() {
+        let dir = temp_dir("add");
+        let a = file(&dir, "a.mp3");
+        let c = file(&dir, "c.mp3");
+        let b = file(&dir, "b.mp3");
+        let mut playlist = Playlist {
+            musics: vec![Music::from_path(a.clone()), Music::from_path(c.clone())],
+            sort: Sort::ByTitleAscending,
+            repeat: Repeat::default(),
+            playing_index: 1,
+            name: "default".to_string(),
+        };
+        playlist.sort(Sort::ByTitleAscending);
+        let playing = playlist.musics[playlist.playing_index as usize].path.clone();
+
+        assert!(playlist.add_music(b.clone()));
+        assert_eq!(playlist.musics.len(), 3);
+        // the same track is still the playing one after re-sorting
+        assert_eq!(playlist.musics[playlist.playing_index as usize].path, playing);
+        // adding it again does nothing
+        assert!(!playlist.add_music(b));
+        assert_eq!(playlist.musics.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

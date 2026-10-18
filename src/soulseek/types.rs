@@ -121,20 +121,22 @@ impl SharedFile {
     /// calculate quality score (higher = better)
     /// considers: format quality, bitrate, sample rate
     pub fn quality_score(&self) -> u32 {
+        // format weight (0-700 points)
+        (self.format() as u32) * 100 + self.quality_points()
+    }
+
+    /// bitrate / sample rate / vbr part of the score, without the format weight
+    pub fn quality_points(&self) -> u32 {
         let mut score = 0u32;
 
-        // format weight (0-700 points)
-        score += (self.format() as u32) * 100;
-
         // bitrate weight (0-320 points for lossy, bonus for lossless)
-        if self.bitrate > 0 {
-            if self.format().is_lossless() {
-                // lossless gets bonus points
-                score += 400 + (self.bitrate / 100).min(200);
-            } else {
-                // lossy: higher bitrate = better (max ~320)
-                score += self.bitrate.min(320);
-            }
+        if self.format().is_lossless() {
+            // lossless gets bonus points, whether or not the peer reports a bitrate (most
+            // don't for flac); without this a 320k mp3 outranked every flac
+            score += 400 + (self.bitrate / 100).min(200);
+        } else if self.bitrate > 0 {
+            // lossy: higher bitrate = better (max ~320)
+            score += self.bitrate.min(320);
         }
 
         // sample rate bonus (44.1k = baseline, higher = bonus)
@@ -332,3 +334,27 @@ impl std::fmt::Display for SoulseekError {
 }
 
 impl std::error::Error for SoulseekError {}
+
+/// how search results are filtered and ranked, from the client's [soulseek] config
+#[derive(Debug, Clone)]
+pub struct SearchPrefs {
+    /// only these extensions are shown, earlier ones rank higher; empty = all audio, built-in order
+    pub formats: Vec<String>,
+    /// hide lossy files below this kbps (0 = off); lossless and unknown bitrates are kept
+    pub min_bitrate: u32,
+    /// hide files larger than this many MiB (0 = no limit)
+    pub max_size_mb: u32,
+    /// rank peers with free upload slots higher
+    pub prefer_free_slots: bool,
+}
+
+impl Default for SearchPrefs {
+    fn default() -> Self {
+        Self {
+            formats: Vec::new(),
+            min_bitrate: 0,
+            max_size_mb: 0,
+            prefer_free_slots: true,
+        }
+    }
+}
