@@ -3,9 +3,9 @@ use zbus::proxy;
 use zbus::Result;
 
 #[proxy(
-    interface = "org.zbus.mplayerServer",
-    default_service = "org.zbus.mplayer",
-    default_path = "/org/zbus/mplayer"
+    interface = "net.rotko.Musa.Player",
+    default_service = "net.rotko.Musa",
+    default_path = "/net/rotko/Musa"
 )]
 
 pub trait LightClient {

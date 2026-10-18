@@ -635,7 +635,7 @@ struct Player {
 }
 
 // methods
-#[interface(name = "org.zbus.mplayerServer")]
+#[interface(name = "net.rotko.Musa.Player")]
 impl<'a> Player {
     async fn reload_config(&mut self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
         let config = Config::try_from_env().unwrap_or_else(|e| {
@@ -1683,7 +1683,7 @@ impl Server {
         Server {
             dbus_interf: path_from_addr(&dbus_addr),
             dbus_addr,
-            app_name: String::from("mplayer"),
+            app_name: String::from("musa"),
             player: Player {
                 response_reciver,
                 sender,
@@ -1716,9 +1716,9 @@ impl Server {
             .await;
 
         Server {
-            dbus_addr: String::from("org.zbus.mplayer"),
-            dbus_interf: String::from("/org/zbus/mplayer"),
-            app_name: String::from("mplayer"),
+            dbus_addr: String::from("net.rotko.Musa"),
+            dbus_interf: String::from("/net/rotko/Musa"),
+            app_name: String::from("musa"),
             player: Player {
                 response_reciver,
                 sender,
@@ -1735,7 +1735,7 @@ impl Server {
 
     /// Starts the dbus server
     pub async fn start(self) -> Result<(), Box<dyn Error>> {
-        info!("Starting the `mplayer-server`...");
+        info!("Starting `musad`...");
         let _connection = connection::Builder::session()?
             .name(self.dbus_addr.clone())?
             .max_queued(1000)
@@ -2098,9 +2098,16 @@ impl Config {
         if args.len() > 1 {
             Config::read_config(PathBuf::from(&args[1]))
         } else {
-            let mut home = std::env::var("HOME").unwrap().to_string();
-            home.push_str("/.config/mplayer-server/config.toml");
-            let file_path = PathBuf::from_str(&home).unwrap_or_default();
+            let home = std::env::var("HOME").unwrap().to_string();
+            // ~/.config/musad, or the config from before the rename
+            let file_path = [
+                format!("{home}/.config/musad/config.toml"),
+                format!("{home}/.config/mplayer-server/config.toml"),
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .unwrap_or_default();
             if file_path.exists() {
                 Config::read_config(file_path)
             } else {
@@ -2870,7 +2877,7 @@ mod library_tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mplayer-test-{}-{}", name, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("musad-test-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

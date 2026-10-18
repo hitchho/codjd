@@ -1,14 +1,17 @@
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [package]
-authors = ["yasssine <yassine.bna@proton.me>"]
-name = "mplayer-server"
-version = "0.1.1"
+authors = [
+    "yasssine <yassine.bna@proton.me>",
+    "Tommi Niemi <tommi@rotko.net>",
+]
+name = "musad"
+version = "0.2.0"
 edition = "2021"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/yassinebenarbia/mplayer-server"
-description = "Simple dbus server to play music"
-keywords = ["music", "server", "mplayer-server", "mplayer-client", "linux", "dbus", "zbus", "audio", "playback", "mplayer"]
+description = "musad: music player daemon with built-in Soulseek, controlled over D-Bus"
+keywords = ["music", "daemon", "soulseek", "dbus", "audio"]
 
 [dependencies]
 zbus = { version = "5.11.0", features = ["tokio"] }

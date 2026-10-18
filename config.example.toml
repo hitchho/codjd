@@ -3,4 +3,4 @@ sort = "ByDurationDescending" # ByTitleAscending, ByTitleDescending, ByDurationA
 repeat = "AllMusics" # Dont, ThisMusic
 volume = 0.9 # value beteen 0.0 and 1.0
 allow_formats = ["ogg", "flac", "mp3"] # webm, still not supported tho
-playlist_save_path = "/home/user/.local/share/mplayer-server/playlist.json" # No default, provide an empty file
+playlist_save_path = "/home/user/.local/share/musad/playlist.json" # No default, provide an empty file

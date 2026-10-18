@@ -32,7 +32,7 @@
       in
       {
         defaultPackage = naersk-lib.buildPackage {
-          name = "mplayer-server";
+          name = "musad";
           src = ./.;
           buildInputs = with pkgs; [
             pkg-config
