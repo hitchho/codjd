@@ -74,14 +74,15 @@ pub struct Analyzer {
 const VERSION: u16 = FeaturesVersion::LATEST as u16;
 
 impl Analyzer {
-    /// Loads the cache and starts the workers (half the cores, at least one)
+    /// Loads the cache and starts the workers: half the cores, 1 to 4. Each worker holds a whole
+    /// decoded file (22.05 kHz mono, ~320 MB for an hour-long mix), so more would cost memory.
     pub fn start() -> Arc<Self> {
         let cache_path = std::env::var_os("MUSAD_CACHE_DIR")
             .map(PathBuf::from)
             .or_else(|| dirs::cache_dir().map(|d| d.join("musad")))
             .map(|d| d.join("analysis.json"));
         let threads = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(1))
+            .map(|n| (n.get() / 2).clamp(1, 4))
             .unwrap_or(1);
         Self::start_with(cache_path, threads)
     }
@@ -287,7 +288,7 @@ mod tests {
         let a = Analyzer::start_with(Some(cache.clone()), 1);
         a.enqueue([wav.clone()]);
         let start = Instant::now();
-        while a.features(&wav).is_none() && start.elapsed() < Duration::from_secs(60) {
+        while a.progress() != (1, 1) && start.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(50));
         }
         let f = a.features(&wav).expect("analyzed");
