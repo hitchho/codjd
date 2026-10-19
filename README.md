@@ -4,6 +4,8 @@
 
 It keeps playing, keeps the play queue and keeps downloading when no client is open, and adds finished downloads to the library.
 
+It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/musad/analysis.json` (`MUSAD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo is an estimate and can be off by half or double.
+
 # Usage:
 
 ## Installation

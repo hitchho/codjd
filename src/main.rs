@@ -1,6 +1,7 @@
 use std::error::Error;
 use tracing::instrument;
 
+mod analysis;
 mod light_client;
 mod server;
 mod soulseek;

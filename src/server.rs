@@ -632,6 +632,7 @@ struct Player {
     soulseek_max_results: usize,
     soulseek_prefs: crate::soulseek::SearchPrefs,
     soulseek_max_concurrent: usize,
+    analysis: std::sync::Arc<crate::analysis::Analyzer>,
 }
 
 // methods
@@ -645,6 +646,75 @@ impl<'a> Player {
         // ---------------------------------------------------------------
         self.sender.send(PlayAction::ReloadConfig(config)).unwrap();
         self.config_reloaded(emitter).await.unwrap();
+        let playlist = self.playlist().await;
+        self.analysis.enqueue(playlist.paths());
+    }
+
+    /// (analyzed, queued) for the current analysis run; equal when idle
+    async fn analysis_status(&self) -> (u32, u32) {
+        self.analysis.progress()
+    }
+
+    /// (bpm, loudness in dBFS, analyzed) of the file at `path`. The tempo is an estimate and can
+    /// be off by half or double.
+    async fn get_features(&self, path: String) -> (f64, f64, bool) {
+        match self.analysis.features(std::path::Path::new(&path)) {
+            Some(f) => (f.bpm() as f64, f.loudness_db() as f64, true),
+            None => (0., 0., false),
+        }
+    }
+
+    /// Playlist indices of the `n` tracks that sound most like the one at `path`, nearest first.
+    /// Empty until `path` has been analyzed.
+    async fn similar_to(&mut self, path: String, n: u32) -> Vec<u32> {
+        let paths = self.playlist().await.paths();
+        let similar = self
+            .analysis
+            .similar(std::path::Path::new(&path), &paths, n as usize);
+        similar
+            .into_iter()
+            .filter_map(|p| paths.iter().position(|q| q == p).map(|i| i as u32))
+            .collect()
+    }
+
+    /// Queues the `n` tracks most like the one at `path` that aren't queued already.
+    /// Returns how many were added.
+    async fn queue_similar(&mut self, path: String, n: u32) -> u32 {
+        let queued: std::collections::HashSet<PathBuf> = self
+            .get_queue()
+            .await
+            .iter()
+            .map(|m| <&std::path::Path>::from(&m.path).to_path_buf())
+            .collect();
+        let playlist = self.playlist().await;
+        let paths = playlist.paths();
+        let similar = self
+            .analysis
+            .similar(std::path::Path::new(&path), &paths, paths.len());
+        // the same song in another format/folder sounds "most similar"; skip such copies
+        let song = |i: usize| {
+            let m = &playlist.musics[i];
+            (!m.title.is_empty()).then(|| (m.title.to_lowercase(), m.artist.to_lowercase()))
+        };
+        let mut seen: std::collections::HashSet<(String, String)> = paths
+            .iter()
+            .position(|q| q.as_path() == std::path::Path::new(&path))
+            .and_then(song)
+            .into_iter()
+            .collect();
+        let mut added = 0;
+        for p in similar.into_iter().filter(|p| !queued.contains(*p)) {
+            if added == n {
+                break;
+            }
+            let Some(i) = paths.iter().position(|q| q == p) else { continue };
+            if song(i).is_some_and(|key| !seen.insert(key)) {
+                continue;
+            }
+            self.sender.send(PlayAction::QueueAdd(i as u32, false)).unwrap();
+            added += 1;
+        }
+        added
     }
 
     #[zbus(signal)]
@@ -1455,6 +1525,7 @@ impl<'a> Player {
                             Arc::clone(&client),
                             self.sender.clone(),
                             emitter.to_owned(),
+                            Arc::clone(&self.analysis),
                         );
                         self.soulseek_max_results = max_results;
                         self.soulseek = Some(client);
@@ -1669,6 +1740,8 @@ impl Server {
         // init
         let config = Config::read_config(PathBuf::new()).unwrap_or_default();
         let playlist = Playlist::from_config(&config);
+        let analysis = crate::analysis::Analyzer::start();
+        analysis.enqueue(playlist.paths());
 
         let (sender, reciver) = tokio::sync::mpsc::unbounded_channel::<PlayAction>();
 
@@ -1694,6 +1767,7 @@ impl Server {
                 soulseek_max_results: 50,
                 soulseek_prefs: Default::default(),
                 soulseek_max_concurrent: 3,
+                analysis,
             },
         }
     }
@@ -1705,6 +1779,8 @@ impl Server {
             Config::default()
         });
         let playlist = Playlist::from_config(&config);
+        let analysis = crate::analysis::Analyzer::start();
+        analysis.enqueue(playlist.paths());
 
         let (sender, reciver) = tokio::sync::mpsc::unbounded_channel::<PlayAction>();
         let (response_sender, response_reciver) =
@@ -1729,6 +1805,7 @@ impl Server {
                 soulseek_max_results: 50,
                 soulseek_prefs: Default::default(),
                 soulseek_max_concurrent: 3,
+                analysis,
             },
         }
     }
@@ -1812,6 +1889,13 @@ struct PlaylistEntry {
 
 // TODO: check if playlist is already sorted by the element requested, if so, don't resort
 impl Playlist {
+    fn paths(&self) -> Vec<PathBuf> {
+        self.musics
+            .iter()
+            .map(|m| <&std::path::Path>::from(&m.path).to_path_buf())
+            .collect()
+    }
+
     fn sort(&mut self, sort: Sort) {
         let mut seed = rand::rng();
         ternary!(
@@ -2012,6 +2096,7 @@ fn spawn_download_watcher(
     client: std::sync::Arc<crate::soulseek::SoulseekClient>,
     sender: UnboundedSender<PlayAction>,
     emitter: SignalEmitter<'static>,
+    analysis: std::sync::Arc<crate::analysis::Analyzer>,
 ) {
     use crate::soulseek::{ConnectionState, DownloadState};
     tokio::spawn(async move {
@@ -2030,6 +2115,7 @@ fn spawn_download_watcher(
                     if sender.send(PlayAction::AddMusic(dl.local_path.clone())).is_err() {
                         return;
                     }
+                    analysis.enqueue([dl.local_path.clone()]);
                     let path = dl.local_path.to_string_lossy();
                     let _ = Player::music_added(&emitter, &path).await;
                 }
