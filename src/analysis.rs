@@ -33,10 +33,16 @@ pub struct Features {
     version: u16,
     /// bliss feature vector (normalized to [-1, 1])
     vector: Vec<f32>,
+    // the three below are defaulted so a pre-v2 cache file still parses; the version check then
+    // drops those entries and they're analyzed again
     /// integrated loudness, LUFS (EBU R128, -70 for silence)
+    #[serde(default)]
     lufs: f64,
-    /// sample peak in dBFS (0 = full scale)
+    /// sample peak in dBFS (0 = full scale; a sample peak, not a true peak, so decoded mp3s can
+    /// read above 0)
+    #[serde(default)]
     peak_db: f64,
+    #[serde(default)]
     duration_ms: u64,
 }
 
@@ -372,6 +378,21 @@ mod tests {
         let got = a.similar(Path::new("/seed"), &candidates, 5);
         assert_eq!(got, [&PathBuf::from("/near"), &PathBuf::from("/far")]);
         assert!(a.similar(Path::new("/unanalyzed"), &candidates, 5).is_empty());
+    }
+
+    #[test]
+    fn pre_v2_cache_entries_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("musad-oldcache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("analysis.json");
+        let old = format!(
+            r#"{{"tracks":{{"/a.mp3":{{"size":1,"mtime":2,"version":{},"vector":[0.5]}}}}}}"#,
+            FeaturesVersion::LATEST as u16
+        );
+        std::fs::write(&cache, old).unwrap();
+        let a = Analyzer::start_with(Some(cache), 1);
+        assert!(a.features(Path::new("/a.mp3")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Analyzes a generated WAV end to end and round-trips it through the cache file
