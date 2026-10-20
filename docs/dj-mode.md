@@ -32,6 +32,48 @@ planned transitions can run on their own or by hand; any key press overrides the
 
 Normal player mode is "one deck, no plan" on the same engine.
 
+## Sets as code, edited in real vim
+
+Prep happens in a text file, not a drag-and-drop timeline: precise, diffable, versioned in git,
+and it lives on the USB stick next to the music.
+
+- **The editor is the user's own vim/nvim.** No editor inside musa: `e` opens the set file in
+  `$EDITOR` (or a terminal/tmux split). musad watches the file and hot-reloads on save; the
+  timeline view in musa updates and shows errors inline.
+- Later: a small language server (completion for track and cue names, bar numbers; error
+  diagnostics), and live coding: send a selected block from vim to musad, applied quantized to
+  the next bar.
+- **The language counts bars and beats, not seconds**, and is declarative, so a planned
+  transition plays the same every time and can be taken over by hand at any moment:
+
+```
+set "kaiku friday" bpm 128
+
+track aft "Pneumatix - Aftertekno"
+  grid 127.98 @ 0.412s          # tempo, first downbeat (hand-fixed when the detector is wrong)
+  cue drop  bar 33
+  cue outro bar 129
+  gain -1.5dB
+
+track smk "Aasi & Swooh - Smokin"
+  cue intro bar 1
+
+mix aft -> smk at aft.outro over 32 bars
+  smk play from intro, synced
+  bars 0..16   smk.low kill;  smk.fader 0 -> 1
+  bar 16       swap low                       # bass swap
+  bars 16..32  aft.filter 0 -> -0.6; aft.fader 1 -> 0
+```
+
+- **Scripting is a control layer, never audio:** where plain data isn't enough (random fills,
+  generative FX, macros), a script runs per beat / at ~100 Hz on the engine thread and sends
+  parameter ramps and deck commands; the audio thread glides to them. A slow script means a late
+  fader move, never a dropout. The interface is language-neutral (beat clock in, ramps and
+  commands out) so Lua (mlua, already in the client), Rhai, or Plush can be tried side by side.
+- Open question: whether "coding songs" also means making music (patterns, samples, synths over
+  the decks, Tidal/Strudel style). If so, it becomes a pattern layer on the same beat clock with
+  a sampler in the engine, after the set language.
+
 ## Audio engine (replaces rodio)
 
 ```
@@ -105,7 +147,8 @@ The hard part: keyboards have no knobs or jog wheels.
    outputs and to master + cue, with no glitches under load.
 2. **Analysis v2**: beat grid + key + waveform + LUFS, grid editing. *Done when:* grids are
    right on the library's techno, or fixable in a few keys.
-3. **Prep mode**: sets, cues, loops, gain, transition plans with preview.
+3. **Prep mode**: the set language and file watcher, timeline view, cues, loops, gain,
+   transition preview ("play from 8 bars before this mix").
 4. **Live mode**: two-deck TUI, keymap with hold/release, sync, nudge, quantize, phase meter.
 5. **Planned transitions** running by themselves, with override.
 6. **Gig kit**: portable build, set recording, resume after crash.
