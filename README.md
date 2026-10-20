@@ -29,6 +29,28 @@ codjd # optional config path here
 ## Configuration
 See the [example config file](./config.example.toml). Put it at `$HOME/.config/codjd/config.toml` or pass its path as the first argument. A config at the old `$HOME/.config/mplayer-server/config.toml` is still read if the new one doesn't exist.
 
+## Listening apps (Subsonic)
+codjd can stream the library to existing music apps over the [OpenSubsonic](https://opensubsonic.netlify.app/) API. It is off unless the config has a `[net]` section:
+```toml
+[net]
+listen = "0.0.0.0:4533" # use "127.0.0.1:4533" behind a reverse proxy
+```
+Each device gets its own login; create one, and revoke it by removing it (no restart needed):
+```bash
+codjd user add phone      # prints a generated password and an API key, once
+codjd user reset phone    # new password and key
+codjd user remove phone
+codjd user list
+```
+Users live in `~/.config/codjd/users.toml` (mode 0600; `CODJD_USERS_FILE` overrides). Subsonic's token login (`md5(password + salt)`) needs the server to know the password, so passwords are stored in clear in that file; they are random and per device, so don't reuse them. Plain (`p=`, `enc:`) and OpenSubsonic `apiKey` logins work too.
+
+In the app, add a Subsonic/OpenSubsonic server with the address, the user name and the password (or API key, if the app has the option). Recommended: Symfonium or Tempo on Android. **Tested so far: curl only**; no real app yet.
+
+- **No TLS.** Put it behind a reverse proxy (Caddy, nginx) or reach it over WireGuard; anything else sends the password in the clear (token login does not, but the audio is).
+- Read-only: browse, search, playlists (the named ones in codjd), stream/download (original files, HTTP Range, so seeking works), embedded cover art. No transcoding: `format` and `maxBitRate` are ignored, and cover art is not resized. `scrobble` is accepted and dropped; no stars, ratings or play counts.
+- Artists, albums and tags come from the files' tags (album artist, else artist, plus album name; files without an album tag land in "Unknown Album"). Tags are read once and cached (`net-index.json` in the cache dir); the index is rebuilt a second after the library changes.
+- Songs are served only from inside the music folder, by opaque id. Symlinks in the folder are not followed.
+
 ## Documentation
 Access the documentation in [DOCS.md](./DOCS.md).
 

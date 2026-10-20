@@ -15,3 +15,8 @@ mode = "internal"
 main = "default"
 # empty: no second output
 second = ""
+
+# OpenSubsonic API for listening apps (optional; off without this section).
+# Users: `codjd user add <name>`. No TLS: use a reverse proxy or WireGuard.
+# [net]
+# listen = "127.0.0.1:4533"

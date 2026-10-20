@@ -46,8 +46,14 @@ it gives mature listening apps on every platform for free: Symfonium, Tempo, DSu
 (Android), play:Sub, Amperfy (iOS), Feishin, Sonixd (desktop/web) — streaming, offline caching,
 lock screen, Android Auto, casting. codj does not write its own listening app.
 
-Auth: pair a device once (QR code from the TUI/server), one revocable token per device; TLS (or
-WireGuard).
+Auth: one login per device (`codjd user add <name>` prints a generated password and an API key;
+`user remove` revokes it). Subsonic's token scheme needs the server to know the password, so
+`users.toml` (mode 0600) holds them in clear. Pairing by QR code from the TUI comes later. No TLS in
+codjd: reverse proxy or WireGuard.
+
+Status: the OpenSubsonic front end is `src/net/` (`[net] listen = ...` in the config; off by
+default). Read-only listening, original files with Range, no transcoding yet. Albums and artists
+come from tags, indexed once and cached; the index follows `LibraryChanged`/`MusicAdded`.
 
 ## The codj Android app
 
