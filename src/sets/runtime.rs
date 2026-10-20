@@ -17,6 +17,9 @@
 //!   new plan (when that plan or its tracks changed); once it has started the running plan stays
 //!   and the new version is used for the next mix. If the new version has no such mix any more,
 //!   an armed one is dropped.
+//! - Tracks the runtime loads (the incoming one, a preview's, `SetLoad`'s) start from a neutral
+//!   deck: tempo 1.0, EQ and filter 0, fader 1. Without it a deck would carry what the previous
+//!   mix left (a killed low, a closed filter) onto its next track.
 //! - Arming after the mix start has passed shifts the incoming deck's start to the next whole
 //!   beat (and its start position by the same beats), so it stays in phase; the other items fire
 //!   at once or jump to their current value (engine rules).

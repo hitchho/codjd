@@ -166,3 +166,24 @@ Rules: a manual change of a control during a mix cancels only that control's aut
 rule). Loading another track onto either deck of a running mix disarms it. Overrides from the set
 (`grid`, `gain`) apply to tracks loaded through `SetArm`/`SetLoad`/`SetPreview`, not to tracks loaded
 with `DjLoad`.
+
+### Runtime behavior (clarifications, not contract changes)
+
+- A track is "on a deck" when a deck's loaded path is the set track's file. `SetArm` always puts the
+  set's effective grid (analysis, hand correction, `grid` line) on the outgoing deck if it differs
+  (a track loaded with `DjLoad` does not know the set's `grid` line), and its `gain` line too when
+  that deck is not playing. A later `:grid` correction does not reach a set's compiled plan until
+  the set file is saved again; it disarms a mix that uses the deck.
+- Tracks loaded by `SetArm`/`SetPreview`/`SetLoad` start from a neutral deck: rate 1.0, EQ and
+  filter 0, fader 1 (a deck that took part in an earlier mix would otherwise keep its kills).
+- `SetArm` refuses to load over an audible playing deck by hand (`"deck B is playing: stop it
+  first"`); auto mode and `SetPreview` do not check. A synced `Play` that exceeds `sync_range` is
+  refused before anything is loaded. Arming after the mix start has passed moves the incoming deck's
+  start to the next whole beat.
+- Hot reload: a re-saved active file re-arms an armed, not yet started mix when its plan or tracks
+  changed; a started mix keeps its plan and the new version serves the next one. A mix that no
+  longer exists disarms. `SetPreview` starts the outgoing deck once the decoder has caught up.
+- `SetState`: `file` is absolute; `tracks[i].path` is the library path, i.e. what `DeckInfo.path`
+  holds for a track loaded from the library; `next_items` text has no bar prefix (the client prints
+  it from the beat), deck letters are the real decks (`A`/`B`), a ramp reads
+  `bars 16–32 · A filter 0 → -0.6`.

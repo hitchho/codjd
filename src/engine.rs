@@ -463,6 +463,15 @@ impl Engine {
         }
         self.attach(deck, path, gain_db.is_none());
         if let Some(g) = grid {
+            // a set's track starts from a neutral deck: tempo at the track's own, EQ and filter
+            // off, fader up. What a previous mix left (a killed low, a closed filter) would
+            // otherwise ride along onto the new track.
+            self.audio.set_rate(deck, 1.);
+            for band in 0..3 {
+                self.audio.set_eq(deck, band, 0.);
+            }
+            self.audio.set_filter(deck, 0.);
+            self.audio.set_fader(deck, 1.);
             self.lock_grid(deck, g);
         }
         if let Some(db) = gain_db.filter(|d| d.is_finite()) {
