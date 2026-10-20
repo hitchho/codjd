@@ -111,3 +111,25 @@ The hard part: keyboards have no knobs or jog wheels.
 6. **Gig kit**: portable build, set recording, resume after crash.
 
 Then keylock, MIDI controllers, Rekordbox export.
+
+## Libraries (researched 2026-10-20)
+
+No mature open-source DJ engine exists to build on (Mixxx, C++, is the reference design), and the
+general audio-graph crates (firewheel, kira, fundsp) handle one output device and add little
+for a fixed deck/mixer layout. So: our own engine on proven parts.
+
+| need | pick | fallback / later |
+|---|---|---|
+| audio output | cpal 0.18 (native PipeWire host, xrun flag) | `pipewire` / `jack` crates |
+| EQ, filter | `biquad` (Linkwitz-Riley isolator from biquads) | fundsp |
+| real-time plumbing | rtrb (commands/events), atomics for state, buffers returned to a non-RT thread to free | triple_buffer, basedrop, assert_no_alloc (debug) |
+| multiple devices | one PipeWire stream per device, rings between them, measure drift | rubato async resampler steered by ring fill |
+| keylock | Signalsmith Stretch (MIT, real-time) | `timestretch` (pure Rust, young), Bungee, Rubber Band R2 |
+| beats, downbeats | `beat-this` (state-of-the-art model, offline) fitted to a constant grid | stratum-dsp, bliss tempo |
+| key | libKeyFinder via `libkeyfinder-sys` (what Mixxx uses) | stratum-dsp |
+| loudness | `ebur128` | — |
+| key release, rollover | `evdev` | crossterm kitty protocol (REPORT_EVENT_TYPES) |
+| Rekordbox export | `rbox` (writes ANLZ/XML/exports) | rekordcrate (reader) |
+
+Several of these are young, partly AI-written crates (beat-this, timestretch, stratum-dsp):
+benchmark them on our own library before relying on them.
