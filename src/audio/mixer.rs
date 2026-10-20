@@ -9,7 +9,7 @@ use std::sync::{
     Arc,
 };
 
-use super::track::Track;
+use super::{eq::DeckFx, track::Track};
 
 pub const DECKS: usize = 2;
 
@@ -41,6 +41,10 @@ pub enum Cmd {
     Rate(usize, f64),
     /// trim, linear
     Gain(usize, f32),
+    /// EQ band (0 low, 1 mid, 2 high), -1 = kill, 0 = unity, +1 = +6 dB
+    Eq(usize, usize, f32),
+    /// filter knob, -1 = low-pass closed, 0 = off, 1 = high-pass closed
+    Filter(usize, f32),
     /// channel fader, 0..1
     Fader(usize, f32),
     /// send the deck to the headphones
@@ -90,13 +94,13 @@ impl DeckShared {
 
 /// A value that glides to its target, so changes don't click
 #[derive(Clone, Copy)]
-struct Smooth {
-    current: f32,
-    target: f32,
+pub(super) struct Smooth {
+    pub current: f32,
+    pub target: f32,
 }
 
 impl Smooth {
-    fn new(v: f32) -> Self {
+    pub(super) fn new(v: f32) -> Self {
         Self {
             current: v,
             target: v,
@@ -105,8 +109,14 @@ impl Smooth {
 
     /// One sample step; `k` sets the speed (about 1/(time constant in samples))
     #[inline]
-    fn next(&mut self, k: f32) -> f32 {
-        self.current += (self.target - self.current) * k;
+    pub(super) fn next(&mut self, k: f32) -> f32 {
+        let d = self.target - self.current;
+        // land exactly: no endless tail of ever smaller steps
+        if d.abs() < 1e-6 {
+            self.current = self.target;
+        } else {
+            self.current += d * k;
+        }
         self.current
     }
 }
@@ -123,12 +133,13 @@ struct Deck {
     pending_seek: Option<f64>,
     pausing: bool,
     gain: Smooth,
+    fx: DeckFx,
     fader: Smooth,
     cue: bool,
 }
 
 impl Deck {
-    fn new() -> Self {
+    fn new(out_rate: f64) -> Self {
         Self {
             track: None,
             pos: 0.,
@@ -139,6 +150,7 @@ impl Deck {
             pending_seek: None,
             pausing: false,
             gain: Smooth::new(1.),
+            fx: DeckFx::new(out_rate),
             fader: Smooth::new(1.),
             cue: false,
         }
@@ -236,7 +248,7 @@ impl Mixer {
     ) -> Self {
         let out_rate = out_rate as f64;
         Self {
-            decks: [Deck::new(), Deck::new()],
+            decks: [Deck::new(out_rate), Deck::new(out_rate)],
             out_rate,
             crossfader: Smooth::new(0.),
             master: Smooth::new(1.),
@@ -307,6 +319,8 @@ impl Mixer {
             }
             Cmd::Rate(deck, rate) => self.decks[deck].rate = rate.clamp(0.25, 4.),
             Cmd::Gain(deck, gain) => self.decks[deck].gain.target = gain.max(0.),
+            Cmd::Eq(deck, band, v) => self.decks[deck].fx.set_band(band, v),
+            Cmd::Filter(deck, v) => self.decks[deck].fx.set_filter(v),
             Cmd::Fader(deck, v) => self.decks[deck].fader.target = v.clamp(0., 1.),
             Cmd::Cue(deck, on) => self.decks[deck].cue = on,
             Cmd::Crossfader(v) => self.crossfader.target = v.clamp(-1., 1.),
@@ -350,7 +364,7 @@ impl Mixer {
             }
             let gain = d.gain.next(k);
             let fader = d.fader.next(k);
-            let (l, r) = (l * gain, r * gain);
+            let (l, r) = d.fx.process(l * gain, r * gain, k);
             out.decks[n] = (l, r);
             // crossfader: full level up to the centre, fading out towards the other side
             let side = if n == 0 { (1. - xf).min(1.) } else { (1. + xf).min(1.) };
@@ -488,8 +502,192 @@ mod tests {
         for _ in 0..200 {
             m.next();
         }
-        assert_eq!(m.next().master.0, 0.);
+        assert!(m.next().master.0.abs() < 1e-6);
         m.publish();
         assert!(!m.shared.decks[0].playing());
+    }
+
+    // ---- EQ and filter ----
+
+    const SR: u32 = 48_000;
+
+    fn sine_track(hz: f32, secs: f32) -> Arc<Track> {
+        let n = (SR as f32 * secs) as usize;
+        let frames: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                let s = 0.5 * (2. * std::f32::consts::PI * hz * i as f32 / SR as f32).sin();
+                (s, s)
+            })
+            .collect();
+        Track::from_frames(SR, &frames)
+    }
+
+    /// RMS of deck A's post-EQ output after the first 0.5 s, with `setup` applied first
+    fn rms_through(hz: f32, setup: &[Cmd]) -> f32 {
+        let (mut m, mut cmds, _ev) = mixer(SR);
+        load(&mut cmds, 0, sine_track(hz, 2.), 1);
+        for c in setup {
+            let _ = cmds.push(match c {
+                Cmd::Eq(d, b, v) => Cmd::Eq(*d, *b, *v),
+                Cmd::Filter(d, v) => Cmd::Filter(*d, *v),
+                _ => unreachable!(),
+            });
+        }
+        m.take_commands();
+        let (mut sum, mut n) = (0f64, 0);
+        for i in 0..(SR as usize * 3 / 2) {
+            let l = m.next().decks[0].0;
+            if i >= SR as usize / 2 {
+                sum += (l * l) as f64;
+                n += 1;
+            }
+        }
+        (sum / n as f64).sqrt() as f32
+    }
+
+    fn gain_db(hz: f32, setup: &[Cmd]) -> f32 {
+        20. * (rms_through(hz, setup) / (0.5 / 2f32.sqrt())).max(1e-9).log10()
+    }
+
+    #[test]
+    fn unity_eq_is_flat() {
+        for hz in [60., 250., 1000., 2500., 8000.] {
+            let g = gain_db(hz, &[]);
+            assert!(g.abs() < 0.1, "{hz} Hz: {g} dB");
+        }
+    }
+
+    #[test]
+    fn band_curve() {
+        use super::super::eq::band_gain;
+        assert_eq!(band_gain(0.), 1.);
+        assert_eq!(band_gain(-1.), 0.);
+        assert_eq!(band_gain(-0.98), 0.);
+        assert!((20. * band_gain(1.).log10() - 6.).abs() < 1e-3);
+        assert!((20. * band_gain(-0.5).log10() + 12.).abs() < 1e-3);
+        assert_eq!(band_gain(f32::NAN), 1.);
+    }
+
+    #[test]
+    fn eq_boost_and_cut() {
+        let g = gain_db(60., &[Cmd::Eq(0, 0, 1.)]);
+        assert!((g - 6.).abs() < 0.5, "{g}");
+        let g = gain_db(1000., &[Cmd::Eq(0, 1, -0.5)]);
+        assert!((g + 12.).abs() < 1., "{g}");
+    }
+
+    #[test]
+    fn low_kill_removes_bass_keeps_treble() {
+        let kill = [Cmd::Eq(0, 0, -1.)];
+        assert!(gain_db(60., &kill) < -30.);
+        assert!(gain_db(8000., &kill).abs() < 0.2);
+    }
+
+    #[test]
+    fn mid_kill_removes_mids() {
+        let kill = [Cmd::Eq(0, 1, -1.)];
+        assert!(gain_db(1000., &kill) < -30.);
+        assert!(gain_db(60., &kill).abs() < 0.5);
+        assert!(gain_db(10000., &kill).abs() < 0.5);
+    }
+
+    #[test]
+    fn high_kill_removes_treble_keeps_bass() {
+        let kill = [Cmd::Eq(0, 2, -1.)];
+        assert!(gain_db(8000., &kill) < -30.);
+        assert!(gain_db(60., &kill).abs() < 0.2);
+    }
+
+    #[test]
+    fn filter_off_is_bypass() {
+        for hz in [60., 1000., 8000.] {
+            let g = gain_db(hz, &[Cmd::Filter(0, 0.)]);
+            assert!(g.abs() < 0.1, "{hz}: {g}");
+        }
+    }
+
+    #[test]
+    fn lowpass_and_highpass_sweep() {
+        let lp = [Cmd::Filter(0, -0.8)];
+        assert!(gain_db(8000., &lp) < -40.);
+        assert!(gain_db(60., &lp).abs() < 1.5);
+        let hp = [Cmd::Filter(0, 0.8)];
+        assert!(gain_db(60., &hp) < -40.);
+        assert!(gain_db(8000., &hp).abs() < 1.5);
+    }
+
+    #[test]
+    fn fast_sweeps_stay_finite_and_bounded() {
+        let (mut m, mut cmds, _ev) = mixer(SR);
+        // loud broadband-ish content: a square wave at full scale
+        let frames: Vec<(f32, f32)> = (0..SR as usize * 4)
+            .map(|i| {
+                let s = if (i / 50) % 2 == 0 { 1. } else { -1. };
+                (s, s)
+            })
+            .collect();
+        load(&mut cmds, 0, Track::from_frames(SR, &frames), 1);
+        m.take_commands();
+        let mut peak = 0f32;
+        for i in 0..SR as usize * 3 {
+            if i % 97 == 0 {
+                let v = if (i / 97) % 2 == 0 { 1. } else { -1. };
+                let _ = cmds.push(Cmd::Filter(0, v));
+                let _ = cmds.push(Cmd::Eq(0, (i / 97) % 3, -v));
+                let _ = cmds.push(Cmd::Eq(0, (i / 31) % 3, v));
+                m.take_commands();
+            }
+            let (l, r) = m.next().decks[0];
+            assert!(l.is_finite() && r.is_finite(), "sample {i}");
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        // +6 dB on three bands plus filter resonance: well under 8x
+        assert!(peak < 8., "{peak}");
+    }
+
+    #[test]
+    fn silence_after_signal_decays_to_exact_zero() {
+        let (mut m, mut cmds, _ev) = mixer(SR);
+        let mut frames = vec![(0.5f32, 0.5f32); 4800];
+        frames.extend(vec![(0., 0.); SR as usize * 3]);
+        load(&mut cmds, 0, Track::from_frames(SR, &frames), 1);
+        let _ = cmds.push(Cmd::Filter(0, -0.5));
+        m.take_commands();
+        let mut last = (1., 1.);
+        for _ in 0..SR as usize * 3 {
+            last = m.next().decks[0];
+        }
+        assert_eq!(last, (0., 0.));
+    }
+
+    /// Release-mode speed check: `cargo test --release -- --ignored --nocapture eq_cpu`
+    #[test]
+    #[ignore]
+    fn eq_cpu() {
+        let secs = 60;
+        let (mut m, mut cmds, _ev) = mixer(SR);
+        for d in 0..2 {
+            load(&mut cmds, d, sine_track(220. * (d + 1) as f32, secs as f32), d as u64);
+            let _ = cmds.push(Cmd::Eq(d, 0, 0.3));
+            let _ = cmds.push(Cmd::Eq(d, 2, -0.3));
+            let _ = cmds.push(Cmd::Filter(d, -0.4));
+        }
+        m.take_commands();
+        let frames = SR as usize * secs;
+        let t = std::time::Instant::now();
+        let mut acc = 0f32;
+        for i in 0..frames {
+            if i % 4800 == 0 {
+                let _ = cmds.push(Cmd::Filter(0, ((i / 4800) as f32 * 0.37).sin()));
+                m.take_commands();
+            }
+            acc += m.next().master.0;
+        }
+        let el = t.elapsed();
+        println!(
+            "{secs} s x 2 decks with EQ+filter: {el:?} ({:.0}x real time, {:.2}% of one core) [{acc}]",
+            secs as f64 / el.as_secs_f64(),
+            100. * el.as_secs_f64() / secs as f64
+        );
     }
 }

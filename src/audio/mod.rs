@@ -4,6 +4,7 @@
 //! mixer and reads its state from atomics. A small housekeeping thread forwards events from the
 //! audio thread (a track ended) and frees tracks the mixer is done with.
 
+mod eq;
 mod mixer;
 mod output;
 mod track;
@@ -161,6 +162,16 @@ impl Audio {
 
     pub fn set_gain(&mut self, deck: usize, gain: f32) {
         self.send(Cmd::Gain(deck, gain));
+    }
+
+    /// EQ `band` (0 low, 1 mid, 2 high): -1 = kill, 0 = unity, +1 = +6 dB
+    pub fn set_eq(&mut self, deck: usize, band: usize, value: f32) {
+        self.send(Cmd::Eq(deck, band, value));
+    }
+
+    /// filter knob: -1 = low-pass closed, 0 = off, +1 = high-pass closed
+    pub fn set_filter(&mut self, deck: usize, value: f32) {
+        self.send(Cmd::Filter(deck, value));
     }
 
     pub fn set_fader(&mut self, deck: usize, value: f32) {

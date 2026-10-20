@@ -371,7 +371,8 @@ impl Bus {
         )
     }
 
-    /// controls: rate, gain, fader, cue (per deck); crossfader, master, cue_mix (deck ignored)
+    /// controls: rate, gain, low/mid/high (EQ, -1..1), filter (-1..1), fader, cue (per deck);
+    /// crossfader, master, cue_mix (deck ignored)
     async fn dj_set(&self, control: String, deck: u32, value: f64) -> String {
         reply(
             self.musad

@@ -104,6 +104,14 @@ deck B ─ gain ─ EQ3 ─ filter ─ fader ─┴─ crossfader ─ master ─
                      └──── cue (PFL per deck) + cue/master mix ─────────── internal: out 3/4
 ```
 
+- **EQ3** (per deck, after gain): isolator-style, Linkwitz-Riley 4th-order crossovers at 250 Hz and
+  2.5 kHz, a gain per band, summed (flat when all bands are at unity; the low band gets an allpass at
+  2.5 kHz to stay phase-aligned). Controls `low`/`mid`/`high`, -1..1: 0 = unity, +1 = +6 dB,
+  dB-linear down to -24 dB at -0.98, and -0.98..-1 is a full kill.
+- **Filter** (per deck, after the EQ): `filter` -1..1, 0 = off (bit-exact bypass), negative =
+  low-pass 20 kHz -> 60 Hz, positive = high-pass 20 Hz -> 18 kHz, exponential, 12 dB/oct, Q 0.9. A
+  state-variable filter with the cutoff recomputed every 32 samples from a 10 ms-smoothed knob.
+  Both run on the audio thread with fixed state only (code in `src/audio/eq.rs`).
 - cpal (ALSA / PipeWire-JACK); one output stream per device (master, cue, or deck A / deck B),
   the master device's clock leads and the others are drift-corrected; a real-time callback that never
   locks, allocates or does I/O. Commands go in through a lock-free ring buffer; state (positions,

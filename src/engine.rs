@@ -416,6 +416,10 @@ impl Engine {
         match control {
             "rate" => self.audio.set_rate(deck, value),
             "gain" => self.audio.set_gain(deck, v),
+            "low" => self.audio.set_eq(deck, 0, v),
+            "mid" => self.audio.set_eq(deck, 1, v),
+            "high" => self.audio.set_eq(deck, 2, v),
+            "filter" => self.audio.set_filter(deck, v),
             "fader" => self.audio.set_fader(deck, v),
             "cue" => self.audio.set_cue(deck, value != 0.),
             "crossfader" => self.audio.set_crossfader(v),
