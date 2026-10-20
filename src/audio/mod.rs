@@ -18,7 +18,7 @@ use std::{
 
 use tracing::warn;
 
-pub use beat::{sync_plan, BeatGrid, GridSpec, SyncPlan};
+pub use beat::{sync_plan, GridSpec};
 pub use mixer::{DeckState, Mode, DECKS};
 use mixer::{Cmd, Mixer, RtEvent, Shared};
 pub use output::list_devices;

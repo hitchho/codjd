@@ -427,6 +427,49 @@ impl Bus {
         )
     }
 
+    /// CDJ cue button: paused, press sets the cue point and plays while held, release returns
+    /// and pauses; playing, press returns to the cue point and pauses
+    async fn dj_cue(&self, deck: u32, pressed: bool) -> String {
+        reply(self.codjd.call(move |e| e.deck_cue(deck as usize, pressed)).await)
+    }
+
+    /// match `deck`'s tempo to the other deck and align the beats; follows its tempo from then on
+    async fn dj_sync(&self, deck: u32) -> String {
+        reply(self.codjd.call(move |e| e.deck_sync(deck as usize)).await)
+    }
+
+    /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases
+    async fn dj_nudge(&self, deck: u32, amount: f64) -> String {
+        reply(self.codjd.call(move |e| e.deck_nudge(deck as usize, amount)).await)
+    }
+
+    async fn dj_beat_jump(&self, deck: u32, beats: f64) -> String {
+        reply(self.codjd.call(move |e| e.deck_beat_jump(deck as usize, beats)).await)
+    }
+
+    /// beat loop of `beats` from the current beat (resizes a running loop); 0 exits
+    async fn dj_loop(&self, deck: u32, beats: f64) -> String {
+        reply(self.codjd.call(move |e| e.deck_loop(deck as usize, beats)).await)
+    }
+
+    /// `action`: "set", "jump" or "clear" for hot cue `slot` (0..7)
+    async fn dj_hotcue(&self, deck: u32, slot: u32, action: String) -> String {
+        reply(
+            self.codjd
+                .call(move |e| e.deck_hotcue(deck as usize, slot as usize, &action))
+                .await,
+        )
+    }
+
+    /// both decks in one call, for a UI polling at ~30 Hz
+    async fn dj_decks(&self) -> Vec<crate::dj::DeckInfo> {
+        self.ask(|e| e.deck_infos()).await
+    }
+
+    async fn dj_mixer(&self) -> crate::dj::MixerInfo {
+        self.ask(|e| e.mixer_info()).await
+    }
+
     /// "internal" (codj mixes: master + headphones) or "external" (deck A and B outputs)
     async fn dj_mode(&self, mode: String) -> String {
         let mode = match mode.as_str() {

@@ -93,6 +93,11 @@ impl Features {
         (self.vector[AnalysisIndex::MeanLoudness as usize] + 1.) / 2. * 90. - 90.
     }
 
+    /// Length of the file in seconds (0 if unknown)
+    pub fn duration_secs(&self) -> f64 {
+        self.duration_ms as f64 / 1000.
+    }
+
     pub fn grid(&self) -> Option<&Grid> {
         self.grid.as_ref()
     }

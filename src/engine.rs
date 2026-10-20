@@ -13,7 +13,8 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -21,8 +22,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::{
-    audio::{Audio, AudioEvent, Mode},
+    analysis::{Analyzer, Grid},
+    audio::{sync_plan, Audio, AudioEvent, GridSpec, Mode},
     config::Config,
+    dj::{DeckInfo, MixerInfo},
+    hotcues::{HotcueStore, Slots, SLOTS},
     library::{Playlist, PlaylistStore},
     types::{
         format_allowed, FileFormat, Lyrics, Metadata, Music, PlayerStatus, PlayingStatus,
@@ -130,8 +134,52 @@ enum Transport {
     Paused,
 }
 
+/// What the engine knows about the track on a deck beyond what the audio thread holds
+#[derive(Default)]
+struct DeckMeta {
+    path: Option<PathBuf>,
+    title: String,
+    artist: String,
+    /// length from the library, to show while the decode is still running
+    length: f64,
+    grid: Option<Grid>,
+    key: String,
+    /// auto-gain applied as the deck's trim
+    gain_db: f64,
+    /// the analysis cache was looked at and had this track
+    analyzed: bool,
+    hot: Slots,
+}
+
+/// Knob positions the audio thread only smooths towards: kept for `DjDecks`
+#[derive(Clone, Copy)]
+struct DeckKnobs {
+    eq: [f64; 3],
+    filter: f64,
+    fader: f64,
+    headphones: bool,
+}
+
+impl Default for DeckKnobs {
+    fn default() -> Self {
+        Self { eq: [0.; 3], filter: 0., fader: 1., headphones: false }
+    }
+}
+
+struct MixerKnobs {
+    crossfader: f64,
+    master: f64,
+    cue_mix: f64,
+    quantize: bool,
+}
+
 pub struct Engine {
     audio: Audio,
+    analyzer: Option<Arc<Analyzer>>,
+    meta: [DeckMeta; crate::audio::DECKS],
+    knobs: [DeckKnobs; crate::audio::DECKS],
+    mixer: MixerKnobs,
+    hotcues: HotcueStore,
     /// the player's state; the audio thread's own view lags by a callback
     transport: Transport,
     /// tags the playing track, so a late end event from a replaced one is ignored
@@ -163,8 +211,14 @@ impl Engine {
         .map_err(|e| std::io::Error::other(format!("can't open the audio output: {e}")))?;
         let volume = config.volume.clamp(0., 1.);
         apply_volume(&mut audio, volume);
+        let master = if audio.mode() == Mode::Internal { volume as f64 } else { 1. };
         Ok(Self {
             audio,
+            analyzer: None,
+            meta: Default::default(),
+            knobs: Default::default(),
+            mixer: MixerKnobs { crossfader: 0., master, cue_mix: 0., quantize: true },
+            hotcues: HotcueStore::open_default(),
             transport: Transport::Stopped,
             generation: 0,
             volume,
@@ -206,6 +260,7 @@ impl Engine {
             }
         }
         info!("playing {}", path.display());
+        self.attach(PLAYER_DECK, &path, false);
         self.playlist.playing_index = index;
         self.transport = Transport::Playing;
         self.emit(Event::MusicPlayed);
@@ -307,7 +362,7 @@ impl Engine {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0., 1.);
-        apply_volume(&mut self.audio, self.volume);
+        self.push_volume();
         self.emit(Event::VolumeChanged(self.volume));
     }
 
@@ -318,7 +373,7 @@ impl Engine {
         } else {
             self.volume = self.muted_volume;
         }
-        apply_volume(&mut self.audio, self.volume);
+        self.push_volume();
         self.emit(Event::VolumeChanged(self.volume));
     }
 
@@ -390,12 +445,206 @@ impl Engine {
             self.generation = generation;
             self.transport = Transport::Stopped;
         }
+        self.attach(deck, path, true);
         Ok(())
     }
 
-    pub fn deck_play(&mut self, deck: usize) -> Result<(), String> {
+    /// Records what is on `deck` (title, hot cues, and whatever the analysis cache knows) and
+    /// sends the audio thread the grid; for a DJ load also the auto-gain as the deck's trim
+    fn attach(&mut self, deck: usize, path: &Path, dj: bool) {
+        let (title, artist, length) = self.tags_of(path);
+        let hot = self.hotcues.get(path);
+        self.meta[deck] = DeckMeta {
+            path: Some(path.to_path_buf()),
+            title,
+            artist,
+            length,
+            hot,
+            ..Default::default()
+        };
+        self.audio.set_trim(deck, 1.);
+        self.bind_analysis(deck, dj);
+    }
+
+    /// Takes grid, key and (`gain`) suggested gain for the track on `deck` from the analysis
+    /// cache if it has them. A track that is analyzed after it was loaded gets its grid later,
+    /// but never a gain change in the middle of playing.
+    fn bind_analysis(&mut self, deck: usize, gain: bool) {
+        let Some(path) = self.meta[deck].path.clone() else { return };
+        let Some(features) = self.analyzer.as_ref().and_then(|a| a.features(&path)) else { return };
+        let m = &mut self.meta[deck];
+        m.analyzed = true;
+        if m.length <= 0. {
+            m.length = features.duration_secs();
+        }
+        m.grid = features.grid().cloned();
+        m.key = features.key().map(|k| k.camelot.clone()).unwrap_or_default();
+        self.audio.set_grid(deck, m.grid.as_ref().map(grid_spec));
+        if gain {
+            let db = features.gain_db();
+            if db.is_finite() {
+                m.gain_db = db;
+                self.audio.set_trim(deck, 10f32.powf(db as f32 / 20.));
+            }
+        }
+    }
+
+    /// Title, artist and length (0 if unknown): the library's entry, else the file's tags, else
+    /// the file name
+    fn tags_of(&self, path: &Path) -> (String, String, f64) {
+        let known = self.playlist.musics.iter().find(|m| <&Path>::from(&m.path) == path);
+        let (mut title, mut artist, length) = match known {
+            Some(m) => (m.title.clone(), m.artist.clone(), m.length.as_secs_f64()),
+            None => (String::new(), String::new(), 0.),
+        };
+        if title.is_empty() {
+            use lofty::{file::TaggedFileExt, tag::Accessor};
+            if let Ok(file) = lofty::read_from_path(path) {
+                if let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) {
+                    title = tag.title().map(|t| t.to_string()).unwrap_or_default();
+                    if artist.is_empty() {
+                        artist = tag.artist().map(|t| t.to_string()).unwrap_or_default();
+                    }
+                }
+            }
+        }
+        if title.trim().is_empty() {
+            title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        (title, artist, length)
+    }
+
+    /// The analyzer, to read grids, keys and gains from; set once it has started
+    pub fn set_analyzer(&mut self, analyzer: Arc<Analyzer>) {
+        self.analyzer = Some(analyzer);
+        for deck in 0..crate::audio::DECKS {
+            if !self.meta[deck].analyzed {
+                self.bind_analysis(deck, false);
+            }
+        }
+    }
+
+    fn loaded(&self, deck: usize) -> Result<&DeckMeta, String> {
         check_deck(deck)?;
+        let m = &self.meta[deck];
+        if m.path.is_some() {
+            Ok(m)
+        } else {
+            Err("nothing loaded".into())
+        }
+    }
+
+    /// Like [`Self::loaded`], for a deck that needs a beat grid (looks in the analysis cache once
+    /// more if the track has been analyzed since it was loaded)
+    fn gridded(&mut self, deck: usize) -> Result<Grid, String> {
+        self.loaded(deck)?;
+        if self.meta[deck].grid.is_none() {
+            self.bind_analysis(deck, false);
+        }
+        self.meta[deck].grid.clone().ok_or_else(|| "no beat grid".to_string())
+    }
+
+    pub fn deck_play(&mut self, deck: usize) -> Result<(), String> {
+        self.loaded(deck)?;
+        if self.meta[deck].grid.is_none() {
+            self.bind_analysis(deck, false);
+        }
         self.audio.play(deck);
+        Ok(())
+    }
+
+    /// The CDJ cue button
+    pub fn deck_cue(&mut self, deck: usize, pressed: bool) -> Result<(), String> {
+        self.loaded(deck)?;
+        self.audio.cue_button(deck, pressed);
+        Ok(())
+    }
+
+    /// Match `deck`'s tempo to the other deck and keep following it
+    pub fn deck_sync(&mut self, deck: usize) -> Result<(), String> {
+        let own = self.gridded(deck)?;
+        let other = 1 - deck;
+        if self.loaded(other).is_err() {
+            return Err("other deck has nothing loaded".into());
+        }
+        let theirs = self
+            .gridded(other)
+            .map_err(|_| "other deck has no beat grid".to_string())?;
+        let states = self.audio.deck_states();
+        if !states[other].playing {
+            return Err("other deck is not playing".into());
+        }
+        if sync_plan(theirs.bpm * states[other].rate, own.bpm).is_none() {
+            return Err("tempo too far from the other deck".into());
+        }
+        self.audio.sync(deck);
+        Ok(())
+    }
+
+    /// Temporary tempo bend, -1..1 = -4..+4 %, 0 releases it
+    pub fn deck_nudge(&mut self, deck: usize, amount: f64) -> Result<(), String> {
+        self.loaded(deck)?;
+        if !amount.is_finite() {
+            return Err("bad amount".into());
+        }
+        self.audio.nudge(deck, amount.clamp(-1., 1.) as f32);
+        Ok(())
+    }
+
+    pub fn deck_beat_jump(&mut self, deck: usize, beats: f64) -> Result<(), String> {
+        self.gridded(deck)?;
+        if !beats.is_finite() {
+            return Err("bad beats".into());
+        }
+        self.audio.beat_jump(deck, beats);
+        Ok(())
+    }
+
+    /// Beat loop of `beats` from the current beat, resizing a running one; 0 exits
+    pub fn deck_loop(&mut self, deck: usize, beats: f64) -> Result<(), String> {
+        if beats == 0. {
+            // leaving a loop needs no grid
+            self.loaded(deck)?;
+        } else {
+            self.gridded(deck)?;
+        }
+        if !beats.is_finite() || beats < 0. {
+            return Err("bad beats".into());
+        }
+        self.audio.set_loop(deck, beats);
+        Ok(())
+    }
+
+    /// `action`: "set" (here, on the nearest beat with quantize on), "jump", "clear"
+    pub fn deck_hotcue(&mut self, deck: usize, slot: usize, action: &str) -> Result<(), String> {
+        let path = self.loaded(deck)?.path.clone().unwrap_or_default();
+        if slot >= SLOTS {
+            return Err(format!("no slot {slot}"));
+        }
+        match action {
+            "set" => {
+                let mut at = self.audio.deck_states()[deck].position;
+                if self.mixer.quantize {
+                    if let Some(g) = &self.meta[deck].grid {
+                        let beat = 60. / g.bpm;
+                        at = (g.first_beat_s + ((at - g.first_beat_s) / beat).round() * beat).max(0.);
+                    }
+                }
+                self.hotcues.set(&path, slot, Some(at))?;
+                self.meta[deck].hot[slot] = Some(at);
+            }
+            "clear" => {
+                self.hotcues.set(&path, slot, None)?;
+                self.meta[deck].hot[slot] = None;
+            }
+            "jump" => {
+                let Some(at) = self.meta[deck].hot[slot] else {
+                    return Err(format!("hot cue {slot} is empty"));
+                };
+                self.audio.jump_to(deck, at, true);
+            }
+            other => return Err(format!("unknown action {other}")),
+        }
         Ok(())
     }
 
@@ -415,27 +664,129 @@ impl Engine {
     /// cue_mix (0 = cue only .. 1 = master only) for the mixer
     pub fn deck_set(&mut self, control: &str, deck: usize, value: f64) -> Result<(), String> {
         check_deck(deck)?;
+        if !value.is_finite() {
+            return Err("bad value".into());
+        }
         let v = value as f32;
+        let unit = value.clamp(-1., 1.);
         match control {
             "rate" => self.audio.set_rate(deck, value),
             "gain" => self.audio.set_gain(deck, v),
-            "low" => self.audio.set_eq(deck, 0, v),
-            "mid" => self.audio.set_eq(deck, 1, v),
-            "high" => self.audio.set_eq(deck, 2, v),
-            "filter" => self.audio.set_filter(deck, v),
-            "fader" => self.audio.set_fader(deck, v),
-            "cue" => self.audio.set_cue(deck, value != 0.),
-            "crossfader" => self.audio.set_crossfader(v),
-            "master" => self.audio.set_master(v),
-            "cue_mix" => self.audio.set_cue_mix(v),
+            "low" | "mid" | "high" => {
+                let band = ["low", "mid", "high"].iter().position(|b| *b == control).unwrap_or(0);
+                self.knobs[deck].eq[band] = unit;
+                self.audio.set_eq(deck, band, v);
+            }
+            "filter" => {
+                self.knobs[deck].filter = unit;
+                self.audio.set_filter(deck, v);
+            }
+            "fader" => {
+                self.knobs[deck].fader = value.clamp(0., 1.);
+                self.audio.set_fader(deck, v);
+            }
+            "cue" => {
+                self.knobs[deck].headphones = value != 0.;
+                self.audio.set_cue(deck, value != 0.);
+            }
+            "crossfader" => {
+                self.mixer.crossfader = unit;
+                self.audio.set_crossfader(v);
+            }
+            "master" => {
+                self.mixer.master = value.max(0.);
+                self.audio.set_master(v);
+            }
+            "cue_mix" => {
+                self.mixer.cue_mix = value.clamp(0., 1.);
+                self.audio.set_cue_mix(v);
+            }
+            "quantize" => {
+                self.mixer.quantize = value != 0.;
+                self.audio.set_quantize(value != 0.);
+            }
+            // reserved
+            "keylock" => {}
             other => return Err(format!("unknown control {other}")),
         }
         Ok(())
     }
 
+    /// Everything the UI shows about both decks, for `DjDecks`
+    pub fn deck_infos(&mut self) -> Vec<DeckInfo> {
+        for deck in 0..crate::audio::DECKS {
+            if self.meta[deck].path.is_some() && !self.meta[deck].analyzed {
+                self.bind_analysis(deck, false);
+            }
+        }
+        let states = self.audio.deck_states();
+        (0..crate::audio::DECKS)
+            .map(|deck| {
+                let (m, st, k) = (&self.meta[deck], &states[deck], &self.knobs[deck]);
+                let loaded = m.path.is_some();
+                let (decoded, done) = self.audio.decoded(deck);
+                let track_bpm = m.grid.as_ref().map_or(0., |g| g.bpm);
+                DeckInfo {
+                    loaded,
+                    path: m.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                    title: m.title.clone(),
+                    artist: m.artist.clone(),
+                    position: if loaded { st.position } else { 0. },
+                    duration: if !loaded {
+                        0.
+                    } else if done {
+                        decoded
+                    } else {
+                        m.length.max(decoded)
+                    },
+                    playing: loaded && st.playing,
+                    rate: st.rate,
+                    bpm: track_bpm * st.rate * st.nudge,
+                    track_bpm,
+                    beat_phase: if track_bpm > 0. { st.beat_phase } else { -1. },
+                    beat_in_bar: if track_bpm > 0. { st.beat_in_bar } else { 0 },
+                    synced: st.synced,
+                    loop_beats: st.loop_beats,
+                    loop_start: st.loop_start,
+                    loop_end: st.loop_end,
+                    cue_point: if loaded { st.cue } else { 0. },
+                    hotcues: m.hot.iter().map(|c| c.unwrap_or(-1.)).collect(),
+                    key: m.key.clone(),
+                    gain_db: m.gain_db,
+                    decoded,
+                    eq: (k.eq[0], k.eq[1], k.eq[2]),
+                    filter: k.filter,
+                    fader: k.fader,
+                    headphones: k.headphones,
+                }
+            })
+            .collect()
+    }
+
+    pub fn mixer_info(&self) -> MixerInfo {
+        MixerInfo {
+            crossfader: self.mixer.crossfader,
+            master: self.mixer.master,
+            cue_mix: self.mixer.cue_mix,
+            mode: match self.audio.mode() {
+                Mode::Internal => "internal",
+                Mode::External => "external",
+            }
+            .to_string(),
+            quantize: self.mixer.quantize,
+            xruns: self.audio.health().xruns,
+        }
+    }
+
     pub fn set_audio_mode(&mut self, mode: Mode) {
         self.audio.set_mode(mode);
+        self.push_volume();
+    }
+
+    /// The player volume goes to the audio thread, and the mixer knob mirror follows
+    fn push_volume(&mut self) {
         apply_volume(&mut self.audio, self.volume);
+        self.mixer.master = if self.audio.mode() == Mode::Internal { self.volume as f64 } else { 1. };
     }
 
     /// Per deck: (position s, playing, decoded s, decoding finished)
@@ -646,6 +997,15 @@ fn apply_volume(audio: &mut Audio, volume: f32) {
     match audio.mode() {
         Mode::Internal => audio.set_master(volume),
         Mode::External => audio.set_gain(PLAYER_DECK, volume),
+    }
+}
+
+fn grid_spec(g: &Grid) -> GridSpec {
+    GridSpec {
+        bpm: g.bpm,
+        first_beat_s: g.first_beat_s,
+        downbeat_offset: g.downbeat_offset as u32,
+        beats_per_bar: g.beats_per_bar as u32,
     }
 }
 
