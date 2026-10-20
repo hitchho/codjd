@@ -127,3 +127,42 @@ Rules:
 - Items whose time is already past when scheduled fire immediately (`Set`, `Swap`, `Play`...) or
   jump to their current interpolated value (`Ramp`).
 - `DeckInfo`/`MixerInfo` report the values as they move, so the UI shows automation live.
+
+## Set runtime (D-Bus)
+
+Runs a set's mixes with the automation engine. One set is *active* at a time. A mix is *armed*
+when its outgoing track is on a deck; it then runs by itself when that deck reaches the mix start,
+or is started by hand. Every method that changes something returns `"ok"` or an error string.
+
+| method | args | does |
+|---|---|---|
+| `SetUse` | `s name` | make a set active (by set name, file name or stem); `""` = none |
+| `SetArm` | `u mix` | arm mix `mix` (0-based, file order): the outgoing track must be on a deck (else error "load <track> first"); loads the incoming track onto the other deck at its play position, paused, synced; schedules the plan as one automation group on the outgoing deck's beat clock |
+| `SetDisarm` | — | cancel the armed/running mix's remaining automation (controls stay where they are) |
+| `SetAuto` | `b on` | auto mode: after a mix ends, arm the next one whose outgoing track is now on air |
+| `SetPreview` | `u mix, d bars_before` | audition: load both tracks, put the outgoing deck `bars_before` bars before the mix start, arm, play |
+| `SetLoad` | `u track` | load track `track` (0-based, file order) of the active set onto the free deck (the one not playing), with the set's grid/gain overrides |
+| `SetState` | — | `SetState` struct |
+
+```rust
+struct SetState {
+    name: String,            // active set, "" = none
+    file: String,
+    errors: u32,             // errors in the file (the last good version stays active)
+    tracks: Vec<(String, String, String)>,   // (id, title, path) in file order
+    mixes: Vec<(String, String, f64, f64)>,  // (from id, to id, start beat on from's grid, length in beats)
+    armed: i32,              // armed or running mix, -1 = none
+    running: bool,           // the armed mix has started
+    out_deck: i32,           // deck playing the outgoing track of the armed mix, -1
+    mix_beat: f64,           // beats since the armed mix's start (negative before it), 0 if none
+    auto: bool,
+    next_items: Vec<(f64, String)>,  // upcoming automation of the armed mix: (mix beat, text), at most 8
+}
+```
+
+Signature: `(ssua(sss)a(ssdd)ibidba(ds))`.
+
+Rules: a manual change of a control during a mix cancels only that control's automation (engine
+rule). Loading another track onto either deck of a running mix disarms it. Overrides from the set
+(`grid`, `gain`) apply to tracks loaded through `SetArm`/`SetLoad`/`SetPreview`, not to tracks loaded
+with `DjLoad`.
