@@ -1622,6 +1622,49 @@ impl<'a> Player {
         }
     }
 
+    /// queue every file `username` shares in the remote folder of `filename` (an album), in
+    /// track order, into a subfolder of the download dir named after the remote folder.
+    /// Only files in the received results that pass the search preferences are queued, and
+    /// files already downloading or downloaded from that user are skipped.
+    async fn slsk_download_folder(&mut self, username: String, filename: String) -> String {
+        use crate::soulseek::{find_alternates, folder_files, remote_folder, sanitize_folder_name};
+        let Some(client) = &self.soulseek else {
+            return "not connected".to_string();
+        };
+        let files = folder_files(&self.soulseek_ranked, &username, &filename);
+        if files.is_empty() {
+            return "no files from that folder in results".to_string();
+        }
+        let folder = remote_folder(&filename);
+        let subdir = sanitize_folder_name(folder);
+        let have: std::collections::HashSet<String> = client
+            .get_downloads()
+            .await
+            .into_iter()
+            .filter(|d| d.is_active() || d.is_complete())
+            .filter(|d| d.username == username)
+            .map(|d| d.remote_path)
+            .collect();
+        let (mut queued, mut skipped) = (0, 0);
+        for file in &files {
+            if have.contains(&file.file.filename) {
+                skipped += 1;
+                continue;
+            }
+            let alternates = find_alternates(&self.soulseek_ranked, file);
+            if let Err(e) = client.queue_download(file, alternates, subdir.as_deref()).await {
+                return format!("download error after {} files: {}", queued, e);
+            }
+            queued += 1;
+        }
+        let name = subdir.unwrap_or_else(|| folder.to_string());
+        if skipped > 0 {
+            format!("queued {} files from {} ({} already queued)", queued, name, skipped)
+        } else {
+            format!("queued {} files from {}", queued, name)
+        }
+    }
+
     /// get download list
     async fn slsk_get_downloads(&self) -> Vec<crate::soulseek::Download> {
         if let Some(client) = &self.soulseek {

@@ -338,6 +338,36 @@ impl DownloadManager {
     }
 }
 
+/// the folder part of a soulseek path (backslash separated, `/` tolerated), "" when none
+pub fn remote_folder(path: &str) -> &str {
+    path.rsplit_once(['\\', '/']).map(|(dir, _)| dir).unwrap_or("")
+}
+
+fn same_folder(a: &str, b: &str) -> bool {
+    a.replace('/', "\\") == b.replace('/', "\\")
+}
+
+/// Every file `username` shares in the same remote folder as `filename`, taken from the ranked
+/// results (so the format/bitrate/size preferences already apply), in track order: sorted by
+/// file name, case-insensitively. Duplicate paths are listed once.
+pub fn folder_files(ranked: &[RankedFile], username: &str, filename: &str) -> Vec<RankedFile> {
+    let folder = remote_folder(filename);
+    let mut files: Vec<RankedFile> = ranked
+        .iter()
+        .filter(|r| r.username == username && same_folder(remote_folder(&r.file.filename), folder))
+        .cloned()
+        .collect();
+    // same folder, so the file name decides; separators may differ between peers' paths
+    files.sort_by(|a, b| {
+        let key = |r: &RankedFile| r.file.basename().to_lowercase();
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.file.filename.cmp(&b.file.filename))
+    });
+    files.dedup_by(|a, b| a.file.filename == b.file.filename);
+    files
+}
+
 /// Other users' copies of `chosen`: same file name (case-insensitive) and the same size within
 /// 1%, one per user, in ranking order (best first), at most `MAX_ALTERNATES`
 pub fn find_alternates(ranked: &[RankedFile], chosen: &RankedFile) -> Vec<RankedFile> {
@@ -357,6 +387,28 @@ pub fn find_alternates(ranked: &[RankedFile], chosen: &RankedFile) -> Vec<Ranked
         }
     }
     out
+}
+
+/// A local directory name for a remote folder: its last component with path separators,
+/// control characters and characters Windows/samba shares reject replaced; None when nothing
+/// usable is left (empty, `.` or `..`)
+pub fn sanitize_folder_name(remote_folder: &str) -> Option<String> {
+    let last = remote_folder
+        .rsplit(['\\', '/'])
+        .find(|c| !c.trim().is_empty())?;
+    let cleaned: String = last
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim().to_string();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        return None;
+    }
+    Some(cleaned.chars().take(200).collect())
 }
 
 /// rank and sort search results by quality
@@ -569,6 +621,84 @@ mod schedule_tests {
         // removing a running one frees its slot too
         dm.remove(d).await;
         assert_eq!(dm.take_startable().await, vec![c]);
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn result(user: &str, paths: &[&str]) -> SearchResult {
+        SearchResult {
+            username: user.to_string(),
+            token: 1,
+            files: paths
+                .iter()
+                .map(|p| SharedFile {
+                    filename: p.to_string(),
+                    size: 1000,
+                    ..Default::default()
+                })
+                .collect(),
+            free_slots: true,
+            upload_speed: 0,
+            queue_size: 0,
+        }
+    }
+
+    #[test]
+    fn folder_groups_same_user_and_folder_in_track_order() {
+        let results = vec![
+            result(
+                "bob",
+                &[
+                    "Music\\Artist\\Album\\03 - c.flac",
+                    "Music\\Artist\\Album\\01 - a.flac",
+                    "Music\\Artist\\Album\\cover.jpg",
+                    "Music\\Artist\\Album\\02 - B.flac",
+                    "Music\\Artist\\Album\\CD2\\01 - x.flac",
+                    "Music\\Artist\\Other\\01 - a.flac",
+                ],
+            ),
+            result("eve", &["Music\\Artist\\Album\\04 - d.flac"]),
+        ];
+        let ranked = rank_search_results(&results, &SearchPrefs::default());
+        let files = folder_files(&ranked, "bob", "Music\\Artist\\Album\\02 - B.flac");
+        let names: Vec<&str> = files.iter().map(|f| f.file.basename()).collect();
+        // no cover.jpg, no subfolder, no other folder, nothing from eve
+        assert_eq!(names, vec!["01 - a.flac", "02 - B.flac", "03 - c.flac"]);
+    }
+
+    #[test]
+    fn folder_respects_format_prefs_and_mixed_separators() {
+        let results = vec![result(
+            "bob",
+            &["A\\Album\\1.mp3", "A/Album/2.flac", "A\\Album\\3.m4a", "A\\Album\\4.mp3"],
+        )];
+        let prefs = SearchPrefs {
+            formats: vec!["mp3".into(), "flac".into()],
+            ..Default::default()
+        };
+        let ranked = rank_search_results(&results, &prefs);
+        let files = folder_files(&ranked, "bob", "A\\Album\\1.mp3");
+        let names: Vec<&str> = files.iter().map(|f| f.file.basename()).collect();
+        assert_eq!(names, vec!["1.mp3", "2.flac", "4.mp3"]);
+    }
+
+    #[test]
+    fn folder_name_is_sanitized() {
+        assert_eq!(remote_folder("Music\\Artist\\Album\\x.flac"), "Music\\Artist\\Album");
+        assert_eq!(remote_folder("x.flac"), "");
+        assert_eq!(
+            sanitize_folder_name("Music\\Artist - Album: Live? (2001)").as_deref(),
+            Some("Artist - Album_ Live_ (2001)")
+        );
+        assert_eq!(sanitize_folder_name("@@x\\Music\\Album\\").as_deref(), Some("Album"));
+        assert_eq!(sanitize_folder_name("a\\..").as_deref(), None);
+        assert_eq!(sanitize_folder_name("a\\.").as_deref(), None);
+        assert_eq!(sanitize_folder_name(""), None);
+        assert_eq!(sanitize_folder_name("a\\b\u{0}c").as_deref(), Some("b_c"));
     }
 }
 

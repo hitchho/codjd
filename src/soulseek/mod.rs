@@ -11,7 +11,9 @@ mod protocol;
 mod types;
 
 pub use client::SoulseekClient;
-pub use download::{find_alternates, rank_search_results};
+pub use download::{
+    find_alternates, folder_files, rank_search_results, remote_folder, sanitize_folder_name,
+};
 pub use types::{
     ConnectionState, Download, DownloadState, RankedFile, SearchPrefs, SearchResult,
     SoulseekConfig,
