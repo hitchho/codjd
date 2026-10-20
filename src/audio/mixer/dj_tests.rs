@@ -11,8 +11,8 @@ use super::*;
 // ---- an allocator that notices allocations on a marked thread ----
 
 thread_local! {
-    static WATCH: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    pub(super) static WATCH: Cell<bool> = const { Cell::new(false) };
+    pub(super) static ALLOCS: Cell<usize> = const { Cell::new(0) };
 }
 
 struct Watching;
@@ -43,15 +43,15 @@ static ALLOC: Watching = Watching;
 
 // ---- helpers ----
 
-const SR: u32 = 8000;
+pub(super) const SR: u32 = 8000;
 /// track rate unlike the output rate, so the conversion is part of every test
-const TR: u32 = 7350;
+pub(super) const TR: u32 = 7350;
 
-fn silence(rate: u32, secs: f64) -> Arc<Track> {
+pub(super) fn silence(rate: u32, secs: f64) -> Arc<Track> {
     Track::from_frames(rate, &vec![(0., 0.); (rate as f64 * secs) as usize])
 }
 
-fn tone(rate: u32, secs: f64, hz: f64) -> Arc<Track> {
+pub(super) fn tone(rate: u32, secs: f64, hz: f64) -> Arc<Track> {
     let n = (rate as f64 * secs) as usize;
     let frames: Vec<(f32, f32)> = (0..n)
         .map(|i| {
@@ -63,7 +63,7 @@ fn tone(rate: u32, secs: f64, hz: f64) -> Arc<Track> {
 }
 
 /// An impulse on every beat of a grid (integer frames: pick numbers that make them)
-fn clicks(rate: u32, secs: f64, first: usize, every: usize) -> Arc<Track> {
+pub(super) fn clicks(rate: u32, secs: f64, first: usize, every: usize) -> Arc<Track> {
     let n = (rate as f64 * secs) as usize;
     let mut frames = vec![(0f32, 0f32); n];
     let mut i = first;
@@ -74,7 +74,7 @@ fn clicks(rate: u32, secs: f64, first: usize, every: usize) -> Arc<Track> {
     Track::from_frames(rate, &frames)
 }
 
-fn spec(bpm: f64, first: f64) -> GridSpec {
+pub(super) fn spec(bpm: f64, first: f64) -> GridSpec {
     GridSpec {
         bpm,
         first_beat_s: first,
@@ -83,15 +83,15 @@ fn spec(bpm: f64, first: f64) -> GridSpec {
     }
 }
 
-struct Rig {
-    m: Mixer,
-    tx: rtrb::Producer<Cmd>,
+pub(super) struct Rig {
+    pub(super) m: Mixer,
+    pub(super) tx: rtrb::Producer<Cmd>,
     _ev: rtrb::Consumer<RtEvent>,
     _gb: rtrb::Consumer<Arc<Track>>,
 }
 
 impl Rig {
-    fn new(out_rate: u32) -> Self {
+    pub(super) fn new(out_rate: u32) -> Self {
         let (tx, rx) = rtrb::RingBuffer::new(256);
         let (ev_tx, ev) = rtrb::RingBuffer::new(64);
         let (gb_tx, gb) = rtrb::RingBuffer::new(64);
@@ -99,45 +99,45 @@ impl Rig {
         Rig { m, tx, _ev: ev, _gb: gb }
     }
 
-    fn send(&mut self, c: Cmd) {
+    pub(super) fn send(&mut self, c: Cmd) {
         assert!(self.tx.push(c).is_ok());
         self.m.take_commands();
     }
 
-    fn load(&mut self, deck: usize, track: Arc<Track>, grid: Option<GridSpec>, at: f64, play: bool) {
+    pub(super) fn load(&mut self, deck: usize, track: Arc<Track>, grid: Option<GridSpec>, at: f64, play: bool) {
         self.send(Cmd::Load { deck, track, at, play, generation: 1 });
         self.send(Cmd::Grid(deck, grid));
     }
 
-    fn run(&mut self, frames: usize) {
+    pub(super) fn run(&mut self, frames: usize) {
         for _ in 0..frames {
             self.m.next();
         }
         self.m.publish();
     }
 
-    fn secs(&self, s: f64) -> usize {
+    pub(super) fn secs(&self, s: f64) -> usize {
         (s * self.m.out_rate) as usize
     }
 
-    fn d(&self, i: usize) -> &Deck {
+    pub(super) fn d(&self, i: usize) -> &Deck {
         &self.m.decks[i]
     }
 
     /// Whether deck `i`'s last rendered frame crossed a beat boundary of its grid
-    fn crossed(&self, i: usize) -> bool {
+    pub(super) fn crossed(&self, i: usize) -> bool {
         let d = self.d(i);
         let g = d.grid.unwrap();
         d.last_step > 0. && g.beats_at(d.last_pos).floor() != g.beats_at(d.last_pos + d.last_step).floor()
     }
 
-    fn tempo(&self, i: usize) -> f64 {
+    pub(super) fn tempo(&self, i: usize) -> f64 {
         self.d(i).grid.unwrap().bpm * self.d(i).rate
     }
 }
 
 /// Distance between two beat phases (0..1, circular)
-fn pdiff(a: f64, b: f64) -> f64 {
+pub(super) fn pdiff(a: f64, b: f64) -> f64 {
     let d = (a - b).abs();
     d.min(1. - d)
 }
@@ -422,8 +422,8 @@ fn nudge_shifts_the_phase_and_gives_the_rate_back() {
 
 /// A loop that doesn't fit a whole number of the sine's periods: without the crossfade the wrap
 /// would jump by up to 1.0
-const SINE_HZ: f64 = 150.;
-const BPM: f64 = 127.;
+pub(super) const SINE_HZ: f64 = 150.;
+pub(super) const BPM: f64 = 127.;
 
 fn sine_rig(rate: u32) -> Rig {
     let mut r = Rig::new(rate);

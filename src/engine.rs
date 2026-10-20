@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     analysis::{Analyzer, Grid},
-    audio::{sync_plan, Audio, AudioEvent, GridSpec, Mode},
+    audio::{sync_plan, Audio, AudioEvent, AutoItem, AutoKind, Control, GridSpec, Mode},
     config::Config,
     dj::{DeckInfo, MixerInfo},
     hotcues::{HotcueStore, Slots, SLOTS},
@@ -151,23 +151,14 @@ struct DeckMeta {
     hot: Slots,
 }
 
-/// Knob positions the audio thread only smooths towards: kept for `DjDecks`
-#[derive(Clone, Copy)]
+/// Knob state the audio thread does not publish (EQ, filter, fader and crossfader are read from
+/// it, because automation moves them too)
+#[derive(Clone, Copy, Default)]
 struct DeckKnobs {
-    eq: [f64; 3],
-    filter: f64,
-    fader: f64,
     headphones: bool,
 }
 
-impl Default for DeckKnobs {
-    fn default() -> Self {
-        Self { eq: [0.; 3], filter: 0., fader: 1., headphones: false }
-    }
-}
-
 struct MixerKnobs {
-    crossfader: f64,
     master: f64,
     cue_mix: f64,
     quantize: bool,
@@ -221,7 +212,7 @@ impl Engine {
             analyzer: None,
             meta: Default::default(),
             knobs: Default::default(),
-            mixer: MixerKnobs { crossfader: 0., master, cue_mix: 0., quantize: true },
+            mixer: MixerKnobs { master, cue_mix: 0., quantize: true },
             hotcues: HotcueStore::open_default(),
             gridfix: crate::gridfix::GridFixes::open_default(),
             sync_range: 0.16,
@@ -570,6 +561,58 @@ impl Engine {
         Ok(())
     }
 
+    /// Queues a beat-timed item (a ramp, a set, a swap, a play...) for the audio thread, which
+    /// runs it on the clock deck's beat grid at the exact frame. Checks what the audio thread
+    /// cannot: the clock needs a beat grid, a deck that is started or looped or jumped needs one
+    /// too, and a synced play has to stay within `sync_range` of the clock's tempo (now).
+    #[allow(dead_code)] // used by the set runtime (next layer)
+    pub fn schedule(&mut self, item: AutoItem) -> Result<(), String> {
+        if !item.is_sane(crate::audio::DECKS) {
+            return Err("bad automation item (deck out of range or a bad number)".into());
+        }
+        let names = ["A", "B"];
+        self.gridded(item.clock)
+            .map_err(|e| format!("clock deck {}: {e}", names[item.clock]))?;
+        match item.kind {
+            AutoKind::Ramp { deck, .. } | AutoKind::Set { deck, .. } | AutoKind::Pause { deck } | AutoKind::LoopOff { deck } => {
+                self.loaded(deck)?;
+            }
+            AutoKind::Swap { .. } => {
+                self.loaded(1 - item.clock)?;
+            }
+            AutoKind::Loop { deck, .. } | AutoKind::Jump { deck, .. } => {
+                self.gridded(deck).map_err(|e| format!("deck {}: {e}", names[deck]))?;
+            }
+            AutoKind::Play { deck, synced, .. } => {
+                let own = self.gridded(deck).map_err(|e| format!("deck {}: {e}", names[deck]))?;
+                if synced {
+                    let clock = self.meta[item.clock].grid.clone().ok_or("no beat grid")?;
+                    let tempo = clock.bpm * self.audio.deck_states()[item.clock].rate;
+                    let Some(plan) = sync_plan(tempo, own.bpm) else {
+                        return Err("tempo too far from the clock deck".into());
+                    };
+                    if (plan.rate - 1.).abs() > self.sync_range {
+                        return Err(format!(
+                            "synced play would change {} by {:+.0}% ({:.1} -> {:.1} BPM): fix a grid with \
+                             :grid, or raise sync_range",
+                            names[deck],
+                            (plan.rate - 1.) * 100.,
+                            own.bpm,
+                            tempo,
+                        ));
+                    }
+                }
+            }
+        }
+        self.audio.schedule(item)
+    }
+
+    /// Drops all pending and running automation of a mix
+    #[allow(dead_code)] // used by the set runtime (next layer)
+    pub fn cancel_group(&mut self, group: u32) {
+        self.audio.cancel_group(group);
+    }
+
     /// The CDJ cue button
     pub fn deck_cue(&mut self, deck: usize, pressed: bool) -> Result<(), String> {
         self.loaded(deck)?;
@@ -727,31 +770,24 @@ impl Engine {
             return Err("bad value".into());
         }
         let v = value as f32;
-        let unit = value.clamp(-1., 1.);
+        // manual wins: a hand on a control ends the automation of it
+        if let Some(c) = auto_control(control) {
+            self.audio.cancel_control(deck, c);
+        }
         match control {
             "rate" => self.audio.set_rate(deck, value),
             "gain" => self.audio.set_gain(deck, v),
             "low" | "mid" | "high" => {
                 let band = ["low", "mid", "high"].iter().position(|b| *b == control).unwrap_or(0);
-                self.knobs[deck].eq[band] = unit;
                 self.audio.set_eq(deck, band, v);
             }
-            "filter" => {
-                self.knobs[deck].filter = unit;
-                self.audio.set_filter(deck, v);
-            }
-            "fader" => {
-                self.knobs[deck].fader = value.clamp(0., 1.);
-                self.audio.set_fader(deck, v);
-            }
+            "filter" => self.audio.set_filter(deck, v),
+            "fader" => self.audio.set_fader(deck, v),
             "cue" => {
                 self.knobs[deck].headphones = value != 0.;
                 self.audio.set_cue(deck, value != 0.);
             }
-            "crossfader" => {
-                self.mixer.crossfader = unit;
-                self.audio.set_crossfader(v);
-            }
+            "crossfader" => self.audio.set_crossfader(v),
             "master" => {
                 self.mixer.master = value.max(0.);
                 self.audio.set_master(v);
@@ -819,9 +855,9 @@ impl Engine {
                     key: m.key.clone(),
                     gain_db: m.gain_db,
                     decoded,
-                    eq: (k.eq[0], k.eq[1], k.eq[2]),
-                    filter: k.filter,
-                    fader: k.fader,
+                    eq: (st.eq[0] as f64, st.eq[1] as f64, st.eq[2] as f64),
+                    filter: st.filter as f64,
+                    fader: st.fader as f64,
                     headphones: k.headphones,
                 }
             })
@@ -830,7 +866,7 @@ impl Engine {
 
     pub fn mixer_info(&self) -> MixerInfo {
         MixerInfo {
-            crossfader: self.mixer.crossfader,
+            crossfader: self.audio.crossfader() as f64,
             master: self.mixer.master,
             cue_mix: self.mixer.cue_mix,
             mode: match self.audio.mode() {
@@ -1078,6 +1114,20 @@ fn grid_spec(g: &Grid) -> GridSpec {
         downbeat_offset: g.downbeat_offset as u32,
         beats_per_bar: g.beats_per_bar as u32,
     }
+}
+
+/// The automation control a `deck_set` control name is
+fn auto_control(name: &str) -> Option<Control> {
+    Some(match name {
+        "fader" => Control::Fader,
+        "low" => Control::Low,
+        "mid" => Control::Mid,
+        "high" => Control::High,
+        "filter" => Control::Filter,
+        "gain" => Control::Gain,
+        "crossfader" => Control::Crossfader,
+        _ => return None,
+    })
 }
 
 fn check_deck(deck: usize) -> Result<(), String> {
