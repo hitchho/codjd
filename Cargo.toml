@@ -34,11 +34,22 @@ cpal = { version = "0.18", features = ["pipewire"] }
 rtrb = "0.4"
 symphonia = { version = "0.6", features = ["all", "opt-simd"] }
 ebur128 = "0.1"
+# beat and downbeat tracking (pure-Rust rten runtime; weights are loaded from the cache dir, see
+# src/analysis/models.rs)
+beat-this = { version = "1.1", default-features = false }
+# cross-check tempo and the pure-Rust key detector
+timestretch = "0.15"
+# verifies the model weights before they are loaded
+sha2 = "0.10"
+# optional: libKeyFinder, needs the system libkeyfinder 2.2 and fftw (GPL-3)
+libkeyfinder-sys = { version = "0.1", optional = true }
 
 [features]
 full-log = []
 trivial = []
 debug = []
+# key detection with libKeyFinder instead of the built-in pure-Rust detector
+keyfinder = ["dep:libkeyfinder-sys"]
 
 # analysis (bliss/fft) and decoding are 10-50x slower unoptimized; keep our own code debuggable
 [profile.dev.package."*"]

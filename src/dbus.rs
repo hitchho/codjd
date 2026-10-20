@@ -8,7 +8,7 @@ use tracing::warn;
 use zbus::{interface, object_server::SignalEmitter, Connection};
 
 use crate::{
-    analysis::Analyzer,
+    analysis::{Analyzer, Grid, Key},
     config::Config,
     engine::{Event, Codjd},
     library::Playlist,
@@ -259,8 +259,9 @@ impl Bus {
         self.analysis.progress()
     }
 
-    /// (bpm, loudness in dBFS, analyzed) of the file at `path`. The tempo is an estimate and can
-    /// be off by half or double.
+    /// (bpm, loudness in dBFS, analyzed) of the file at `path`. The tempo is the beat grid's
+    /// (see `GetGrid`) once that has been analyzed, until then bliss's estimate, which can be off
+    /// by half or double.
     async fn get_features(&self, path: String) -> (f64, f64, bool) {
         match self.analysis.features(std::path::Path::new(&path)) {
             Some(f) => (f.bpm() as f64, f.loudness_db() as f64, true),
@@ -268,8 +269,8 @@ impl Bus {
         }
     }
 
-    /// (integrated loudness in LUFS, suggested gain in dB toward -11 LUFS, bliss bpm estimate,
-    /// has_waveform) of the file at `path`; zeros and false until it has been analyzed. The gain
+    /// (integrated loudness in LUFS, suggested gain in dB toward -11 LUFS, bpm as in
+    /// `GetFeatures`, has_waveform) of the file at `path`; zeros and false until it has been analyzed. The gain
     /// is limited to +-12 dB and never lifts the sample peak above -1 dBFS.
     async fn get_analysis(&self, path: String) -> (f64, f64, f64, bool) {
         let path = std::path::Path::new(&path);
@@ -277,6 +278,25 @@ impl Bus {
             Some(f) => (f.lufs(), f.gain_db(), f.bpm() as f64, self.analysis.has_waveform(path)),
             None => (0., 0., 0., false),
         }
+    }
+
+    /// Beat grid of the file at `path`: (bpm, first_beat_s, downbeat_offset, beats_per_bar,
+    /// confidence, variable, octave_doubt, analyzed). Beat `k` (k = 0, 1, ...) is at
+    /// `first_beat_s + k * 60 / bpm`, the first grid beat at or after 0; it is a bar's beat 1 when
+    /// `k % beats_per_bar == downbeat_offset` (the offset is the weak part: check it by ear).
+    /// `confidence` is the share of detected beats within 35 ms of the grid; `variable` says the
+    /// tempo moves or the fit is poor, so a constant grid is only approximate; `octave_doubt`
+    /// says a second detector found about double, half, 3/2 or 2/3 of `bpm` (bpm is not changed).
+    /// `analyzed` is false, and the rest zero, until the grid exists: the file has not been
+    /// analyzed, the beat-this weights are missing, or no beats were found.
+    async fn get_grid(&self, path: String) -> (f64, f64, u32, u32, f64, bool, bool, bool) {
+        grid_reply(self.analysis.features(std::path::Path::new(&path)).as_ref().and_then(|f| f.grid()))
+    }
+
+    /// Key of the file at `path`: (camelot, name, analyzed), e.g. ("8A", "A minor", true).
+    /// Techno is often barely tonal, so treat it as a hint.
+    async fn get_key(&self, path: String) -> (String, String, bool) {
+        key_reply(self.analysis.features(std::path::Path::new(&path)).as_ref().and_then(|f| f.key()))
     }
 
     /// Waveform overview of an analyzed track, merged to at most `columns` columns (never more
@@ -536,6 +556,31 @@ impl Bus {
     }
 }
 
+type GridReply = (f64, f64, u32, u32, f64, bool, bool, bool);
+
+fn grid_reply(grid: Option<&Grid>) -> GridReply {
+    match grid {
+        Some(g) => (
+            g.bpm,
+            g.first_beat_s,
+            g.downbeat_offset as u32,
+            g.beats_per_bar as u32,
+            g.confidence,
+            g.variable,
+            g.octave_doubt,
+            true,
+        ),
+        None => (0., 0., 0, 0, 0., false, false, false),
+    }
+}
+
+fn key_reply(key: Option<&Key>) -> (String, String, bool) {
+    match key {
+        Some(k) => (k.camelot.clone(), k.name.clone(), true),
+        None => (String::new(), String::new(), false),
+    }
+}
+
 fn reply(result: Option<Result<(), String>>) -> String {
     match result {
         Some(Ok(())) => "ok".to_string(),
@@ -621,4 +666,26 @@ pub fn forward_signals(connection: &Connection, codjd: &Codjd) -> zbus::Result<(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zbus::zvariant::Type;
+
+    /// clients (codj, busctl scripts) rely on these shapes
+    #[test]
+    fn grid_and_key_signatures_are_pinned() {
+        // a method returning a tuple sends its members as separate out-arguments: "dduudbbb"
+        assert_eq!(<GridReply as Type>::SIGNATURE.to_string(), "(dduudbbb)");
+        assert_eq!(<(String, String, bool) as Type>::SIGNATURE.to_string(), "(ssb)");
+    }
+
+    #[test]
+    fn replies_are_zeroed_until_analyzed() {
+        assert_eq!(grid_reply(None), (0., 0., 0, 0, 0., false, false, false));
+        assert_eq!(key_reply(None), (String::new(), String::new(), false));
+        let k = Key::new(9, true, "test");
+        assert_eq!(key_reply(Some(&k)), ("8A".into(), "A minor".into(), true));
+    }
 }

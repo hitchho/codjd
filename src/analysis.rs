@@ -1,29 +1,42 @@
 //! Audio analysis of the library: a feature vector and tempo estimate (via bliss), integrated
-//! loudness (EBU R128) and a waveform overview per track, used for "similar tracks" now and for
-//! the DJ features later.
+//! loudness (EBU R128), a waveform overview, a beat grid and a key per track, used for "similar
+//! tracks" now and for the DJ features later.
 //!
 //! Analysis runs on its own worker threads and never blocks playback or D-Bus. A file is decoded
-//! once (`pass.rs`) and that pass feeds loudness, waveform and bliss. Results are cached in
+//! once (`pass.rs`) and that pass feeds loudness, waveform and bliss; those results are stored
+//! first, so they are available as soon as they were before. The same worker then runs the heavy
+//! part on the audio already in memory: key detection, and the beat grid with beat-this (see
+//! `grid.rs`, `models.rs`; skipped without the model weights). Results are cached in
 //! `~/.cache/codjd/analysis.json` (override the directory with `CODJD_CACHE_DIR`), keyed on
 //! path + size + mtime, so a file is only analyzed again when it changes. Waveforms are too big
 //! for that file and live next to it, one per track (see `waveform.rs`).
 
+mod grid;
+mod key;
+mod models;
 mod pass;
 pub mod waveform;
 
+pub use grid::{Grid, Key};
+pub use models::fetch_command as fetch_models;
+
 use std::{
     collections::{HashMap, HashSet},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use beat_this::{BeatThis, RtenRuntime, Runtime};
 use bliss_audio::{Song, AnalysisIndex, FeaturesVersion};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use models::Weights;
 
 /// What we keep per analyzed file
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -44,6 +57,15 @@ pub struct Features {
     peak_db: f64,
     #[serde(default)]
     duration_ms: u64,
+    /// constant beat grid; None until the grid analysis ran, or when the weights are missing or
+    /// no beats were found
+    #[serde(default)]
+    grid: Option<Grid>,
+    #[serde(default)]
+    key: Option<Key>,
+    /// the grid analysis ran (with the model) on this entry, whatever it found
+    #[serde(default)]
+    grid_done: bool,
 }
 
 /// Loudness the suggested gain aims for. Club masters of techno typically sit around -7 to -9
@@ -56,8 +78,12 @@ const MAX_GAIN_DB: f64 = 12.;
 const PEAK_CEILING_DB: f64 = -1.;
 
 impl Features {
-    /// Estimated tempo. aubio's estimate: often right, sometimes off by half or double
+    /// Tempo: the beat grid's when it has been analyzed, else bliss's (aubio) estimate, which is
+    /// often right but sometimes off by half or double and a few percent high
     pub fn bpm(&self) -> f32 {
+        if let Some(grid) = &self.grid {
+            return grid.bpm as f32;
+        }
         // bliss maps 0..206 BPM onto -1..1
         (self.vector[AnalysisIndex::Tempo as usize] + 1.) / 2. * 206.
     }
@@ -65,6 +91,14 @@ impl Features {
     /// Mean loudness in dBFS (bliss maps -90..0 dB onto -1..1)
     pub fn loudness_db(&self) -> f32 {
         (self.vector[AnalysisIndex::MeanLoudness as usize] + 1.) / 2. * 90. - 90.
+    }
+
+    pub fn grid(&self) -> Option<&Grid> {
+        self.grid.as_ref()
+    }
+
+    pub fn key(&self) -> Option<&Key> {
+        self.key.as_ref()
     }
 
     /// Integrated loudness in LUFS
@@ -102,6 +136,12 @@ pub struct Analyzer {
     pending: Mutex<HashSet<PathBuf>>,
     work: Mutex<mpsc::Sender<PathBuf>>,
     cache_path: Option<PathBuf>,
+    /// where the beat-this weights are looked for; None (tests) means there are none
+    models_dir: Option<PathBuf>,
+    /// whether missing weights may be downloaded (`CODJD_MODEL_DOWNLOAD=1`)
+    download_models: bool,
+    /// the verified weights, found (or not) on first use
+    weights: OnceLock<Option<Weights>>,
     /// where waveform files go; None (tests) keeps them off disk
     wave_dir: Option<PathBuf>,
     done: AtomicUsize,
@@ -109,8 +149,8 @@ pub struct Analyzer {
 }
 
 /// Bump when the cached content changes shape; old entries are then analyzed again.
-/// 1: bliss only. 2: + loudness, peak, duration, waveform files.
-const FORMAT: u16 = 2;
+/// 1: bliss only. 2: + loudness, peak, duration, waveform files. 3: + beat grid and key.
+const FORMAT: u16 = 3;
 const VERSION: u16 = FORMAT * 100 + FeaturesVersion::LATEST as u16;
 
 /// `CODJD_CACHE_DIR` (or the older `MUSAD_CACHE_DIR`), else `~/.cache/codjd`. A cache left in
@@ -137,10 +177,21 @@ impl Analyzer {
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).clamp(1, 4))
             .unwrap_or(1);
-        Self::start_with(cache_path, threads)
+        let models_dir = cache_dir().map(|d| models::dir_in(&d));
+        Self::start_full(cache_path, threads, models_dir, models::download_allowed())
     }
 
+    #[cfg(test)]
     fn start_with(cache_path: Option<PathBuf>, threads: usize) -> Arc<Self> {
+        Self::start_full(cache_path, threads, None, false)
+    }
+
+    fn start_full(
+        cache_path: Option<PathBuf>,
+        threads: usize,
+        models_dir: Option<PathBuf>,
+        download_models: bool,
+    ) -> Arc<Self> {
         let cache = cache_path
             .as_deref()
             .and_then(|p| std::fs::read(p).ok())
@@ -158,6 +209,9 @@ impl Analyzer {
             failed: Mutex::default(),
             pending: Mutex::default(),
             work: Mutex::new(tx),
+            models_dir,
+            download_models,
+            weights: OnceLock::new(),
             wave_dir: cache_path.as_deref().and_then(Path::parent).map(|d| d.join("waveforms")),
             cache_path,
             done: AtomicUsize::new(0),
@@ -177,14 +231,18 @@ impl Analyzer {
 
     /// Queues files for analysis; ones already cached (and unchanged) or known to fail are skipped
     pub fn enqueue<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
+        let grid_wanted = self.grid_wanted();
         let cache = self.cache.lock().unwrap();
         let failed = self.failed.lock().unwrap();
         let mut pending = self.pending.lock().unwrap();
         let work = self.work.lock().unwrap();
         for path in paths {
-            let fresh = cache
-                .get(&path)
-                .is_some_and(|f| stat(&path).is_some_and(|(s, m)| f.size == s && f.mtime == m));
+            // unchanged, and nothing to add: no weights to grid it with, same key detector
+            let fresh = cache.get(&path).is_some_and(|f| {
+                stat(&path).is_some_and(|(s, m)| f.size == s && f.mtime == m)
+                    && !(grid_wanted && !f.grid_done)
+                    && f.key.as_ref().is_none_or(|k| k.source == key::SOURCE)
+            });
             if fresh || failed.contains(&path) || !pending.insert(path.clone()) {
                 continue;
             }
@@ -199,6 +257,26 @@ impl Analyzer {
             self.done.load(Ordering::Relaxed) as u32,
             self.total.load(Ordering::Relaxed) as u32,
         )
+    }
+
+    /// Whether a beat grid could be made now: the weights are there and verify (hashed once, a
+    /// fraction of a second), or may still be downloaded
+    fn grid_wanted(&self) -> bool {
+        if let Some(w) = self.weights.get() {
+            return w.is_some();
+        }
+        if self.models_dir.as_deref().is_some_and(models::present) {
+            return self.weights().is_some();
+        }
+        // a download takes minutes: left to the worker that needs the weights first
+        self.download_models && self.models_dir.is_some()
+    }
+
+    /// The verified weights, looked up once (this may hash 83 MB, or download)
+    fn weights(&self) -> Option<&Weights> {
+        self.weights
+            .get_or_init(|| models::locate(self.models_dir.as_deref()?, self.download_models))
+            .as_ref()
     }
 
     pub fn features(&self, path: &Path) -> Option<Features> {
@@ -239,14 +317,25 @@ impl Analyzer {
         scored.into_iter().take(n).map(|(_, c)| c).collect()
     }
 
-    fn finish(&self, path: PathBuf, result: Option<Features>) {
-        match result {
-            Some(features) => {
-                self.cache.lock().unwrap().insert(path.clone(), features);
+    /// Makes the result of the fast pass visible
+    fn store(&self, path: &Path, features: Features) {
+        self.cache.lock().unwrap().insert(path.to_owned(), features);
+    }
+
+    /// Adds the grid stage's result to the stored entry, if the file is still the one analyzed
+    fn store_grid(&self, path: &Path, (size, mtime): (u64, u64), result: GridStage) {
+        if let Some(f) = self.cache.lock().unwrap().get_mut(path) {
+            if f.size == size && f.mtime == mtime {
+                f.key = result.key;
+                f.grid = result.grid;
+                f.grid_done = result.done;
             }
-            None => {
-                self.failed.lock().unwrap().insert(path.clone());
-            }
+        }
+    }
+
+    fn finish(&self, path: PathBuf, ok: bool) {
+        if !ok {
+            self.failed.lock().unwrap().insert(path.clone());
         }
         self.pending.lock().unwrap().remove(&path);
         self.done.fetch_add(1, Ordering::Relaxed);
@@ -275,16 +364,34 @@ impl Analyzer {
 
 fn worker(rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>, analyzer: std::sync::Weak<Analyzer>) {
     let mut last_save = Instant::now();
+    // loaded on first use, then kept for the next tracks
+    let mut beats = BeatModel::default();
     loop {
         let next = rx.lock().unwrap().recv();
         let Ok(path) = next else { return };
-        let Some(wave_file) = analyzer.upgrade().map(|a| a.wave_file(&path)) else { return };
-        let result = analyze(&path, wave_file);
-        if result.is_none() {
-            warn!(path = %path.display(), "can't analyze");
-        }
         let Some(analyzer) = analyzer.upgrade() else { return };
-        analyzer.finish(path, result);
+        match analyze(&path, analyzer.wave_file(&path)) {
+            None => {
+                warn!(path = %path.display(), "can't analyze");
+                analyzer.finish(path, false);
+            }
+            Some(fast) => {
+                // loudness, waveform and bliss are usable now; the heavy part follows
+                let stamp = (fast.features.size, fast.features.mtime);
+                analyzer.store(&path, fast.features);
+                let started = Instant::now();
+                let stage = grid_stage(&mut beats, &analyzer, fast.mono, fast.average_gain);
+                info!(
+                    path = %path.display(),
+                    grid_ms = started.elapsed().as_millis() as u64,
+                    bpm = stage.grid.as_ref().map(|g| format!("{:.2}", g.bpm)),
+                    key = stage.key.as_ref().map(|k| k.camelot.as_str()),
+                    "grid analyzed"
+                );
+                analyzer.store_grid(&path, stamp, stage);
+                analyzer.finish(path, true);
+            }
+        }
         // save every so often while busy, and once the queue drains
         if analyzer.idle() || last_save.elapsed() > Duration::from_secs(30) {
             analyzer.save();
@@ -293,7 +400,15 @@ fn worker(rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>, analyzer: std::sync::Weak<Ana
     }
 }
 
-fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Features> {
+struct Fast {
+    features: Features,
+    /// mono 22.05 kHz, kept for the grid stage so the file is not decoded twice
+    mono: Vec<f32>,
+    average_gain: f32,
+}
+
+/// Decode pass + bliss + waveform: everything that was analyzed before beat grids
+fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Fast> {
     let (size, mtime) = stat(path)?;
     let started = Instant::now();
     let pass = pass::run(path)
@@ -313,7 +428,7 @@ fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Features> {
         lufs = format!("{:.1}", pass.lufs),
         "analyzed"
     );
-    Some(Features {
+    let features = Features {
         size,
         mtime,
         version: VERSION,
@@ -321,7 +436,94 @@ fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Features> {
         lufs: pass.lufs,
         peak_db: 20. * pass.peak.max(1e-6).log10(),
         duration_ms: pass.duration_ms,
+        grid: None,
+        key: None,
+        grid_done: false,
+    };
+    Some(Fast { features, mono: pass.mono, average_gain: pass.average_gain })
+}
+
+/// What the grid stage found
+#[derive(Default)]
+struct GridStage {
+    key: Option<Key>,
+    grid: Option<Grid>,
+    /// the beat model ran (found a grid or not)
+    done: bool,
+}
+
+/// One worker's beat-this model, loaded on first use
+#[derive(Default)]
+struct BeatModel {
+    model: Option<BeatThis<<RtenRuntime as Runtime>::Model>>,
+    /// loading failed: don't try again for every track
+    broken: bool,
+}
+
+impl BeatModel {
+    fn get(&mut self, weights: &Weights) -> Option<&mut BeatThis<<RtenRuntime as Runtime>::Model>> {
+        if self.model.is_none() && !self.broken {
+            match BeatThis::new(&RtenRuntime, &weights.mel, &weights.beat) {
+                Ok(m) => self.model = Some(m),
+                Err(e) => {
+                    warn!(error = %e, "can't load the beat-this model");
+                    self.broken = true;
+                }
+            }
+        }
+        self.model.as_mut()
+    }
+}
+
+/// Key, and the beat grid if the weights are there. A panic in a detector (they are young
+/// crates) costs this track's grid, not the worker.
+fn grid_stage(model: &mut BeatModel, analyzer: &Analyzer, mono: Vec<f32>, gain: f32) -> GridStage {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let key = key::detect(&mono, pass::BLISS_RATE);
+        let Some(weights) = analyzer.weights() else {
+            return GridStage { key, ..Default::default() };
+        };
+        let Some(bt) = model.get(weights) else {
+            return GridStage { key, ..Default::default() };
+        };
+        // the cheap second opinion on the tempo, before beat-this takes the audio
+        let other_bpm = timestretch::analysis::beat::detect_beats(&mono, pass::BLISS_RATE).bpm;
+        let grid = beat_grid(bt, mono, gain, other_bpm)
+            .map_err(|e| warn!(error = %e, "beat tracking failed"))
+            .ok()
+            .flatten();
+        GridStage { key, grid, done: true }
+    }))
+    .unwrap_or_else(|_| {
+        warn!("a detector panicked; this track gets no grid");
+        *model = BeatModel::default();
+        GridStage { done: true, ..Default::default() }
     })
+}
+
+/// beat-this over the audio (streamed in chunks, scaled to a plain channel average), then the
+/// constant-grid fit
+fn beat_grid<M: beat_this::Model>(
+    bt: &mut BeatThis<M>,
+    mono: Vec<f32>,
+    gain: f32,
+    other_bpm: f64,
+) -> Result<Option<Grid>, String> {
+    let fail = |e: &dyn std::fmt::Display| e.to_string();
+    let mut stream = bt.stream(pass::BLISS_RATE).map_err(|e| fail(&e))?;
+    let mut chunk = Vec::with_capacity(1 << 16);
+    for part in mono.chunks(1 << 16) {
+        chunk.clear();
+        chunk.extend(part.iter().map(|s| s * gain));
+        stream.push(&chunk).map_err(|e| fail(&e))?;
+    }
+    drop(mono);
+    let analysis = stream.finish().map_err(|e| fail(&e))?;
+    let mut grid = grid::fit_grid(&analysis.beats, &analysis.downbeats);
+    if let Some(g) = &mut grid {
+        g.octave_doubt = grid::octave_doubt(g.bpm, other_bpm);
+    }
+    Ok(grid)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -352,6 +554,9 @@ mod tests {
             lufs: -14.,
             peak_db: -3.,
             duration_ms: 0,
+            grid: None,
+            key: None,
+            grid_done: false,
         }
     }
 
@@ -442,6 +647,56 @@ mod tests {
         }
         let b = Analyzer::start_with(Some(cache), 1);
         assert_eq!(b.features(&wav), Some(f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the beat-this weights in the cache dir: a 30 s click track at 120 BPM gets a grid
+    /// near it, stored in the cache file and answered by `grid()`. Skipped without the weights.
+    #[test]
+    fn click_track_gets_a_beat_grid() {
+        // read-only lookup (not `cache_dir()`, which may move an old cache directory)
+        let models = std::env::var_os("CODJD_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs::cache_dir().map(|d| d.join("codjd")))
+            .map(|d| models::dir_in(&d))
+            .filter(|d| models::present(d));
+        let Some(models) = models else {
+            eprintln!("skipped: no beat-this weights in the cache dir (codjd fetch-models)");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("codjd-grid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("click.wav");
+        write_click_track(&wav, 120., 30.);
+        let cache = dir.join("analysis.json");
+
+        let a = Analyzer::start_full(Some(cache.clone()), 1, Some(models.clone()), false);
+        a.enqueue([wav.clone()]);
+        let start = Instant::now();
+        while a.progress() != (1, 1) && start.elapsed() < Duration::from_secs(300) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let f = a.features(&wav).expect("analyzed");
+        assert!(f.grid_done);
+        let g = f.grid().expect("a grid");
+        assert!((g.bpm - 120.).abs() < 0.3, "bpm {}", g.bpm);
+        assert!(g.confidence > 0.9, "confidence {}", g.confidence);
+        assert!(!g.variable && !g.octave_doubt, "{g:?}");
+        // the grid sits on the clicks: a beat every 0.5 s starting at 0
+        let phase = (g.first_beat_s / 0.5).fract();
+        assert!(phase < 0.1 || phase > 0.9, "first beat {}", g.first_beat_s);
+        assert_eq!(f.bpm() as f64, g.bpm as f32 as f64);
+        // saved, and an unchanged file with a grid is not analyzed again
+        while !cache.exists() && start.elapsed() < Duration::from_secs(300) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let b = Analyzer::start_full(Some(cache), 1, Some(models), false);
+        let again = b.features(&wav).unwrap();
+        let g2 = again.grid().expect("grid survives the cache file");
+        // (JSON drops the last bit of a float)
+        assert!((g2.bpm - g.bpm).abs() < 1e-9 && g2.downbeat_offset == g.downbeat_offset);
+        b.enqueue([wav.clone()]);
+        assert_eq!(b.progress(), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

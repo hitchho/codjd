@@ -32,6 +32,9 @@ pub struct Pass {
     pub duration_ms: u64,
     /// mono, 22.05 kHz: the input to `bliss_audio::Song::analyze`
     pub mono: Vec<f32>,
+    /// multiply `mono` by this to get the plain channel average (beat-this was trained on
+    /// averaged stereo; bliss's downmix is sqrt(2) louder)
+    pub average_gain: f32,
     pub waveform: Waveform,
 }
 
@@ -68,6 +71,7 @@ pub fn run(path: &Path) -> Result<Pass, String> {
     let mut mono_native: Vec<f32> = Vec::new();
     let mut frames = 0u64;
     let mut errors = 0;
+    let mut average_gain = 1.;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
@@ -90,6 +94,9 @@ pub fn run(path: &Path) -> Result<Pass, String> {
             Err(e) => return Err(e.to_string()),
         };
         let channels = decoded.spec().channels().count().max(1);
+        if frames == 0 && channels == 2 {
+            average_gain = std::f32::consts::FRAC_1_SQRT_2;
+        }
         interleaved.resize(decoded.samples_interleaved(), 0.);
         decoded.copy_to_slice_interleaved(&mut interleaved);
         stereo.clear();
@@ -129,6 +136,7 @@ pub fn run(path: &Path) -> Result<Pass, String> {
         peak,
         duration_ms,
         mono,
+        average_gain,
         waveform: wave.finish(duration_ms),
     })
 }

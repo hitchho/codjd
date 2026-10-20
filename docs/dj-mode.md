@@ -149,9 +149,42 @@ Per track, cached next to the current analysis:
 - **Waveform** at a few resolutions (overview + zoomed), with low/mid/high energy for colour.
 - **Loudness** (integrated LUFS) → automatic gain so tracks play at the same level.
 
-Done so far: loudness (`ebur128`, target -11 LUFS, `GetAnalysis`) and the waveform overview
-(50 columns/s, peak + RMS in low/mid/high, `GetWaveform`), both from the same single decode pass
-that feeds bliss. Beat grid and key are still open.
+Done so far: loudness (`ebur128`, target -11 LUFS, `GetAnalysis`), the waveform overview
+(50 columns/s, peak + RMS in low/mid/high, `GetWaveform`), and the beat grid and key (below).
+Loudness, waveform and bliss come from one decode pass; the grid and key are computed from that
+same audio right after, in the same worker, so nothing is decoded twice and the fast results are
+available before the grid is.
+
+### Beat grid and key (stored per track in `analysis.json`)
+
+- **Grid** (`GetGrid`): `bpm` and `first_beat_s` of a constant grid fitted (least squares, beat
+  number against time, strays dropped) to beat-this's beats; beat `k` is at
+  `first_beat_s + k * 60 / bpm`. `downbeat_offset`: the beats with `k % beats_per_bar == offset`
+  are bar starts (majority vote of beat-this's downbeats; the weak part). `beats_per_bar` is 4.
+  `confidence`: share of the detected beats within 35 ms of the grid. `variable`: confidence
+  below 0.8, or the two halves of the track differ by more than 1% in tempo. `octave_doubt`:
+  timestretch's `detect_beats` (2 s) found about 2x, 1/2, 3/2 or 2/3 of beat-this's tempo; the
+  tempo itself is not changed. `GetFeatures`/`GetAnalysis` report the grid's bpm once there is
+  one (bliss's estimate before).
+- **Key** (`GetKey`): Camelot ("8A") and name ("A minor"), plus the detector that made it.
+  Default build: timestretch's pure-Rust `detect_key`. With `cargo build --features keyfinder`:
+  libKeyFinder (what Mixxx uses; it matched the user's key tags better), which needs the system
+  library: `pacman -S libkeyfinder` on Arch (libkeyfinder 2.2 and fftw, plus a C++ compiler; for
+  a private install point `PKG_CONFIG_PATH` at its `lib/pkgconfig`, and `LD_LIBRARY_PATH` at its
+  `lib` to run). GPL-3, as codjd is. Switching detectors re-analyzes cached tracks.
+- Cost: about 12 s per track with beat-this's large model (plus the 2 s cross-check and a couple
+  of seconds for the key) on top of the 5-8 s fast pass, so a first scan of a big library takes
+  a while; each worker thread keeps its own copy of the model (about 200 MB). A cache entry made
+  before the weights were there gets its grid on the next scan once they are.
+- **Weights.** beat-this's `beat_this.onnx` (83 MB) and `mel_spectrogram.onnx` (0.3 MB) are not
+  shipped. They live in `~/.cache/codjd/models/beat-this/` (under `CODJD_CACHE_DIR` if set) and
+  are checked against SHA-256 values compiled into codjd every time they are loaded; a file with
+  another hash is never used. codjd does not use the network by itself: run `codjd fetch-models`
+  once (needs `curl`; https only; downloads from the beat-this-rs GitHub release, verifies, then
+  moves into place), or start codjd with `CODJD_MODEL_DOWNLOAD=1` to fetch missing weights on
+  first use. Or copy the two files in by hand and check them against
+  `5f810deb...0f02` (`beat_this.onnx`) and `fdd59e65...3dd9` (`mel_spectrogram.onnx`). Without
+  weights the grid is skipped (one warning in the log) and key and everything else still work.
 
 ## Keyboard
 
@@ -251,4 +284,4 @@ other libKeyFinder and stratum agree exactly on 37/109, libKeyFinder and timestr
 Pick: **beat-this large for BPM and grid** (analysis in the background, once per track), with
 timestretch's 2 s `detect_beats` as the cross-check that flags 2x/0.5x disagreements;
 **libKeyFinder for key** (needs libkeyfinder 2.2 + FFTW and a C++ build; GPL-3 matches codjd).
-Not wired into codjd yet.
+Wired into codjd (above); key falls back to timestretch unless built with `--features keyfinder`.
