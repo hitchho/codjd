@@ -344,6 +344,68 @@ impl Bus {
             .tell(move |e| e.delete_from_playlist(index as usize, &id));
     }
 
+    // ---- decks (DJ mode groundwork) ----
+
+    /// load a file on deck 0 (A, also the player's) or 1 (B), paused at the start
+    async fn dj_load(&self, deck: u32, path: String) -> String {
+        let result = self
+            .musad
+            .call(move |e| e.deck_load(deck as usize, std::path::Path::new(&path)))
+            .await;
+        reply(result)
+    }
+
+    async fn dj_play(&self, deck: u32) -> String {
+        reply(self.musad.call(move |e| e.deck_play(deck as usize)).await)
+    }
+
+    async fn dj_pause(&self, deck: u32) -> String {
+        reply(self.musad.call(move |e| e.deck_pause(deck as usize)).await)
+    }
+
+    async fn dj_seek(&self, deck: u32, seconds: f64) -> String {
+        reply(
+            self.musad
+                .call(move |e| e.deck_seek(deck as usize, seconds))
+                .await,
+        )
+    }
+
+    /// controls: rate, gain, fader, cue (per deck); crossfader, master, cue_mix (deck ignored)
+    async fn dj_set(&self, control: String, deck: u32, value: f64) -> String {
+        reply(
+            self.musad
+                .call(move |e| e.deck_set(&control, deck as usize, value))
+                .await,
+        )
+    }
+
+    /// "internal" (musa mixes: master + headphones) or "external" (deck A and B outputs)
+    async fn dj_mode(&self, mode: String) -> String {
+        let mode = match mode.as_str() {
+            "internal" => crate::audio::Mode::Internal,
+            "external" => crate::audio::Mode::External,
+            other => return format!("unknown mode {other}"),
+        };
+        reply(self.musad.call(move |e| Ok(e.set_audio_mode(mode))).await)
+    }
+
+    /// per deck: (position s, playing, decoded s, decoding finished)
+    async fn dj_state(&self) -> Vec<(f64, bool, f64, bool)> {
+        self.ask(|e| e.decks()).await
+    }
+
+    /// (xruns, second output underruns, second output skips, sample rate)
+    async fn audio_health(&self) -> (u64, u64, u64, u32) {
+        self.ask(|e| e.audio_health()).await
+    }
+
+    async fn audio_devices(&self) -> Vec<String> {
+        tokio::task::spawn_blocking(crate::audio::list_devices)
+            .await
+            .unwrap_or_default()
+    }
+
     // ---- soulseek ----
 
     /// connect to soulseek in the background; poll slsk_state / slsk_status
@@ -444,6 +506,14 @@ impl Bus {
         self.slsk
             .set_preferences(prefs, max_concurrent_downloads as usize)
             .await
+    }
+}
+
+fn reply(result: Option<Result<(), String>>) -> String {
+    match result {
+        Some(Ok(())) => "ok".to_string(),
+        Some(Err(e)) => e,
+        None => "engine not running".to_string(),
     }
 }
 

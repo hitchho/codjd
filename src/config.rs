@@ -12,6 +12,9 @@ pub struct Config {
     pub volume: f32,
     pub allow_formats: Option<Vec<FileFormat>>,
     pub playlist_save_path: String,
+    /// outputs and mixing mode
+    #[serde(default)]
+    pub audio: crate::audio::AudioConfig,
 }
 
 impl Default for Config {
@@ -24,6 +27,7 @@ impl Default for Config {
             allow_formats: Some(vec![FileFormat::Ogg, FileFormat::Flac, FileFormat::Mp3]),
             // FIXME
             playlist_save_path: String::default(),
+            audio: Default::default(),
         }
     }
 }

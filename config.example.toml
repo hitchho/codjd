@@ -4,3 +4,14 @@ repeat = "AllMusics" # Dont, ThisMusic
 volume = 0.9 # value beteen 0.0 and 1.0
 allow_formats = ["ogg", "flac", "mp3"] # webm, still not supported tho
 playlist_save_path = "/home/user/.local/share/musad/playlist.json" # No default, provide an empty file
+
+# Audio outputs (optional; without this section musad plays on the default output)
+[audio]
+# "internal": musa mixes; main = master (PA/speakers), second = headphones (cue)
+# "external": musa is only the decks; main = deck A, second = deck B, into a club mixer
+mode = "internal"
+# "default" or part of a device name (`busctl --user call net.rotko.Musa /net/rotko/Musa
+# net.rotko.Musa.Player AudioDevices` lists them)
+main = "default"
+# empty: no second output
+second = ""

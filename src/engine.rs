@@ -17,11 +17,11 @@ use std::{
     time::Duration,
 };
 
-use rodio::Sink;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::{
+    audio::{Audio, AudioEvent, Mode},
     config::Config,
     library::{Playlist, PlaylistStore},
     types::{
@@ -120,10 +120,23 @@ impl Musad {
     }
 }
 
+/// Normal playback uses deck A
+const PLAYER_DECK: usize = 0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Stopped,
+    Playing,
+    Paused,
+}
+
 pub struct Engine {
-    sink: Sink,
-    /// must outlive the sink
-    _stream: rodio::OutputStream,
+    audio: Audio,
+    /// the player's state; the audio thread's own view lags by a callback
+    transport: Transport,
+    /// tags the playing track, so a late end event from a replaced one is ignored
+    generation: u64,
+    volume: f32,
     pub playlist: Playlist,
     store: PlaylistStore,
     allow_formats: Option<Vec<FileFormat>>,
@@ -133,27 +146,32 @@ pub struct Engine {
     queue: VecDeque<Music>,
     /// playlist position to continue after once the queue has played
     resume_after_queue: Option<u32>,
-    /// stop() was called; the sink drops its sources asynchronously, so it can still look busy
-    stopped: bool,
     handle: Musad,
 }
 
 impl Engine {
     fn new(config: Config, handle: Musad) -> std::io::Result<Self> {
-        let stream = rodio::OutputStreamBuilder::open_default_stream()
-            .map_err(|e| std::io::Error::other(format!("can't open the audio output: {e}")))?;
-        let sink = Sink::connect_new(stream.mixer());
-        sink.set_volume(config.volume);
+        let events = handle.clone();
+        let mut audio = Audio::start(&config.audio, move |event| match event {
+            AudioEvent::Ended { deck, generation } if deck == PLAYER_DECK => {
+                events.tell(move |e| e.track_ended(generation))
+            }
+            AudioEvent::Ended { .. } => {}
+        })
+        .map_err(|e| std::io::Error::other(format!("can't open the audio output: {e}")))?;
+        let volume = config.volume.clamp(0., 1.);
+        apply_volume(&mut audio, volume);
         Ok(Self {
-            sink,
-            _stream: stream,
+            audio,
+            transport: Transport::Stopped,
+            generation: 0,
+            volume,
             playlist: Playlist::from_config(&config),
             store: PlaylistStore::new(&config.playlist_save_path),
             allow_formats: config.allow_formats.clone(),
-            muted_volume: config.volume,
+            muted_volume: volume,
             queue: VecDeque::new(),
             resume_after_queue: None,
-            stopped: false,
             handle,
         })
     }
@@ -177,28 +195,16 @@ impl Engine {
             return;
         };
         let path = <&std::path::Path>::from(&music.path).to_path_buf();
-        let source = std::fs::File::open(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|f| rodio::Decoder::try_from(f).map_err(|e| e.to_string()));
-        let source = match source {
-            Ok(source) => source,
+        match self.audio.load(PLAYER_DECK, &path, 0., true) {
+            Ok(generation) => self.generation = generation,
             Err(e) => {
                 error!(path = %path.display(), error = %e, "can't play");
                 return;
             }
-        };
+        }
         info!("playing {}", path.display());
         self.playlist.playing_index = index;
-        self.stopped = false;
-        self.sink.clear();
-        self.sink.append(source);
-        // runs on the audio thread when the track is done
-        let handle = self.handle.clone();
-        self.sink
-            .append(rodio::source::EmptyCallback::new(Box::new(move || {
-                handle.tell(|e| e.track_ended());
-            })));
-        self.sink.play();
+        self.transport = Transport::Playing;
         self.emit(Event::MusicPlayed);
     }
 
@@ -231,7 +237,10 @@ impl Engine {
         self.start(self.playlist.previous_music_index());
     }
 
-    fn track_ended(&mut self) {
+    fn track_ended(&mut self, generation: u64) {
+        if generation != self.generation || self.transport != Transport::Playing {
+            return;
+        }
         // queued tracks play even with repeat off / repeat one, and the list continues after
         let queue_pending = !self.queue.is_empty()
             || (self.resume_after_queue.is_some() && !matches!(self.playlist.repeat, Repeat::Dont));
@@ -254,52 +263,60 @@ impl Engine {
                 }
             }
             PlayingStatus::Playing => {
-                self.sink.pause();
+                self.audio.pause(PLAYER_DECK);
+                self.transport = Transport::Paused;
                 self.emit(Event::Paused);
             }
             PlayingStatus::Pausing => {
-                self.sink.play();
+                self.audio.play(PLAYER_DECK);
+                self.transport = Transport::Playing;
                 self.emit(Event::MusicPlayed);
             }
         }
     }
 
     pub fn pause(&mut self) {
-        self.sink.pause();
+        if self.transport == Transport::Playing {
+            self.audio.pause(PLAYER_DECK);
+            self.transport = Transport::Paused;
+        }
         self.emit(Event::Paused);
     }
 
     pub fn resume(&mut self) {
-        self.sink.play();
+        if self.transport == Transport::Paused {
+            self.audio.play(PLAYER_DECK);
+            self.transport = Transport::Playing;
+        }
         self.emit(Event::Resumed);
     }
 
     pub fn stop(&mut self) {
-        self.stopped = true;
-        self.sink.stop();
+        self.audio.pause(PLAYER_DECK);
+        self.audio.seek(PLAYER_DECK, 0.);
+        self.transport = Transport::Stopped;
         self.emit(Event::Ended);
     }
 
     pub fn seek(&mut self, seconds: f64) {
-        if let Err(e) = self.sink.try_seek(Duration::from_secs_f64(seconds.max(0.))) {
-            warn!(error = %e, "can't seek");
-        }
+        self.audio.seek(PLAYER_DECK, seconds.max(0.));
     }
 
     pub fn set_volume(&mut self, volume: f32) {
-        let volume = volume.clamp(0., 1.);
-        self.sink.set_volume(volume);
-        self.emit(Event::VolumeChanged(volume));
+        self.volume = volume.clamp(0., 1.);
+        apply_volume(&mut self.audio, self.volume);
+        self.emit(Event::VolumeChanged(self.volume));
     }
 
     pub fn toggle_mute(&mut self) {
-        if self.sink.volume() != 0. {
-            self.muted_volume = self.sink.volume();
-            self.sink.set_volume(0.);
+        if self.volume != 0. {
+            self.muted_volume = self.volume;
+            self.volume = 0.;
         } else {
-            self.sink.set_volume(self.muted_volume);
+            self.volume = self.muted_volume;
         }
-        self.emit(Event::VolumeChanged(self.sink.volume()));
+        apply_volume(&mut self.audio, self.volume);
+        self.emit(Event::VolumeChanged(self.volume));
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
@@ -315,22 +332,19 @@ impl Engine {
     // ---- state ----
 
     pub fn status(&self) -> PlayingStatus {
-        if self.stopped {
-            return PlayingStatus::Stopped;
-        }
-        match (self.sink.is_paused(), self.sink.empty()) {
-            (_, true) => PlayingStatus::Stopped,
-            (true, false) => PlayingStatus::Pausing,
-            (false, false) => PlayingStatus::Playing,
+        match self.transport {
+            Transport::Stopped => PlayingStatus::Stopped,
+            Transport::Paused => PlayingStatus::Pausing,
+            Transport::Playing => PlayingStatus::Playing,
         }
     }
 
     pub fn position(&self) -> Duration {
-        self.sink.get_pos()
+        Duration::from_secs_f64(self.audio.position(PLAYER_DECK).max(0.))
     }
 
     pub fn volume(&self) -> f32 {
-        self.sink.volume()
+        self.volume
     }
 
     pub fn playing(&self) -> Music {
@@ -360,6 +374,77 @@ impl Engine {
 
     pub fn lyrics(&self) -> Lyrics {
         self.playing().extract_lyrics().unwrap_or_default()
+    }
+
+    // ---- decks (DJ mode) ----
+
+    /// Puts `path` on `deck`, paused at the start. Deck A is also the player's deck.
+    pub fn deck_load(&mut self, deck: usize, path: &std::path::Path) -> Result<(), String> {
+        check_deck(deck)?;
+        let generation = self.audio.load(deck, path, 0., false)?;
+        if deck == PLAYER_DECK {
+            // the player no longer owns what's on deck A
+            self.generation = generation;
+            self.transport = Transport::Stopped;
+        }
+        Ok(())
+    }
+
+    pub fn deck_play(&mut self, deck: usize) -> Result<(), String> {
+        check_deck(deck)?;
+        self.audio.play(deck);
+        Ok(())
+    }
+
+    pub fn deck_pause(&mut self, deck: usize) -> Result<(), String> {
+        check_deck(deck)?;
+        self.audio.pause(deck);
+        Ok(())
+    }
+
+    pub fn deck_seek(&mut self, deck: usize, seconds: f64) -> Result<(), String> {
+        check_deck(deck)?;
+        self.audio.seek(deck, seconds.max(0.));
+        Ok(())
+    }
+
+    /// Sets a mixer control: rate, gain, fader, cue (0/1) per deck; crossfader (-1..1), master,
+    /// cue_mix (0 = cue only .. 1 = master only) for the mixer
+    pub fn deck_set(&mut self, control: &str, deck: usize, value: f64) -> Result<(), String> {
+        check_deck(deck)?;
+        let v = value as f32;
+        match control {
+            "rate" => self.audio.set_rate(deck, value),
+            "gain" => self.audio.set_gain(deck, v),
+            "fader" => self.audio.set_fader(deck, v),
+            "cue" => self.audio.set_cue(deck, value != 0.),
+            "crossfader" => self.audio.set_crossfader(v),
+            "master" => self.audio.set_master(v),
+            "cue_mix" => self.audio.set_cue_mix(v),
+            other => return Err(format!("unknown control {other}")),
+        }
+        Ok(())
+    }
+
+    pub fn set_audio_mode(&mut self, mode: Mode) {
+        self.audio.set_mode(mode);
+        apply_volume(&mut self.audio, self.volume);
+    }
+
+    /// Per deck: (position s, playing, decoded s, decoding finished)
+    pub fn decks(&self) -> Vec<(f64, bool, f64, bool)> {
+        (0..crate::audio::DECKS)
+            .map(|d| {
+                let (decoded, done) = self.audio.decoded(d);
+                (self.audio.position(d), self.audio.is_playing(d), decoded, done)
+            })
+            .collect()
+    }
+
+    /// (xruns, second output underruns, second output skips, sample rate)
+    pub fn audio_health(&self) -> (u64, u64, u64, u32) {
+        let h = self.audio.health();
+        (h.xruns, h.second_underruns, h.second_skips, self.audio.rate())
     }
 
     // ---- queue ----
@@ -463,8 +548,8 @@ impl Engine {
                 self.playlist.playing_index = 0;
                 self.queue.clear();
                 self.resume_after_queue = None;
-                self.stopped = true;
-                self.sink.stop();
+                self.audio.pause(PLAYER_DECK);
+                self.transport = Transport::Stopped;
                 self.emit(Event::PlaylistLoaded(name.to_string()));
             }
             None => warn!(name, "no such playlist"),
@@ -538,5 +623,22 @@ impl Engine {
 fn log_err(result: std::io::Result<()>) {
     if let Err(e) = result {
         error!("{e}");
+    }
+}
+
+/// The player volume is the master level in internal mode; in external mode there is no master
+/// (the club mixer has it), so it trims deck A
+fn apply_volume(audio: &mut Audio, volume: f32) {
+    match audio.mode() {
+        Mode::Internal => audio.set_master(volume),
+        Mode::External => audio.set_gain(PLAYER_DECK, volume),
+    }
+}
+
+fn check_deck(deck: usize) -> Result<(), String> {
+    if deck < crate::audio::DECKS {
+        Ok(())
+    } else {
+        Err(format!("no deck {deck}"))
     }
 }

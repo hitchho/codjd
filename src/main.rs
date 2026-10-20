@@ -1,6 +1,7 @@
 use std::error::Error;
 
 mod analysis;
+mod audio;
 mod config;
 mod dbus;
 mod engine;
