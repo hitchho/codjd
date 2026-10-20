@@ -12,8 +12,13 @@ Decided:
   - *internal*: musa is decks and mixer. Master → outputs 1/2 (PA), headphone cue → 3/4.
 - **Long beatmatched blends first** (techno/house): accurate beat grid, sync, nudge, EQ/bass swaps;
   keylock soon after.
-- **Headphone cueing is essential** in internal mode → a 4-output USB interface (one device, one
-  clock; the laptop jack as cue output is a fallback only, two devices drift).
+- **Headphone cueing is essential** in internal mode → a second stereo output. No interface needed:
+  laptop jack → PA/mixer and a cheap USB-C audio dongle → headphones (or the other way round).
+  The engine supports several output devices and corrects their clock drift (the cue output is
+  resampled to follow the master), so separate cheap devices work. External mode needs two
+  outputs to the club mixer: two dongles, or a 4-output interface for a tidier, sturdier setup.
+- Hardware that still matters is only the outputs: Bluetooth headphones are unusable for cueing
+  (150–250 ms latency), and a USB device avoids the ground hum the laptop jack can pick up.
 
 ## Two modes
 
@@ -35,7 +40,8 @@ deck B ─ gain ─ EQ3 ─ filter ─ fader ─┴─ crossfader ─ master ─
                      └──── cue (PFL per deck) + cue/master mix ─────────── internal: out 3/4
 ```
 
-- cpal (ALSA / PipeWire-JACK), one multichannel output stream; a real-time callback that never
+- cpal (ALSA / PipeWire-JACK); one output stream per device (master, cue, or deck A / deck B),
+  the master device's clock leads and the others are drift-corrected; a real-time callback that never
   locks, allocates or does I/O. Commands go in through a lock-free ring buffer; state (positions,
   levels) comes out through atomics/ring buffer for the UI.
 - Tracks are decoded into RAM ahead of time (a 7-minute stereo track at 44.1 kHz is about 150 MB
