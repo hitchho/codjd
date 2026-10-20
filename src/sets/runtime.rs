@@ -712,3 +712,494 @@ fn plan_play_from(plan: &MixPlan) -> f64 {
         })
         .unwrap_or(0.)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        audio::{Control as AC, Curve as ACurve},
+        sets::testenv::{grid, FakeEnv},
+    };
+    use zbus::zvariant::Type;
+
+    const SRC: &str = r#"
+set "t"
+track aft "Aftertekno.flac"
+  grid 112 @ 0.012s
+  gain -1.5dB
+  cue outro bar 5
+track smk "Smokin.flac"
+  gain -3dB
+track xyz "Xyz.flac"
+
+mix aft -> smk at aft.outro over 8 bars
+  smk play
+  bars 0..4 smk.low kill; smk.fader 0 -> 1
+  bar 4 swap low
+  bars 4..8 aft.filter _ -> -0.6 exp; aft.fader 1 -> 0
+  bar 8 aft stop
+
+mix smk -> xyz at bar 9 over 4 bars
+  xyz play unsynced
+  bar 1 xfade = 0.5
+"#;
+
+    fn env() -> FakeEnv {
+        let mut e = FakeEnv { root: "/music".into(), ..Default::default() };
+        e.add("P", "Aftertekno", "Aftertekno.flac", Some(grid(112., 0.5, 0)));
+        e.add("A", "Smokin", "Smokin.flac", Some(grid(126., 0.1, 2)));
+        e.add("X", "Xyz", "Xyz.flac", Some(grid(120., 0., 0)));
+        e
+    }
+
+    fn compiled(src: &str) -> Arc<Compiled> {
+        let l = crate::sets::load(Path::new("/sets/t.codj"), src, &env());
+        assert!(l.diags.is_empty(), "{:?}", l.diags);
+        Arc::new(l.compiled.unwrap())
+    }
+
+    fn p(f: &str) -> PathBuf {
+        PathBuf::from("/music").join(f)
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        decks: [DeckView; 2],
+        loads: Vec<(usize, PathBuf, f64, Option<Grid>, Option<f64>)>,
+        pins: Vec<(usize, Grid, Option<f64>)>,
+        scheduled: Vec<AutoItem>,
+        cancelled: Vec<u32>,
+        played: Vec<usize>,
+        sync_err: Option<String>,
+        sched_fail_at: Option<usize>,
+        decoded: [(f64, bool); 2],
+    }
+
+    impl Host for Fake {
+        fn deck(&mut self, d: usize) -> DeckView {
+            self.decks[d].clone()
+        }
+        fn title(&self, path: &Path) -> String {
+            format!("title of {}", path.file_stem().unwrap().to_string_lossy())
+        }
+        fn load(&mut self, d: usize, path: &Path, at: f64, g: Option<&Grid>, gain: Option<f64>) -> Result<(), String> {
+            self.loads.push((d, path.to_path_buf(), at, g.cloned(), gain));
+            self.decks[d] = DeckView { path: Some(path.to_path_buf()), grid: g.cloned(), position: at, fader: 1., ..Default::default() };
+            Ok(())
+        }
+        fn pin(&mut self, d: usize, g: &Grid, gain: Option<f64>) {
+            self.pins.push((d, g.clone(), gain));
+            self.decks[d].grid = Some(g.clone());
+        }
+        fn sync_ok(&mut self, _: usize, _: f64) -> Result<(), String> {
+            self.sync_err.clone().map_or(Ok(()), Err)
+        }
+        fn schedule(&mut self, item: AutoItem) -> Result<(), String> {
+            if self.sched_fail_at == Some(self.scheduled.len()) {
+                return Err("automation pool full".into());
+            }
+            self.scheduled.push(item);
+            Ok(())
+        }
+        fn cancel_group(&mut self, g: u32) {
+            self.cancelled.push(g);
+            self.scheduled.retain(|i| i.group != g);
+        }
+        fn play(&mut self, d: usize) -> Result<(), String> {
+            self.played.push(d);
+            self.decks[d].playing = true;
+            Ok(())
+        }
+        fn decoded(&mut self, d: usize) -> (f64, bool) {
+            self.decoded[d]
+        }
+    }
+
+    /// aft on deck 0 playing with the set's grid, a runtime with the set active
+    fn rig() -> (Runtime, Fake, Arc<Compiled>) {
+        let c = compiled(SRC);
+        let mut rt = Runtime::default();
+        rt.activate("/sets/t.codj".into(), Arc::clone(&c));
+        let mut h = Fake::default();
+        h.decoded = [(1e6, true); 2];
+        let aft_grid = c.set.track("aft").unwrap().grid.clone();
+        h.decks[0] = DeckView { path: Some(p("Aftertekno.flac")), grid: aft_grid, playing: true, fader: 1., ..Default::default() };
+        (rt, h, c)
+    }
+
+    fn start_beat(c: &Compiled) -> f64 {
+        c.plans[0].start_beat
+    }
+
+    fn put(h: &mut Fake, deck: usize, c: &Compiled, mix_beat: f64) {
+        let g = h.decks[deck].grid.clone().unwrap();
+        h.decks[deck].position = g.first_beat_s + (start_beat(c) + mix_beat) * 60. / g.bpm;
+    }
+
+    #[test]
+    fn plan_maps_to_items_on_the_outgoing_clock() {
+        let c = compiled(SRC);
+        let plan = &c.plans[0];
+        let items = map_plan(plan, 1, 0, 7);
+        assert_eq!(items.len(), plan.items.len());
+        let s = plan.start_beat;
+        assert!(items.iter().all(|i| i.group == 7 && i.clock == 1));
+        // the incoming track (smk) is deck 0 here, the outgoing one deck 1
+        assert_eq!(items[0], AutoItem { group: 7, clock: 1, at_beat: s, kind: AutoKind::Play { deck: 0, from_beat: 2., synced: true } });
+        assert!(items.contains(&AutoItem { group: 7, clock: 1, at_beat: s, kind: AutoKind::Set { deck: 0, control: AC::Low, value: -1. } }));
+        assert!(items.contains(&AutoItem {
+            group: 7,
+            clock: 1,
+            at_beat: s,
+            kind: AutoKind::Ramp { deck: 0, control: AC::Fader, from: Some(0.), to: 1., end_beat: s + 16., curve: ACurve::Linear }
+        }));
+        assert!(items.contains(&AutoItem { group: 7, clock: 1, at_beat: s + 16., kind: AutoKind::Swap { band: AC::Low } }));
+        assert!(items.contains(&AutoItem {
+            group: 7,
+            clock: 1,
+            at_beat: s + 16.,
+            kind: AutoKind::Ramp { deck: 1, control: AC::Filter, from: None, to: -0.6, end_beat: s + 32., curve: ACurve::Exp }
+        }));
+        assert!(items.contains(&AutoItem { group: 7, clock: 1, at_beat: s + 32., kind: AutoKind::Pause { deck: 1 } }));
+        assert!(items.iter().all(|i| i.is_sane(2)));
+        // a late arm moves the start of the incoming deck by whole beats, nothing else
+        let late = map_plan_late(plan, 1, 0, 7, 3.);
+        assert_eq!(late[0].at_beat, s + 3.);
+        assert_eq!(late[0].kind, AutoKind::Play { deck: 0, from_beat: 5., synced: true });
+        assert_eq!(late[1..], items[1..]);
+    }
+
+    #[test]
+    fn arming_loads_the_incoming_deck_with_the_sets_overrides() {
+        let (mut rt, mut h, c) = rig();
+        rt.arm(&mut h, 0).unwrap();
+        // smk goes on the other deck with its gain and its grid (analysis, not an override here)
+        let (d, path, at, g, gain) = h.loads.last().unwrap().clone();
+        assert_eq!((d, path, gain), (1, p("Smokin.flac"), Some(-3.)));
+        assert_eq!(g, c.set.track("smk").unwrap().grid);
+        // beat 2 of smk's grid: 0.1 s + 2 beats at 126
+        assert!((at - (0.1 + 2. * 60. / 126.)).abs() < 1e-9, "{at}");
+        // the plan is on aft's effective grid (the `grid` line), clock = deck 0
+        let aft = c.set.track("aft").unwrap().grid.as_ref().unwrap();
+        assert!((aft.first_beat_s - 0.012).abs() < 1e-9);
+        assert_eq!(h.scheduled.len(), c.plans[0].items.len());
+        assert!(h.scheduled.iter().all(|i| i.clock == 0 && i.group == 1));
+        assert_eq!(h.scheduled[0].at_beat, start_beat(&c));
+        assert_eq!(h.scheduled[0].kind, AutoKind::Play { deck: 1, from_beat: 2., synced: true });
+        // outgoing deck had the set's grid already: nothing re-applied
+        assert!(h.pins.is_empty());
+        let st = rt.state(&mut h);
+        assert_eq!((st.armed, st.running, st.out_deck), (0, false, 0));
+    }
+
+    #[test]
+    fn a_plain_djload_gets_the_sets_grid_when_armed() {
+        let (mut rt, mut h, c) = rig();
+        h.decks[0].grid = Some(grid(112., 0.5, 0)); // as DjLoad left it: the analysis
+        h.decks[0].playing = false;
+        rt.arm(&mut h, 0).unwrap();
+        let want = c.set.track("aft").unwrap().grid.clone().unwrap();
+        // the grid, and the gain too since the deck is not playing
+        assert_eq!(h.pins, [(0, want, Some(-1.5))]);
+        // a playing deck keeps its gain
+        let (mut rt, mut h, _) = rig();
+        h.decks[0].grid = Some(grid(112., 0.5, 0));
+        rt.arm(&mut h, 0).unwrap();
+        assert_eq!(h.pins[0].2, None);
+    }
+
+    #[test]
+    fn arming_errors() {
+        let (mut rt, mut h, _) = rig();
+        assert_eq!(rt.arm(&mut h, 5), Err("no mix 5".into()));
+        // mix 1 needs smk on a deck
+        assert_eq!(rt.arm(&mut h, 1), Err("load smk first".into()));
+        let mut idle = Runtime::default();
+        assert!(idle.arm(&mut h, 0).unwrap_err().starts_with("no active set"));
+
+        // no grid on a track of the mix
+        let mut c = (*compiled(SRC)).clone();
+        c.set.tracks[1].grid = None;
+        rt.activate("/sets/t.codj".into(), Arc::new(c));
+        assert_eq!(rt.arm(&mut h, 0), Err("no beat grid: smk".into()));
+        assert!(h.loads.is_empty() && h.scheduled.is_empty());
+
+        // sync range: refused before anything is loaded over the other deck
+        let (mut rt, mut h, _) = rig();
+        h.sync_err = Some("synced play would change B by +30%".into());
+        assert!(rt.arm(&mut h, 0).unwrap_err().contains("+30%"));
+        assert!(h.loads.is_empty() && h.scheduled.is_empty());
+        assert_eq!(rt.state(&mut h).armed, -1);
+
+        // the pool filling up half way drops what was scheduled
+        let (mut rt, mut h, _) = rig();
+        h.sched_fail_at = Some(3);
+        assert_eq!(rt.arm(&mut h, 0), Err("automation pool full".into()));
+        assert!(h.scheduled.is_empty());
+        assert_eq!(h.cancelled, [1]);
+
+        // an audible deck on the other side is not loaded over by hand
+        let (mut rt, mut h, c) = rig();
+        h.decks[1] = DeckView { path: Some(p("Xyz.flac")), grid: c.set.track("xyz").unwrap().grid.clone(), playing: true, fader: 1., ..Default::default() };
+        assert_eq!(rt.arm(&mut h, 0), Err("deck B is playing: stop it first".into()));
+        h.decks[1].fader = 0.;
+        rt.arm(&mut h, 0).unwrap();
+
+        // the mix is over
+        let (mut rt, mut h, c) = rig();
+        put(&mut h, 0, &c, 33.);
+        assert_eq!(rt.arm(&mut h, 0), Err("that mix is over".into()));
+    }
+
+    #[test]
+    fn rearming_replaces_the_group_and_a_late_arm_shifts_the_start() {
+        let (mut rt, mut h, c) = rig();
+        rt.arm(&mut h, 0).unwrap();
+        rt.arm(&mut h, 0).unwrap();
+        assert_eq!(h.cancelled, [1]);
+        assert!(h.scheduled.iter().all(|i| i.group == 2));
+        assert_eq!(h.scheduled.len(), c.plans[0].items.len());
+        // 2.4 beats into the mix: the incoming deck starts on beat 3, 3 beats further in
+        put(&mut h, 0, &c, 2.4);
+        rt.arm(&mut h, 0).unwrap();
+        assert_eq!(h.scheduled[0].at_beat, start_beat(&c) + 3.);
+        assert_eq!(h.scheduled[0].kind, AutoKind::Play { deck: 1, from_beat: 5., synced: true });
+        let at = h.loads.last().unwrap().2;
+        assert!((at - (0.1 + 5. * 60. / 126.)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_mode_chains_the_next_mix_from_the_track_on_air() {
+        let (mut rt, mut h, c) = rig();
+        rt.set_auto(true);
+        rt.arm(&mut h, 0).unwrap();
+        rt.tick(&mut h);
+        assert!(!rt.state(&mut h).running);
+        put(&mut h, 0, &c, 1.);
+        rt.tick(&mut h);
+        let st = rt.state(&mut h);
+        assert!(st.running && st.armed == 0);
+        assert!((st.mix_beat - 1.).abs() < 1e-9);
+        // smk went on air on deck 1; the mix ends
+        h.decks[1].playing = true;
+        put(&mut h, 0, &c, 32.);
+        rt.tick(&mut h);
+        let st = rt.state(&mut h);
+        // mix 1 (smk -> xyz) is armed with smk's deck as the clock, xyz on the free deck
+        assert_eq!((st.armed, st.running, st.out_deck), (1, false, 1));
+        assert_eq!(h.loads.last().unwrap().0, 0);
+        assert_eq!(h.loads.last().unwrap().1, p("Xyz.flac"));
+        assert!(h.scheduled.iter().filter(|i| i.group == 2).all(|i| i.clock == 1));
+        assert!(h.scheduled.iter().any(|i| i.group == 2));
+        // auto off: it just ends
+        let (mut rt, mut h, c) = rig();
+        rt.arm(&mut h, 0).unwrap();
+        put(&mut h, 0, &c, 1.);
+        rt.tick(&mut h);
+        h.decks[1].playing = true;
+        put(&mut h, 0, &c, 32.);
+        rt.tick(&mut h);
+        assert_eq!(rt.state(&mut h).armed, -1);
+    }
+
+    #[test]
+    fn loading_a_deck_of_the_mix_disarms_it() {
+        let (mut rt, mut h, _) = rig();
+        rt.arm(&mut h, 0).unwrap();
+        rt.deck_replaced(&mut h, 1);
+        assert_eq!(rt.state(&mut h).armed, -1);
+        assert_eq!(h.cancelled, [1]);
+        // also when only the tick sees it
+        rt.arm(&mut h, 0).unwrap();
+        h.decks[0].path = Some(p("Xyz.flac"));
+        rt.tick(&mut h);
+        assert_eq!(rt.state(&mut h).armed, -1);
+        assert_eq!(h.cancelled, [1, 2]);
+        // SetDisarm leaves controls alone and is harmless twice
+        let (mut rt, mut h, _) = rig();
+        rt.arm(&mut h, 0).unwrap();
+        rt.disarm(&mut h);
+        rt.disarm(&mut h);
+        assert_eq!(h.cancelled, [1]);
+    }
+
+    fn store_with(src: &str) -> (Arc<Store>, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("codjd-rt-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.codj");
+        std::fs::write(&file, src).unwrap();
+        let store = Store::new(dir.clone(), Arc::new(env()));
+        store.load_all();
+        (store, file, dir)
+    }
+
+    #[test]
+    fn hot_reload_rearms_before_the_start_and_keeps_a_running_plan() {
+        let (store, file, dir) = store_with(SRC);
+        let mut rt = Runtime::default();
+        rt.set_store(Arc::clone(&store));
+        let mut h = Fake::default();
+        h.decoded = [(1e6, true); 2];
+        rt.use_set(&mut h, "t").unwrap();
+        let c = Arc::clone(&rt.active.as_ref().unwrap().compiled);
+        h.decks[0] = DeckView { path: Some(p("Aftertekno.flac")), grid: c.set.track("aft").unwrap().grid.clone(), playing: true, fader: 1., ..Default::default() };
+        rt.arm(&mut h, 0).unwrap();
+        rt.tick(&mut h);
+        assert!(h.cancelled.is_empty());
+
+        // an unrelated edit (the second mix) does not touch the armed one
+        std::fs::write(&file, SRC.replace("bar 1 xfade = 0.5", "bar 2 xfade = 0.5")).unwrap();
+        store.reload_file(&file);
+        rt.tick(&mut h);
+        assert!(h.cancelled.is_empty());
+
+        // the armed mix changes: re-armed with the new plan
+        std::fs::write(&file, SRC.replace("bar 4 swap low", "bar 5 swap low")).unwrap();
+        store.reload_file(&file);
+        rt.tick(&mut h);
+        assert_eq!(h.cancelled, [1]);
+        let swap = h.scheduled.iter().find(|i| matches!(i.kind, AutoKind::Swap { .. })).unwrap();
+        assert_eq!(swap.at_beat, start_beat(&c) + 20.);
+        assert!(h.scheduled.iter().all(|i| i.group == 2));
+
+        // running: the plan stays
+        put(&mut h, 0, &c, 2.);
+        rt.tick(&mut h);
+        assert!(rt.state(&mut h).running);
+        std::fs::write(&file, SRC.replace("bar 4 swap low", "bar 6 swap low")).unwrap();
+        store.reload_file(&file);
+        rt.tick(&mut h);
+        assert_eq!(h.cancelled, [1]);
+        let swap = h.scheduled.iter().find(|i| matches!(i.kind, AutoKind::Swap { .. })).unwrap();
+        assert_eq!(swap.at_beat, start_beat(&c) + 20.);
+        // ...but the set shown is the new one
+        assert!(rt.state(&mut h).mixes[0].3 > 0.);
+        assert!(!Arc::ptr_eq(&rt.active.as_ref().unwrap().compiled, &c));
+
+        // the mix is removed while armed and not running: dropped
+        let (mut rt2, mut h2, _) = rig();
+        rt2.set_store(Arc::clone(&store));
+        rt2.use_set(&mut h2, "t").unwrap();
+        h2.decks[0].grid = rt2.active.as_ref().unwrap().compiled.set.track("aft").unwrap().grid.clone();
+        h2.decks[0].playing = true;
+        rt2.arm(&mut h2, 0).unwrap();
+        std::fs::write(&file, "track aft \"Aftertekno.flac\"\ntrack smk \"Smokin.flac\"\n").unwrap();
+        store.reload_file(&file);
+        rt2.tick(&mut h2);
+        assert_eq!(rt2.state(&mut h2).armed, -1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_use_by_name_file_and_none() {
+        let (store, _file, dir) = store_with(SRC);
+        let mut rt = Runtime::default();
+        let mut h = Fake::default();
+        assert_eq!(rt.use_set(&mut h, "t"), Err("no set folder".into()));
+        rt.set_store(store);
+        assert_eq!(rt.use_set(&mut h, "nope"), Err("no set \"nope\"".into()));
+        rt.use_set(&mut h, "t.codj").unwrap();
+        assert_eq!(rt.state(&mut h).name, "t");
+        rt.use_set(&mut h, "").unwrap();
+        let st = rt.state(&mut h);
+        assert_eq!((st.name.as_str(), st.armed, st.out_deck), ("", -1, -1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_shape_and_next_items() {
+        let (mut rt, mut h, c) = rig();
+        let st = rt.state(&mut h);
+        assert_eq!((st.name.as_str(), st.errors, st.armed, st.out_deck, st.mix_beat), ("t", 0, -1, -1, 0.));
+        assert!(st.next_items.is_empty());
+        assert_eq!(st.file, "/sets/t.codj");
+        assert_eq!(st.tracks.len(), 3);
+        assert_eq!(st.tracks[1], ("smk".into(), "title of Smokin".into(), "/music/Smokin.flac".into()));
+        assert_eq!(st.mixes.len(), 2);
+        assert_eq!((st.mixes[0].0.as_str(), st.mixes[0].1.as_str(), st.mixes[0].3), ("aft", "smk", 32.));
+        assert_eq!(st.mixes[0].2, start_beat(&c));
+        assert_eq!(st.mixes[1].3, 16.);
+
+        rt.arm(&mut h, 0).unwrap();
+        put(&mut h, 0, &c, -4.);
+        let st = rt.state(&mut h);
+        assert!((st.mix_beat + 4.).abs() < 1e-9);
+        let texts: Vec<_> = st.next_items.iter().map(|(b, t)| (*b, t.as_str())).collect();
+        assert_eq!(
+            texts,
+            [
+                (0., "B play"),
+                (0., "B low = -1"),
+                (0., "bars 0–4 · B fader 0 → 1"),
+                (16., "swap low"),
+                (16., "bars 4–8 · A filter _ → -0.6"),
+                (16., "bars 4–8 · A fader 1 → 0"),
+                (32., "A stop"),
+            ]
+            .map(|(b, t): (f64, &str)| (b, t))
+        );
+        assert!(st.next_items.iter().all(|(_, t)| t.chars().count() <= 40 && !t.starts_with("bar ")));
+        // past items are gone, at most 8 are listed
+        put(&mut h, 0, &c, 17.);
+        assert_eq!(rt.state(&mut h).next_items, [(32., "A stop".to_string())]);
+        let mut many = c.plans[0].clone();
+        for i in 0..20 {
+            many.items.push(PlanItem::Pause { deck: Deck::In, at_beat_rel: 1. + i as f64 / 10. });
+        }
+        assert_eq!(next_items(&many, -1., 0).len(), 8);
+    }
+
+    #[test]
+    fn state_signature_is_pinned() {
+        assert_eq!(SetState::SIGNATURE.to_string(), "(ssua(sss)a(ssdd)ibidba(ds))");
+    }
+
+    #[test]
+    fn preview_loads_both_waits_for_the_decoder_and_plays() {
+        let (mut rt, mut h, c) = rig();
+        h.decks[0] = DeckView::default();
+        h.decoded = [(0.5, false); 2];
+        rt.preview(&mut h, 0, 2.).unwrap();
+        // the outgoing track on deck 0 two bars (8 beats) before the start, smk on deck 1
+        let aft = c.set.track("aft").unwrap().grid.clone().unwrap();
+        let (d, path, at, g, gain) = h.loads[0].clone();
+        assert_eq!((d, path, gain), (0, p("Aftertekno.flac"), Some(-1.5)));
+        assert_eq!(g.as_ref(), Some(&aft));
+        assert!((at - (aft.first_beat_s + (start_beat(&c) - 8.) * 60. / aft.bpm)).abs() < 1e-9);
+        assert_eq!(h.loads[1].0, 1);
+        assert_eq!(rt.state(&mut h).armed, 0);
+        rt.tick(&mut h);
+        assert!(h.played.is_empty(), "still decoding");
+        h.decoded = [(1e6, true); 2];
+        rt.tick(&mut h);
+        assert_eq!(h.played, [0]);
+        // negative bars are an error
+        assert!(rt.preview(&mut h, 0, -1.).is_err());
+    }
+
+    #[test]
+    fn set_load_picks_the_free_deck_with_overrides() {
+        let (mut rt, mut h, c) = rig();
+        rt.set_load_for_test(&mut h, 1);
+        assert_eq!(h.loads.len(), 1);
+        let (d, path, at, g, gain) = h.loads[0].clone();
+        assert_eq!((d, path, at, gain), (1, p("Smokin.flac"), 0., Some(-3.)));
+        assert_eq!(g, c.set.track("smk").unwrap().grid);
+        // both playing: nowhere to put it
+        h.decks[1].playing = true;
+        assert_eq!(rt.load_track(&mut h, 2), Err("no free deck: both are playing".into()));
+        assert_eq!(rt.load_track(&mut h, 9), Err("no track 9".into()));
+        // loading onto the incoming deck of an armed mix disarms it
+        h.decks[1].playing = false;
+        rt.arm(&mut h, 0).unwrap();
+        rt.load_track(&mut h, 2).unwrap();
+        assert_eq!(rt.state(&mut h).armed, -1);
+    }
+
+    impl Runtime {
+        fn set_load_for_test(&mut self, h: &mut Fake, t: usize) {
+            self.load_track(h, t).unwrap();
+        }
+    }
+}

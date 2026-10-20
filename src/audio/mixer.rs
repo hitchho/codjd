@@ -1597,6 +1597,8 @@ impl Mixer {
 mod auto_tests;
 #[cfg(test)]
 mod dj_tests;
+#[cfg(test)]
+mod set_tests;
 
 #[cfg(test)]
 mod tests {
