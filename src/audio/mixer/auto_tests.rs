@@ -615,3 +615,26 @@ fn automation_never_allocates_or_frees() {
     assert_eq!(ALLOCS.with(|a| a.get()), 0, "allocation or free while automating");
     assert!(r.m.auto.is_empty(), "everything ran: {} left", r.m.auto.len());
 }
+
+#[test]
+fn back_to_back_ramps_hand_over_at_the_shared_beat() {
+    let mut r = rig2(120., 120.);
+    r.send(Cmd::Fader(1, 0.));
+    r.run(3000);
+    sched(&mut r, ramp(1, Control::Fader, Some(0.), 1., 2., 6., Curve::Linear));
+    sched(&mut r, ramp(1, Control::Fader, None, 0., 6., 10., Curve::Linear));
+    let mut at_six = None;
+    for _ in 0..60_000 {
+        step(&mut r);
+        let b = beat(&r);
+        if at_six.is_none() && b + EPS >= 6. {
+            at_six = Some(r.d(1).fader.current);
+        }
+        if b > 10.2 {
+            break;
+        }
+    }
+    assert_eq!(at_six, Some(1.), "the second ramp starts from where the first ended");
+    assert_eq!(r.d(1).fader.current, 0.);
+    assert!(r.m.auto.is_empty());
+}

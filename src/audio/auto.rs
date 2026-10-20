@@ -207,7 +207,8 @@ pub(super) const JUMP_LEAD_MAX: f64 = 0.1;
 
 fn lead(item: &AutoItem) -> f64 {
     match item.kind {
-        AutoKind::Jump { .. } => JUMP_LEAD_MAX,
+        // only a jump on the clock deck itself starts early (see the mixer)
+        AutoKind::Jump { deck, .. } if deck == item.clock => JUMP_LEAD_MAX,
         _ => 0.,
     }
 }

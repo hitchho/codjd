@@ -951,11 +951,19 @@ impl Mixer {
     }
 
     /// A later ramp or set on a control replaces a running ramp on it
-    fn auto_drop_running(&mut self, deck: usize, c: Control, except: usize) {
+    /// (`b`: the clock's beat now; a ramp that is due to end by then ends at its target first, so
+    /// that a ramp starting where it ended reads the right value)
+    fn auto_drop_running(&mut self, deck: usize, c: Control, except: usize, clock: usize, b: f64) {
         let mut n = 0;
         while n < self.auto.run.len() {
             let si = self.auto.run[n] as usize;
-            if si != except && self.auto.slots[si].item.touches(deck, c) {
+            let it = self.auto.slots[si].item;
+            if si != except && it.touches(deck, c) {
+                if let AutoKind::Ramp { to, end_beat, .. } = it.kind {
+                    if it.clock == clock && b + BEAT_EPS >= end_beat {
+                        self.set_control(deck, c, to, Drive::Snap);
+                    }
+                }
                 self.auto_free(si);
             } else {
                 n += 1;
@@ -1036,19 +1044,19 @@ impl Mixer {
         let clock = it.clock;
         match it.kind {
             AutoKind::Ramp { deck, control, from, .. } => {
-                self.auto_drop_running(deck, control, si);
+                self.auto_drop_running(deck, control, si, clock, b);
                 let from = control.clamp(from.unwrap_or_else(|| self.control_value(deck, control)));
                 // stays in the pool until it has run
                 self.auto.start_running(si, from);
                 return;
             }
             AutoKind::Set { deck, control, value } => {
-                self.auto_drop_running(deck, control, usize::MAX);
+                self.auto_drop_running(deck, control, usize::MAX, clock, b);
                 self.set_control(deck, control, value, Drive::Glide);
             }
             AutoKind::Swap { band } => {
-                self.auto_drop_running(clock, band, usize::MAX);
-                self.auto_drop_running(1 - clock, band, usize::MAX);
+                self.auto_drop_running(clock, band, usize::MAX, clock, b);
+                self.auto_drop_running(1 - clock, band, usize::MAX, clock, b);
                 self.set_control(clock, band, -1., Drive::Glide);
                 self.set_control(1 - clock, band, 0., Drive::Glide);
             }
