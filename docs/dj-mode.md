@@ -203,3 +203,31 @@ for a fixed deck/mixer layout. So: our own engine on proven parts.
 
 Several of these are young, partly AI-written crates (beat-this, timestretch, stratum-dsp):
 benchmark them on our own library before relying on them.
+
+### Detector benchmark (2026-10-20, 109 tracks of the nicotine library, no ground truth)
+
+Reference points: 13 files carry a BPM tag (integers), 7 a key tag. Times are for a 5-6 minute
+track, one track at a time on a 32-thread machine.
+
+| detector | BPM vs the 13 tags | vs beat-this | time/track | notes |
+|---|---|---|---|---|
+| beat-this (large, rten, MIT weights, 83 MB) | 12/13 within 0.1 once the BPM is fitted to the beats (the 13th is a half-time tag) | - | ~12 s wall on ~4 threads | beats on a 20 ms frame grid: fit a constant grid, do not average intervals |
+| beat-this small (10 MB) | same beats on 78/109 | 78/109 | ~8 s | mel front end dominates, so little saved |
+| timestretch `detect_beats` | 11/13 within 1.2 (2 octave errors, one in each direction) | 95/109 within 1% | ~2.2 s | pure Rust, also has `detect_key` (1.4 s) |
+| stratum-dsp | 10/13 within 1.2 | 92/109 | ~8-10 s | pulls symphonia 0.5, rayon; confidence value is not informative |
+| bliss tempo | 12/13 within 1x but 1-3 BPM high | 1/109 within 1% | free | biased about +1.5%, plus 2x/1.5x errors |
+
+Beat-this grid shape: 93 of 109 tracks have at least 80% of beats within 35 ms of one constant
+grid (48 within 95%); 3 are really tempo-changing. The first/second-half tempo differs by more
+than 1% in 1 track. Downbeats are the weak part: 66 of 109 tracks have at least 60% of bar
+lengths exactly 4 beats, and the other detectors' bar phase agrees with beat-this on only a
+third of tracks, so expect to set beat 1 by hand sometimes.
+
+Keys (Camelot): libKeyFinder matches 2 of 7 tags exactly, stratum 1, timestretch 0; against each
+other libKeyFinder and stratum agree exactly on 37/109, libKeyFinder and timestretch on 29/109
+(adjacent on the wheel for most of the rest). Hard techno is barely tonal; treat keys as a hint.
+
+Pick: **beat-this large for BPM and grid** (analysis in the background, once per track), with
+timestretch's 2 s `detect_beats` as the cross-check that flags 2x/0.5x disagreements;
+**libKeyFinder for key** (needs libkeyfinder 2.2 + FFTW and a C++ build; GPL-3 matches musad).
+Not wired into musad yet.
