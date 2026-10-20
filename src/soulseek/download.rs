@@ -2,10 +2,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, RwLock};
 
 use super::types::{Download, DownloadState, RankedFile, SearchPrefs, SearchResult};
+
+/// at most this many other users are tried when a download fails or stalls
+pub const MAX_ALTERNATES: usize = 3;
+/// a download sitting in the uploader's queue this long without any change moves on to the
+/// next alternate source, if there is one
+pub const REMOTE_QUEUE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// events sent from download manager to UI
 #[derive(Debug, Clone)]
@@ -40,6 +47,10 @@ pub struct DownloadManager {
     order: RwLock<Vec<u32>>,
     /// downloads that have been handed to the peer code
     started: RwLock<std::collections::HashSet<u32>>,
+    /// other users' copies of the same file, best first, still to be tried
+    alternates: RwLock<HashMap<u32, Vec<RankedFile>>>,
+    /// since when a remotely queued download has been unchanged: (state, downloaded, since)
+    queued_since: RwLock<HashMap<u32, (DownloadState, u64, Instant)>>,
 }
 
 impl DownloadManager {
@@ -53,6 +64,8 @@ impl DownloadManager {
             max_concurrent: std::sync::atomic::AtomicUsize::new(3),
             order: RwLock::new(Vec::new()),
             started: RwLock::new(std::collections::HashSet::new()),
+            alternates: RwLock::new(HashMap::new()),
+            queued_since: RwLock::new(HashMap::new()),
         }
     }
 
@@ -68,13 +81,28 @@ impl DownloadManager {
 
     /// queue a file for download, returns download id
     pub async fn queue_download(&self, file: &RankedFile) -> u32 {
+        self.queue_download_with(file, Vec::new(), None).await
+    }
+
+    /// queue a file with other users' copies to fall back on (see `find_alternates`), saved
+    /// under `download_dir/<subdir>` when given (see `sanitize_folder_name`)
+    pub async fn queue_download_with(
+        &self,
+        file: &RankedFile,
+        mut alternates: Vec<RankedFile>,
+        subdir: Option<&str>,
+    ) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // create local path
         let filename = file.file.basename();
-        let local_path = self.download_dir.join(filename);
+        let dir = match subdir {
+            Some(sub) => self.download_dir.join(sub),
+            None => self.download_dir.clone(),
+        };
+        let local_path = dir.join(filename);
 
-        let download = Download::new(
+        let mut download = Download::new(
             id,
             file.username.clone(),
             file.file.filename.clone(),
@@ -82,14 +110,99 @@ impl DownloadManager {
             file.file.size,
             file.quality_score,
         );
+        alternates.truncate(MAX_ALTERNATES);
+        download.max_attempts = alternates.len() as u32;
 
         {
             let mut downloads = self.downloads.write().await;
             downloads.insert(id, download);
         }
         self.order.write().await.push(id);
+        if !alternates.is_empty() {
+            self.alternates.write().await.insert(id, alternates);
+        }
 
         id
+    }
+
+    /// Moves failed downloads, and ones stuck in a remote queue for `REMOTE_QUEUE_TIMEOUT`,
+    /// to their next alternate source. The retry gets a fresh id in the same list position
+    /// (so late events and tasks of the old attempt can't touch it) and waits to be started
+    /// again. Returns (old id, new id) pairs; the caller drops the old id's peer state.
+    pub async fn retry_due(&self, now: Instant) -> Vec<(u32, u32)> {
+        let mut downloads = self.downloads.write().await;
+        let mut order = self.order.write().await;
+        let mut started = self.started.write().await;
+        let mut alternates = self.alternates.write().await;
+        let mut queued_since = self.queued_since.write().await;
+
+        queued_since.retain(|id, _| downloads.contains_key(id));
+        let mut swapped = Vec::new();
+        for pos in 0..order.len() {
+            let id = order[pos];
+            let Some(dl) = downloads.get(&id) else {
+                continue;
+            };
+            let reason = match dl.state {
+                DownloadState::Failed => {
+                    if dl.last_error.is_empty() {
+                        "failed".to_string()
+                    } else {
+                        dl.last_error.clone()
+                    }
+                }
+                DownloadState::Queued if started.contains(&id) => {
+                    let seen = (dl.state, dl.downloaded);
+                    let entry = queued_since.entry(id).or_insert((seen.0, seen.1, now));
+                    if (entry.0, entry.1) != seen {
+                        *entry = (seen.0, seen.1, now);
+                    }
+                    if now.duration_since(entry.2) < REMOTE_QUEUE_TIMEOUT {
+                        continue;
+                    }
+                    format!(
+                        "queued at {} for {} min",
+                        dl.username,
+                        REMOTE_QUEUE_TIMEOUT.as_secs() / 60
+                    )
+                }
+                _ => {
+                    queued_since.remove(&id);
+                    continue;
+                }
+            };
+            let Some(next) = alternates.get_mut(&id).filter(|a| !a.is_empty()).map(|a| a.remove(0))
+            else {
+                continue;
+            };
+
+            let new_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let mut retry = Download::new(
+                new_id,
+                next.username.clone(),
+                next.file.filename.clone(),
+                dl.local_path.clone(),
+                next.file.size,
+                next.quality_score,
+            );
+            retry.attempt = dl.attempt + 1;
+            retry.max_attempts = dl.max_attempts;
+            retry.last_error = reason;
+            retry.token = dl.token;
+
+            downloads.remove(&id);
+            downloads.insert(new_id, retry);
+            order[pos] = new_id;
+            started.remove(&id);
+            queued_since.remove(&id);
+            if let Some(rest) = alternates.remove(&id) {
+                if !rest.is_empty() {
+                    alternates.insert(new_id, rest);
+                }
+            }
+            swapped.push((id, new_id));
+        }
+        swapped
     }
 
     pub fn set_max_concurrent(&self, n: usize) {
@@ -146,6 +259,8 @@ impl DownloadManager {
         self.downloads.write().await.remove(&id);
         self.order.write().await.retain(|&i| i != id);
         self.started.write().await.remove(&id);
+        self.alternates.write().await.remove(&id);
+        self.queued_since.write().await.remove(&id);
     }
 
     /// remove completed/failed downloads from list
@@ -154,6 +269,8 @@ impl DownloadManager {
         downloads.retain(|_, dl| dl.is_active());
         self.order.write().await.retain(|id| downloads.contains_key(id));
         self.started.write().await.retain(|id| downloads.contains_key(id));
+        self.alternates.write().await.retain(|id, _| downloads.contains_key(id));
+        self.queued_since.write().await.retain(|id, _| downloads.contains_key(id));
     }
 
     /// get all downloads for display
@@ -219,6 +336,79 @@ impl DownloadManager {
             .max_by_key(|d| d.quality_score)
             .cloned()
     }
+}
+
+/// the folder part of a soulseek path (backslash separated, `/` tolerated), "" when none
+pub fn remote_folder(path: &str) -> &str {
+    path.rsplit_once(['\\', '/']).map(|(dir, _)| dir).unwrap_or("")
+}
+
+fn same_folder(a: &str, b: &str) -> bool {
+    a.replace('/', "\\") == b.replace('/', "\\")
+}
+
+/// Every file `username` shares in the same remote folder as `filename`, taken from the ranked
+/// results (so the format/bitrate/size preferences already apply), in track order: sorted by
+/// file name, case-insensitively. Duplicate paths are listed once.
+pub fn folder_files(ranked: &[RankedFile], username: &str, filename: &str) -> Vec<RankedFile> {
+    let folder = remote_folder(filename);
+    let mut files: Vec<RankedFile> = ranked
+        .iter()
+        .filter(|r| r.username == username && same_folder(remote_folder(&r.file.filename), folder))
+        .cloned()
+        .collect();
+    // same folder, so the file name decides; separators may differ between peers' paths
+    files.sort_by(|a, b| {
+        let key = |r: &RankedFile| r.file.basename().to_lowercase();
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.file.filename.cmp(&b.file.filename))
+    });
+    files.dedup_by(|a, b| a.file.filename == b.file.filename);
+    files
+}
+
+/// Other users' copies of `chosen`: same file name (case-insensitive) and the same size within
+/// 1%, one per user, in ranking order (best first), at most `MAX_ALTERNATES`
+pub fn find_alternates(ranked: &[RankedFile], chosen: &RankedFile) -> Vec<RankedFile> {
+    let name = chosen.file.basename().to_lowercase();
+    let size = chosen.file.size;
+    let mut users = std::collections::HashSet::new();
+    users.insert(chosen.username.as_str());
+    let mut out = Vec::new();
+    for r in ranked {
+        if out.len() == MAX_ALTERNATES {
+            break;
+        }
+        let close = r.file.size.abs_diff(size).saturating_mul(100) <= r.file.size.max(size);
+        if close && r.file.basename().to_lowercase() == name && users.insert(r.username.as_str())
+        {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+/// A local directory name for a remote folder: its last component with path separators,
+/// control characters and characters Windows/samba shares reject replaced; None when nothing
+/// usable is left (empty, `.` or `..`)
+pub fn sanitize_folder_name(remote_folder: &str) -> Option<String> {
+    let last = remote_folder
+        .rsplit(['\\', '/'])
+        .find(|c| !c.trim().is_empty())?;
+    let cleaned: String = last
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim().to_string();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        return None;
+    }
+    Some(cleaned.chars().take(200).collect())
 }
 
 /// rank and sort search results by quality
@@ -431,5 +621,251 @@ mod schedule_tests {
         // removing a running one frees its slot too
         dm.remove(d).await;
         assert_eq!(dm.take_startable().await, vec![c]);
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn result(user: &str, paths: &[&str]) -> SearchResult {
+        SearchResult {
+            username: user.to_string(),
+            token: 1,
+            files: paths
+                .iter()
+                .map(|p| SharedFile {
+                    filename: p.to_string(),
+                    size: 1000,
+                    ..Default::default()
+                })
+                .collect(),
+            free_slots: true,
+            upload_speed: 0,
+            queue_size: 0,
+        }
+    }
+
+    #[test]
+    fn folder_groups_same_user_and_folder_in_track_order() {
+        let results = vec![
+            result(
+                "bob",
+                &[
+                    "Music\\Artist\\Album\\03 - c.flac",
+                    "Music\\Artist\\Album\\01 - a.flac",
+                    "Music\\Artist\\Album\\cover.jpg",
+                    "Music\\Artist\\Album\\02 - B.flac",
+                    "Music\\Artist\\Album\\CD2\\01 - x.flac",
+                    "Music\\Artist\\Other\\01 - a.flac",
+                ],
+            ),
+            result("eve", &["Music\\Artist\\Album\\04 - d.flac"]),
+        ];
+        let ranked = rank_search_results(&results, &SearchPrefs::default());
+        let files = folder_files(&ranked, "bob", "Music\\Artist\\Album\\02 - B.flac");
+        let names: Vec<&str> = files.iter().map(|f| f.file.basename()).collect();
+        // no cover.jpg, no subfolder, no other folder, nothing from eve
+        assert_eq!(names, vec!["01 - a.flac", "02 - B.flac", "03 - c.flac"]);
+    }
+
+    #[test]
+    fn folder_respects_format_prefs_and_mixed_separators() {
+        let results = vec![result(
+            "bob",
+            &["A\\Album\\1.mp3", "A/Album/2.flac", "A\\Album\\3.m4a", "A\\Album\\4.mp3"],
+        )];
+        let prefs = SearchPrefs {
+            formats: vec!["mp3".into(), "flac".into()],
+            ..Default::default()
+        };
+        let ranked = rank_search_results(&results, &prefs);
+        let files = folder_files(&ranked, "bob", "A\\Album\\1.mp3");
+        let names: Vec<&str> = files.iter().map(|f| f.file.basename()).collect();
+        assert_eq!(names, vec!["1.mp3", "2.flac", "4.mp3"]);
+    }
+
+    #[test]
+    fn folder_name_is_sanitized() {
+        assert_eq!(remote_folder("Music\\Artist\\Album\\x.flac"), "Music\\Artist\\Album");
+        assert_eq!(remote_folder("x.flac"), "");
+        assert_eq!(
+            sanitize_folder_name("Music\\Artist - Album: Live? (2001)").as_deref(),
+            Some("Artist - Album_ Live_ (2001)")
+        );
+        assert_eq!(sanitize_folder_name("@@x\\Music\\Album\\").as_deref(), Some("Album"));
+        assert_eq!(sanitize_folder_name("a\\..").as_deref(), None);
+        assert_eq!(sanitize_folder_name("a\\.").as_deref(), None);
+        assert_eq!(sanitize_folder_name(""), None);
+        assert_eq!(sanitize_folder_name("a\\b\u{0}c").as_deref(), Some("b_c"));
+    }
+}
+
+#[cfg(test)]
+mod alternate_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn rf(user: &str, path: &str, size: u64, score: u32) -> RankedFile {
+        RankedFile {
+            file: SharedFile {
+                filename: path.to_string(),
+                size,
+                ..Default::default()
+            },
+            username: user.to_string(),
+            free_slots: true,
+            upload_speed: 0,
+            queue_size: 0,
+            quality_score: score,
+        }
+    }
+
+    #[test]
+    fn alternates_match_name_and_size_skip_same_user_keep_rank_order() {
+        let chosen = rf("bob", "Music\\Album\\01 Song.flac", 30_000_000, 900);
+        let ranked = vec![
+            rf("carol", "x\\01 song.FLAC", 30_100_000, 950), // within 1%, case differs
+            chosen.clone(),
+            rf("bob", "other\\01 Song.flac", 30_000_000, 890), // same user
+            rf("dave", "y\\01 Song.flac", 31_000_000, 880),    // > 1% off
+            rf("erin", "z\\02 Song.flac", 30_000_000, 870),    // other name
+            rf("frank", "q\\01 Song.flac", 30_000_000, 860),
+            rf("carol", "w\\01 Song.flac", 30_000_000, 855), // carol already listed
+            rf("gina", "r\\01 Song.flac", 29_800_000, 850),
+            rf("hank", "s\\01 Song.flac", 30_000_000, 840), // over the cap
+        ];
+        let alts = find_alternates(&ranked, &chosen);
+        let users: Vec<&str> = alts.iter().map(|a| a.username.as_str()).collect();
+        assert_eq!(users, vec!["carol", "frank", "gina"]);
+        assert_eq!(alts[0].file.filename, "x\\01 song.FLAC");
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::soulseek::types::SharedFile;
+
+    fn rf(user: &str, path: &str) -> RankedFile {
+        RankedFile {
+            file: SharedFile {
+                filename: path.to_string(),
+                size: 1000,
+                ..Default::default()
+            },
+            username: user.to_string(),
+            free_slots: true,
+            upload_speed: 0,
+            queue_size: 0,
+            quality_score: 0,
+        }
+    }
+
+    async fn set(dm: &DownloadManager, id: u32, state: DownloadState, err: &str) {
+        let mut d = dm.downloads.write().await;
+        let dl = d.get_mut(&id).unwrap();
+        dl.state = state;
+        dl.last_error = err.to_string();
+    }
+
+    #[tokio::test]
+    async fn failed_download_moves_through_alternates_then_stays_failed() {
+        let dm = DownloadManager::new(std::env::temp_dir(), "me".into());
+        let other = dm.queue_download(&rf("x", "x\\other.mp3")).await;
+        let id = dm
+            .queue_download_with(
+                &rf("bob", "a\\song.mp3"),
+                vec![rf("carol", "c\\song.mp3"), rf("dave", "d\\song.mp3")],
+                Some("Album"),
+            )
+            .await;
+        let first = dm.get_download(id).await.unwrap();
+        assert_eq!((first.attempt, first.max_attempts), (0, 2));
+        assert!(first.local_path.ends_with("Album/song.mp3"));
+        assert_eq!(dm.take_startable().await, vec![other, id]);
+        let now = Instant::now();
+
+        // nothing to do while it's running
+        assert!(dm.retry_due(now).await.is_empty());
+
+        set(&dm, id, DownloadState::Failed, "peer connection failed: timeout").await;
+        let swapped = dm.retry_due(now).await;
+        assert_eq!(swapped.len(), 1);
+        let (old, id2) = swapped[0];
+        assert_eq!(old, id);
+        assert!(dm.get_download(id).await.is_none());
+        let dl = dm.get_download(id2).await.unwrap();
+        assert_eq!(dl.username, "carol");
+        assert_eq!(dl.remote_path, "c\\song.mp3");
+        assert_eq!((dl.attempt, dl.max_attempts), (1, 2));
+        assert_eq!(dl.state, DownloadState::Pending);
+        assert_eq!(dl.local_path, first.local_path);
+        assert_eq!(dl.last_error, "peer connection failed: timeout");
+        // same place in the list, and it can be started again
+        let order: Vec<u32> = dm.get_downloads().await.iter().map(|d| d.id).collect();
+        assert_eq!(order, vec![other, id2]);
+        assert_eq!(dm.take_startable().await, vec![id2]);
+
+        set(&dm, id2, DownloadState::Failed, "denied: Banned").await;
+        let (_, id3) = dm.retry_due(now).await[0];
+        let dl = dm.get_download(id3).await.unwrap();
+        assert_eq!((dl.username.as_str(), dl.attempt), ("dave", 2));
+
+        // out of alternates: stays failed
+        set(&dm, id3, DownloadState::Failed, "upload failed").await;
+        assert!(dm.retry_due(now).await.is_empty());
+        assert_eq!(dm.get_download(id3).await.unwrap().state, DownloadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_alternate_less_downloads_are_not_retried() {
+        let dm = DownloadManager::new(std::env::temp_dir(), "me".into());
+        let a = dm
+            .queue_download_with(&rf("bob", "a\\s.mp3"), vec![rf("carol", "c\\s.mp3")], None)
+            .await;
+        let b = dm.queue_download(&rf("bob", "a\\t.mp3")).await;
+        dm.take_startable().await;
+        dm.cancel_download(a).await;
+        set(&dm, b, DownloadState::Failed, "x").await;
+        assert!(dm.retry_due(Instant::now()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_queue_stall_moves_on_after_timeout() {
+        let dm = DownloadManager::new(std::env::temp_dir(), "me".into());
+        let waiting = dm
+            .queue_download_with(&rf("w", "w\\s.mp3"), vec![rf("v", "v\\s.mp3")], None)
+            .await;
+        dm.set_max_concurrent(1);
+        let id = dm
+            .queue_download_with(&rf("bob", "a\\s.mp3"), vec![rf("carol", "c\\s.mp3")], None)
+            .await;
+        // move id to the top so it is the started one; `waiting` stays Pending locally
+        dm.move_download(id, true).await;
+        assert_eq!(dm.take_startable().await, vec![id]);
+        set(&dm, id, DownloadState::Queued, "").await;
+
+        let t0 = Instant::now();
+        assert!(dm.retry_due(t0).await.is_empty());
+        assert!(dm.retry_due(t0 + REMOTE_QUEUE_TIMEOUT / 2).await.is_empty());
+        // a change (uploader started sending) resets the clock
+        dm.downloads.write().await.get_mut(&id).unwrap().downloaded = 10;
+        assert!(dm.retry_due(t0 + REMOTE_QUEUE_TIMEOUT).await.is_empty());
+        let t1 = t0 + REMOTE_QUEUE_TIMEOUT;
+        assert!(dm
+            .retry_due(t1 + REMOTE_QUEUE_TIMEOUT - Duration::from_secs(1))
+            .await
+            .is_empty());
+        let swapped = dm.retry_due(t1 + REMOTE_QUEUE_TIMEOUT).await;
+        assert_eq!(swapped.len(), 1);
+        let dl = dm.get_download(swapped[0].1).await.unwrap();
+        assert_eq!((dl.username.as_str(), dl.attempt), ("carol", 1));
+        assert!(dl.last_error.contains("queued at bob"));
+        // the waiting-locally download never counted as stalled
+        assert_eq!(dm.get_download(waiting).await.unwrap().state, DownloadState::Pending);
+        // the freed slot goes to the retry, which kept the top position
+        assert_eq!(dm.take_startable().await, vec![swapped[0].1]);
     }
 }

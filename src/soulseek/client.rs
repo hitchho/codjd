@@ -260,8 +260,14 @@ impl SoulseekClient {
         *state = ConnectionState::Disconnected;
     }
 
-    /// queue a file for download
-    pub async fn queue_download(&self, file: &RankedFile) -> Result<u32, SoulseekError> {
+    /// queue a file for download, with other users' copies to retry from (see
+    /// `find_alternates`) and an optional subfolder of the download dir
+    pub async fn queue_download(
+        &self,
+        file: &RankedFile,
+        alternates: Vec<RankedFile>,
+        subdir: Option<&str>,
+    ) -> Result<u32, SoulseekError> {
         {
             let state = self.state.read().await;
             if *state != ConnectionState::Ready {
@@ -270,7 +276,10 @@ impl SoulseekClient {
         }
 
         // create download entry
-        let id = self.download_manager.queue_download(file).await;
+        let id = self
+            .download_manager
+            .queue_download_with(file, alternates, subdir)
+            .await;
 
         // get download and set token
         let token = self.transfer_token.fetch_add(1, Ordering::SeqCst);
@@ -289,6 +298,15 @@ impl SoulseekClient {
 
     /// Starts waiting downloads while fewer than the limit are running, in list order
     pub async fn schedule(&self) {
+        // failed or stuck-in-remote-queue downloads move to their next source first
+        for (old, new) in self
+            .download_manager
+            .retry_due(std::time::Instant::now())
+            .await
+        {
+            tracing::debug!("soulseek download {} retried as {}", old, new);
+            self.peer.abandon(old);
+        }
         for id in self.download_manager.take_startable().await {
             // connect to the uploader and queue the file on its side
             self.peer.start_download(id);
