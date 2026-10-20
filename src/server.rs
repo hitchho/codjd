@@ -37,6 +37,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let music_dir = PathBuf::from(&config.path);
     let allow_formats = config.allow_formats.clone();
     let net_config = config.net.clone();
+    let sets_dir = config.sets.dir.clone();
 
     let codjd = Codjd::start(config)?;
     let analysis = Analyzer::start();
@@ -57,10 +58,19 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
     let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
+    let sets = crate::sets::store::Store::new(
+        sets_dir,
+        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await),
+    );
+    if let Err(e) = crate::sets::store::spawn_watcher(Arc::clone(&sets)) {
+        eprintln!("can't watch the set folder: {e}");
+    }
+
     let bus = Bus {
         codjd: codjd.clone(),
         slsk,
         analysis: Arc::clone(&analysis),
+        sets: Arc::clone(&sets),
     };
     let connection = connection::Builder::session()?
         .name(BUS_NAME)?
@@ -77,18 +87,22 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     if music_dir.is_dir() {
         let codjd = codjd.clone();
+        let sets = Arc::clone(&sets);
         let watched = crate::watcher::spawn(music_dir, move |path| {
             if !is_audio(&path) || !format_allowed(&path, &allow_formats) {
                 return;
             }
             let codjd = codjd.clone();
             let analysis = Arc::clone(&analysis);
+            let sets = Arc::clone(&sets);
             tokio::spawn(async move {
                 let add = path.clone();
                 // added before the event, so a client refetching on it sees the file
                 if codjd.call(move |e| e.add_music(add)).await == Some(true) {
                     analysis.enqueue([path.clone()]);
                     codjd.emit(Event::LibraryChanged(path));
+                    // a set may have been waiting for this track
+                    crate::sets::live::refresh(&sets, &codjd, &analysis).await;
                 }
             });
         });

@@ -388,3 +388,18 @@ fn plans_serialize_to_json() {
     assert_eq!(v["plans"][0]["items"][2]["control"], "fader");
     assert_eq!(v["set"]["tracks"][0]["id"], "aft");
 }
+
+#[test]
+fn the_demo_set_loads() {
+    let mut env = FakeEnv { root: "/music".into(), ..Default::default() };
+    env.add("Pneumatix", "Aftertekno", "pn/aftertekno.flac", Some(grid(124., 0.1, 0)));
+    env.add("Aasi & Swooh", "Smokin", "smokin.flac", Some(grid(126., 0.2, 1)));
+    env.add("Kaiku", "Noita", "noita.flac", Some(grid(132., 0.3, 0)));
+    let l = load(Path::new("demo.codj"), include_str!("../../examples/sets/demo.codj"), &env);
+    assert!(l.diags.is_empty(), "{:#?}", l.diags);
+    let c = l.compiled.unwrap();
+    assert_eq!(c.set.name, "demo: 3 tracks");
+    assert_eq!(c.plans.len(), 2);
+    // `grid /2`: detected as double time
+    assert_eq!(c.set.track("peak").unwrap().grid.as_ref().unwrap().bpm, 66.);
+}

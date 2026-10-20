@@ -152,6 +152,7 @@ impl Store {
     }
 
     /// The active (last good) version of a set, by set name, file stem or file name
+    #[allow(dead_code)] // the arming step runs sets through this
     pub fn get(&self, name: &str) -> Option<Arc<Compiled>> {
         let sets = self.sets.lock().unwrap();
         Self::find(&sets, name).and_then(|(_, e)| e.good.clone())

@@ -51,6 +51,9 @@ In the app, add a Subsonic/OpenSubsonic server with the address, the user name a
 - Artists, albums and tags come from the files' tags (album artist, else artist, plus album name; files without an album tag land in "Unknown Album"). Tags are read once and cached (`net-index.json` in the cache dir); the index is rebuilt a second after the library changes.
 - Songs are served only from inside the music folder, by opaque id. Symlinks in the folder are not followed.
 
+## Sets
+A set is a text file you edit in your own editor: the tracks, their cues and loops, and the mixes between them, counted in bars and beats. codjd watches the set folder (`[sets] dir`, default `~/.local/share/codj/sets`), reloads a file when it is saved and keeps the last good version when a save has errors. The language is in [docs/set-language.md](./docs/set-language.md), an example in [examples/sets/demo.codj](./examples/sets/demo.codj). `busctl --user call net.rotko.Codj /net/rotko/Codj net.rotko.Codj.Player SetList` lists the sets, `SetErrors s <name>` gives `file:line:col: message` lines (quickfix-ready) and `SetShow s <name>` the resolved set and its compiled mix plans as JSON. Running the mixes comes with the engine's automation.
+
 ## Documentation
 Access the documentation in [DOCS.md](./DOCS.md).
 

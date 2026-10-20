@@ -26,6 +26,7 @@ pub struct Bus {
     pub codjd: Codjd,
     pub slsk: Arc<Slsk>,
     pub analysis: Arc<Analyzer>,
+    pub sets: Arc<crate::sets::store::Store>,
 }
 
 impl Bus {
@@ -456,6 +457,28 @@ impl Bus {
         }
     }
 
+    // ---- sets (docs/set-language.md) ----
+
+    /// the sets in the set folder: (name, file, error count); a set with errors still lists
+    /// (and plays) its last good version
+    async fn set_list(&self) -> Vec<(String, String, u32)> {
+        self.sets
+            .list()
+            .into_iter()
+            .map(|s| (s.name, s.file.to_string_lossy().into_owned(), s.errors))
+            .collect()
+    }
+
+    /// `file:line:col: message` for each error of the latest save of a set (by name or file)
+    async fn set_errors(&self, name: String) -> Vec<String> {
+        self.sets.errors(&name)
+    }
+
+    /// JSON dump of a set: file, errors, the resolved model and the compiled mix plans
+    async fn set_show(&self, name: String) -> String {
+        self.sets.show(&name)
+    }
+
     /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases
     async fn dj_nudge(&self, deck: u32, amount: f64) -> String {
         reply(self.codjd.call(move |e| e.deck_nudge(deck as usize, amount)).await)
@@ -740,6 +763,11 @@ mod tests {
         // a method returning a tuple sends its members as separate out-arguments: "dduudbbb"
         assert_eq!(<GridReply as Type>::SIGNATURE.to_string(), "(dduudbbb)");
         assert_eq!(<(String, String, bool) as Type>::SIGNATURE.to_string(), "(ssb)");
+    }
+
+    #[test]
+    fn set_list_signature_is_pinned() {
+        assert_eq!(<Vec<(String, String, u32)> as Type>::SIGNATURE.to_string(), "a(ssu)");
     }
 
     #[test]

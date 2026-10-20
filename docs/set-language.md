@@ -104,7 +104,78 @@ filter), `exp`.
 
 ## Errors
 
-Every error has `file:line:col: message`, e.g.
+Every error has `file:line:col: message` (file name without directory, 1-based line, 1-based **byte** column as vim's quickfix counts), e.g.
 `kaiku.codj:14:20: unknown cue "outr" on track aft (cues: drop, outro)`. A file with errors is
 not loaded; the last good version stays active, so saving a half-written line mid-gig never
 breaks a running set.
+
+## Details
+
+Choices the sections above leave open; this is what the parser and the compiler do.
+
+### Syntax
+- Reserved words: `set`, `track`, `mix`, `bar`, `bars`, `swap` can't be track ids (they start lines
+  or items).
+- `play` may omit `from`: `smk play`, `smk play unsynced` (first downbeat).
+- A mix block is one `<b> play` line (at most one) and any number of `bar`/`bars` lines. Items in a
+  line are separated by `;`; a trailing `;` is fine.
+- `bars i..j` needs `i < j`. A ramp (`<from> -> <to>`) in a plain `bar` line is an error; in a
+  `bars` line the other items happen at bar `i`.
+- `bar`/`bars` numbers inside a mix may be fractional (`bar 15.5`); they are bars from the mix start.
+  `bar`/`beat` positions on a track (`cue`, `loop`, `at`, `play from`) count whole bars from 1;
+  `beat` may be fractional and must be in `1 .. beats_per_bar+1`.
+- `gain` values take an optional `dB`; `grid @` takes `s` or `ms`.
+- Syntax errors are reported first; names, files and ranges are checked only when the file parses,
+  so a half-typed line doesn't bury you in follow-up errors.
+
+### Positions and grids
+- Beat index `k` of a track's grid is at `first_beat_s + k * 60 / bpm`. `bar n beat m` is beat
+  index `downbeat_offset + (n-1) * beats_per_bar + (m-1)`, so `bar 1 beat 1` is the first downbeat,
+  which is beat index 0 only when `downbeat_offset` is 0. Positions before beat 0 are errors.
+- The effective grid is: analysis, then the hand correction (`DjGridScale`, per track, global),
+  then the set's `grid` line, applied in this order inside the line: tempo, scale, `@`, `beat1`.
+  - `<bpm>` replaces the tempo (first beat and bar position stay); `x2`, `/2`, `x1.5`, `/1.5`
+    multiply it, resetting the bar position like `DjGridScale` does (follow with `beat1`).
+  - `@ <t>s` replaces the first beat time and makes it a downbeat; `beat1 <n>` says the first
+    beat is beat `n` of its bar (`downbeat_offset = (beats_per_bar - (n-1)) % beats_per_bar`).
+  - A tempo on a track with no analysis creates a 4/4 grid (first beat 0 s). A scale, `@` or
+    `beat1` alone on such a track does nothing: it has no grid, and a mix touching it errors.
+  - Limits: tempo 30..300, scale factor 0.2..5.
+- The mix start, `play from` and every mix bar number are beat positions: the start is a beat
+  index on `a`'s grid; items are `bars * beats_per_bar(a)` beats after it (`a`'s clock); `play
+  from` is a beat index on `b`'s own grid, default `b`'s first downbeat (`downbeat_offset`).
+- Items may sit anywhere in `0 ..= n` bars of an `over n bars` mix (`bar 32` of a 32-bar mix is
+  allowed, later is an error).
+- `loop <k> beats` and `jump <±k> beats` have no fixed position in the file; the compiler
+  computes where the deck is at that moment: `a` from the mix start, `b` from `play from`, both
+  advancing with `a`'s beats (`b` at its own tempo ratio when `unsynced`), re-based by earlier
+  `jump`s, rounded to a whole beat. Loops are not modeled. The plan holds the absolute beats.
+
+### Values
+- Ranges: `fader` 0..1; `low`/`mid`/`high`/`filter` and `xfade` -1..1; `gain` (track and mix)
+  -48..12 dB. Out of range is an error, never clamped.
+- Default curve: `smooth` for `low`, `mid`, `high` and `filter`, else `linear` (including `gain`).
+- `xfade` values are passed on as written (-1 = the side of `a`).
+- `kill` is `= -1`, only for `low`, `mid`, `high`.
+
+### Files and search
+A `track` file is looked up as: relative to the library root, then absolute, then (relative names
+only) a search of the library: first an exact case-insensitive match of `artist - title`, the file
+name or the file name without extension; if none, a case-insensitive substring of those. One hit
+is used; none or several is an error naming up to five candidates. An absolute path that doesn't
+exist is an error without a search. The library is the daemon's playlist (`Playlist.musics`).
+
+### Names and reloading
+- The set name is the `set` line, else the file name without `.codj`. `SetErrors`/`SetShow` take
+  a set name, a file name or a file stem.
+- Duplicate track ids, cue names or loop names within a track, a second `set`/`grid`/`gain`/`play`
+  line, a mix from a track to itself, and a mix `at` cue of another track are errors.
+- A saved file that has errors keeps the previous version of that set active (a file that never
+  loaded is listed without a set). Deleting the file removes the set. Files with errors are
+  tried again every 5 s and when the library gets a new file, so a set that failed for a missing
+  grid loads once the track is analyzed.
+
+### D-Bus
+`SetList() -> a(ssu)` (name, file, error count), `SetErrors(s) -> as` (`file:line:col: message`),
+`SetShow(s) -> s` (JSON: name, file, errors, and the active resolved model with its compiled
+plans, `{"name","file","errors","active":{"set","plans"}}`).

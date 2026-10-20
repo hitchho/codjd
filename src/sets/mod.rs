@@ -17,7 +17,7 @@ mod tests;
 
 use std::path::Path;
 
-pub use compile::{compile, MixPlan, PlanItem};
+pub use compile::{compile, MixPlan};
 pub use lexer::Diag;
 pub use model::Set;
 pub use resolve::{Env, LibTrack};

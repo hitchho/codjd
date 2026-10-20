@@ -1,0 +1,43 @@
+# a short techno set: two long blends and a hard cut
+# Save this file in the set folder ([sets] dir, default ~/.local/share/codj/sets).
+# The tracks are searched in the library by "artist - title" or file name; change them to
+# yours. Bar numbers inside a mix count from the mix start, on the outgoing track's grid.
+set "demo: 3 tracks"
+
+track warm "Pneumatix - Aftertekno"
+  gain -1.5dB                      # trim instead of the auto-gain
+  cue intro  bar 1
+  cue drop   bar 33
+  cue breakdown bar 65
+  cue outro  bar 113
+  loop tail  bar 121 len 4 bars
+
+track mid "Aasi & Swooh - Smokin"
+  grid beat1 2                     # the detector put the first beat on beat 2 of the bar
+  cue intro  bar 1
+  cue drop   bar 17
+  cue outro  bar 97
+
+track peak "Kaiku - Noita"
+  grid /2                          # detected as double time
+  cue intro  bar 1
+  cue drop   bar 9
+
+# long blend: bring the bass in under the outgoing groove, swap it, filter the old one away
+mix warm -> mid at warm.outro over 32 bars
+  mid play from intro              # synced to warm; "unsynced" to opt out
+  bars 0..16   mid.low kill; mid.high = -0.5; mid.fader 0 -> 1
+  bars 8..16   mid.high -0.5 -> 0 smooth
+  bar 16       swap low            # warm.low kill, mid.low back to 0
+  bars 16..32  warm.filter 0 -> -0.6 smooth; warm.fader 1 -> 0
+  bar 28       warm loop tail      # let the old track run out in its loop
+  bar 32       warm stop
+
+# short mix: echo-out on the crossfader, land on the drop
+mix mid -> peak at mid.outro over 8 bars
+  peak play from drop
+  bar 0        peak.low kill; xfade = -1
+  bars 0..6    peak.fader 0 -> 1
+  bar 6        mid loop 2 beats; swap low
+  bars 6..8    xfade -1 -> 1; mid.filter 0 -> 0.8 exp
+  bar 8        mid stop; mid loop off
