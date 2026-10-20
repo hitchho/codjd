@@ -96,6 +96,19 @@ chop, reverse, resample, render a pattern) but always ahead of time, into finish
 to a sampler slot. The real-time mixer only ever plays finished buffers; no script feeds the
 audio callback. This is how a Plush-style record/edit/loop workflow fits at a gig.
 
+## Three kinds of code
+
+1. **Set files**: our declarative language (bars and beats), edited in vim. Steps 3 and 5.
+2. **Control scripts**: transitions, macros, generative ideas at control rate (per beat / ~100 Hz):
+   Lua, Rhai or Plush (Plush has its own register VM with a GC; a GC pause here only delays a
+   fader move). Language-neutral interface: beat clock in, ramps and commands out.
+3. **User effects and synths in the audio path** (later, after a first gig is possible):
+   WebAssembly via wasmtime, compiled ahead of time, run inside the real-time callback with a
+   fixed CPU budget and cut off on overrun; written in Rust, C, Zig, AssemblyScript or FAUST, or by
+   an agent over MCP, tested offline before it may touch the master. UVM has the right shape
+   (flat memory, no GC, sandboxed, JIT-oriented) but today is an interpreter with no embedding API
+   and an SDL callback that waits on the guest; worth another look if that changes.
+
 ## Audio engine (replaces rodio)
 
 ```
