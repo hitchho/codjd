@@ -148,6 +148,8 @@ struct DeckMeta {
     gain_db: f64,
     /// the analysis cache was looked at and had this track
     analyzed: bool,
+    /// `grid` came from a set (`SetArm`/`SetLoad`): the analysis must not replace it
+    grid_locked: bool,
     hot: Slots,
 }
 
@@ -191,6 +193,8 @@ pub struct Engine {
     queue: VecDeque<Music>,
     /// playlist position to continue after once the queue has played
     resume_after_queue: Option<u32>,
+    /// the set runtime (`SetUse`, `SetArm`...), see `sets::runtime`
+    setrt: crate::sets::runtime::Runtime,
     handle: Codjd,
 }
 
@@ -226,6 +230,7 @@ impl Engine {
             muted_volume: volume,
             queue: VecDeque::new(),
             resume_after_queue: None,
+            setrt: Default::default(),
             handle,
         })
     }
@@ -435,15 +440,48 @@ impl Engine {
 
     /// Puts `path` on `deck`, paused at the start. Deck A is also the player's deck.
     pub fn deck_load(&mut self, deck: usize, path: &std::path::Path) -> Result<(), String> {
+        self.deck_load_with(deck, path, 0., None, None)
+    }
+
+    /// Like [`Self::deck_load`], paused at `at` seconds, and with an explicit grid and gain
+    /// instead of the analysis ones (a set's `grid` and `gain` lines; `None` = the analysis).
+    /// A given grid stays on the deck until the next load, the analysis cannot replace it.
+    pub fn deck_load_with(
+        &mut self,
+        deck: usize,
+        path: &std::path::Path,
+        at: f64,
+        grid: Option<Grid>,
+        gain_db: Option<f64>,
+    ) -> Result<(), String> {
         check_deck(deck)?;
-        let generation = self.audio.load(deck, path, 0., false)?;
+        let generation = self.audio.load(deck, path, at.max(0.), false)?;
         if deck == PLAYER_DECK {
             // the player no longer owns what's on deck A
             self.generation = generation;
             self.transport = Transport::Stopped;
         }
-        self.attach(deck, path, true);
+        self.attach(deck, path, gain_db.is_none());
+        if let Some(g) = grid {
+            self.lock_grid(deck, g);
+        }
+        if let Some(db) = gain_db.filter(|d| d.is_finite()) {
+            self.set_deck_gain(deck, db);
+        }
         Ok(())
+    }
+
+    /// Puts `grid` on the loaded `deck` and keeps it there against the analysis
+    fn lock_grid(&mut self, deck: usize, grid: Grid) {
+        let m = &mut self.meta[deck];
+        self.audio.set_grid(deck, Some(grid_spec(&grid)));
+        m.grid = Some(grid);
+        m.grid_locked = true;
+    }
+
+    fn set_deck_gain(&mut self, deck: usize, db: f64) {
+        self.meta[deck].gain_db = db;
+        self.audio.set_trim(deck, 10f32.powf(db as f32 / 20.));
     }
 
     /// Records what is on `deck` (title, hot cues, and whatever the analysis cache knows) and
@@ -461,6 +499,8 @@ impl Engine {
         };
         self.audio.set_trim(deck, 1.);
         self.bind_analysis(deck, dj);
+        // a track loaded by hand under an armed mix breaks the mix
+        self.with_runtime(|rt, host| rt.deck_replaced(host, deck));
     }
 
     /// Takes grid, key and (`gain`) suggested gain for the track on `deck` from the analysis
@@ -474,10 +514,12 @@ impl Engine {
         if m.length <= 0. {
             m.length = features.duration_secs();
         }
-        let factor = self.gridfix.factor(&path);
-        m.grid = features.grid().map(|g| crate::gridfix::apply(g, factor));
         m.key = features.key().map(|k| k.camelot.clone()).unwrap_or_default();
-        self.audio.set_grid(deck, m.grid.as_ref().map(grid_spec));
+        if !m.grid_locked {
+            let factor = self.gridfix.factor(&path);
+            m.grid = features.grid().map(|g| crate::gridfix::apply(g, factor));
+            self.audio.set_grid(deck, m.grid.as_ref().map(grid_spec));
+        }
         if gain {
             let db = features.gain_db();
             if db.is_finite() {
@@ -565,7 +607,6 @@ impl Engine {
     /// runs it on the clock deck's beat grid at the exact frame. Checks what the audio thread
     /// cannot: the clock needs a beat grid, a deck that is started or looped or jumped needs one
     /// too, and a synced play has to stay within `sync_range` of the clock's tempo (now).
-    #[allow(dead_code)] // used by the set runtime (next layer)
     pub fn schedule(&mut self, item: AutoItem) -> Result<(), String> {
         if !item.is_sane(crate::audio::DECKS) {
             return Err("bad automation item (deck out of range or a bad number)".into());
@@ -586,29 +627,36 @@ impl Engine {
             AutoKind::Play { deck, synced, .. } => {
                 let own = self.gridded(deck).map_err(|e| format!("deck {}: {e}", names[deck]))?;
                 if synced {
-                    let clock = self.meta[item.clock].grid.clone().ok_or("no beat grid")?;
-                    let tempo = clock.bpm * self.audio.deck_states()[item.clock].rate;
-                    let Some(plan) = sync_plan(tempo, own.bpm) else {
-                        return Err("tempo too far from the clock deck".into());
-                    };
-                    if (plan.rate - 1.).abs() > self.sync_range {
-                        return Err(format!(
-                            "synced play would change {} by {:+.0}% ({:.1} -> {:.1} BPM): fix a grid with \
-                             :grid, or raise sync_range",
-                            names[deck],
-                            (plan.rate - 1.) * 100.,
-                            own.bpm,
-                            tempo,
-                        ));
-                    }
+                    self.check_sync(item.clock, deck, own.bpm)?;
                 }
             }
         }
         self.audio.schedule(item)
     }
 
+    /// Whether `deck` (grid tempo `own_bpm`) can be synced to the clock deck's tempo now,
+    /// within `sync_range`
+    fn check_sync(&self, clock: usize, deck: usize, own_bpm: f64) -> Result<(), String> {
+        let names = ["A", "B"];
+        let grid = self.meta[clock].grid.as_ref().ok_or("no beat grid")?;
+        let tempo = grid.bpm * self.audio.deck_states()[clock].rate;
+        let Some(plan) = sync_plan(tempo, own_bpm) else {
+            return Err("tempo too far from the clock deck".into());
+        };
+        if (plan.rate - 1.).abs() > self.sync_range {
+            return Err(format!(
+                "synced play would change {} by {:+.0}% ({:.1} -> {:.1} BPM): fix a grid with \
+                 :grid, or raise sync_range",
+                names[deck],
+                (plan.rate - 1.) * 100.,
+                own_bpm,
+                tempo,
+            ));
+        }
+        Ok(())
+    }
+
     /// Drops all pending and running automation of a mix
-    #[allow(dead_code)] // used by the set runtime (next layer)
     pub fn cancel_group(&mut self, group: u32) {
         self.audio.cancel_group(group);
     }
@@ -668,7 +716,11 @@ impl Engine {
         self.gridded(deck)?;
         let path = self.meta[deck].path.clone().ok_or("nothing loaded")?;
         self.gridfix.scale(&path, factor);
+        // a hand correction replaces a set's grid on the deck, and a mix timed on the old one
+        // is off
+        self.meta[deck].grid_locked = false;
         self.bind_analysis(deck, false);
+        self.with_runtime(|rt, host| rt.deck_replaced(host, deck));
         Ok(self.meta[deck].grid.as_ref().map_or(0., |g| g.bpm))
     }
 
@@ -890,6 +942,58 @@ impl Engine {
         self.mixer.master = if self.audio.mode() == Mode::Internal { self.volume as f64 } else { 1. };
     }
 
+    // ---- sets (docs/dj-api.md, "Set runtime") ----
+
+    /// Runs `f` with the set runtime and the engine as its host. While it runs the engine's own
+    /// slot holds an empty runtime, so loads the runtime makes itself do not disarm it.
+    fn with_runtime<T>(&mut self, f: impl FnOnce(&mut crate::sets::runtime::Runtime, &mut Engine) -> T) -> T {
+        let mut rt = std::mem::take(&mut self.setrt);
+        let out = f(&mut rt, self);
+        // an inner call (a load made by the runtime) restored an empty one: ours wins
+        self.setrt = rt;
+        out
+    }
+
+    pub fn set_sets(&mut self, store: Arc<crate::sets::store::Store>) {
+        self.setrt.set_store(store);
+    }
+
+    pub fn set_use(&mut self, name: &str) -> Result<(), String> {
+        self.with_runtime(|rt, h| rt.use_set(h, name))
+    }
+
+    pub fn set_arm(&mut self, mix: usize) -> Result<(), String> {
+        self.with_runtime(|rt, h| rt.arm(h, mix))
+    }
+
+    pub fn set_disarm(&mut self) {
+        self.with_runtime(|rt, h| rt.disarm(h));
+    }
+
+    pub fn set_auto(&mut self, on: bool) {
+        self.setrt.set_auto(on);
+    }
+
+    pub fn set_preview(&mut self, mix: usize, bars_before: f64) -> Result<(), String> {
+        self.with_runtime(|rt, h| rt.preview(h, mix, bars_before))
+    }
+
+    pub fn set_load(&mut self, track: usize) -> Result<(), String> {
+        self.with_runtime(|rt, h| rt.load_track(h, track))
+    }
+
+    pub fn set_state(&mut self) -> crate::sets::runtime::SetState {
+        self.with_runtime(|rt, h| {
+            rt.tick(h);
+            rt.state(h)
+        })
+    }
+
+    /// Called about ten times a second: follows the armed mix, auto mode, hot reload
+    pub fn set_tick(&mut self) {
+        self.with_runtime(|rt, h| rt.tick(h));
+    }
+
     /// Per deck: (position s, playing, decoded s, decoding finished)
     pub fn decks(&self) -> Vec<(f64, bool, f64, bool)> {
         (0..crate::audio::DECKS)
@@ -1083,6 +1187,63 @@ impl Engine {
             PlaylistOpperation::DeletedMusic,
             name.to_string(),
         ));
+    }
+}
+
+impl crate::sets::runtime::Host for Engine {
+    fn deck(&mut self, deck: usize) -> crate::sets::runtime::DeckView {
+        if deck >= crate::audio::DECKS {
+            return Default::default();
+        }
+        if self.meta[deck].path.is_some() && self.meta[deck].grid.is_none() {
+            self.bind_analysis(deck, false);
+        }
+        let st = self.audio.deck_states()[deck];
+        let m = &self.meta[deck];
+        crate::sets::runtime::DeckView {
+            path: m.path.clone(),
+            grid: m.grid.clone(),
+            position: st.position,
+            playing: st.playing,
+            fader: st.fader,
+        }
+    }
+
+    fn title(&self, path: &Path) -> String {
+        self.tags_of(path).0
+    }
+
+    fn load(&mut self, deck: usize, path: &Path, at: f64, grid: Option<&Grid>, gain_db: Option<f64>) -> Result<(), String> {
+        self.deck_load_with(deck, path, at, grid.cloned(), gain_db)
+    }
+
+    fn pin(&mut self, deck: usize, grid: &Grid, gain_db: Option<f64>) {
+        if deck < crate::audio::DECKS && self.meta[deck].path.is_some() {
+            self.lock_grid(deck, grid.clone());
+            if let Some(db) = gain_db.filter(|d| d.is_finite()) {
+                self.set_deck_gain(deck, db);
+            }
+        }
+    }
+
+    fn sync_ok(&mut self, clock: usize, own_bpm: f64) -> Result<(), String> {
+        self.check_sync(clock, 1 - clock, own_bpm)
+    }
+
+    fn schedule(&mut self, item: AutoItem) -> Result<(), String> {
+        Engine::schedule(self, item)
+    }
+
+    fn cancel_group(&mut self, group: u32) {
+        Engine::cancel_group(self, group)
+    }
+
+    fn play(&mut self, deck: usize) -> Result<(), String> {
+        self.deck_play(deck)
+    }
+
+    fn decoded(&mut self, deck: usize) -> (f64, bool) {
+        self.audio.decoded(deck)
     }
 }
 

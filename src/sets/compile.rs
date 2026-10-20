@@ -48,7 +48,6 @@ pub enum PlanItem {
 }
 
 impl PlanItem {
-    #[allow(dead_code)] // the arming step and the tests
     pub fn start_beat_rel(&self) -> f64 {
         match self {
             PlanItem::Ramp { start_beat_rel, .. } => *start_beat_rel,

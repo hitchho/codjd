@@ -151,8 +151,21 @@ impl Store {
         })
     }
 
+    /// The file of a set, by set name, file stem or file name
+    pub fn resolve(&self, name: &str) -> Option<PathBuf> {
+        let sets = self.sets.lock().unwrap();
+        Self::find(&sets, name).map(|(f, _)| f.clone())
+    }
+
+    /// The last good version of a set's file and the number of errors in its latest save; None
+    /// when the file is not (or no longer) in the folder
+    pub fn entry(&self, file: &Path) -> Option<(Option<Arc<Compiled>>, u32)> {
+        let sets = self.sets.lock().unwrap();
+        sets.get(file).map(|e| (e.good.clone(), e.errors.len() as u32))
+    }
+
     /// The active (last good) version of a set, by set name, file stem or file name
-    #[allow(dead_code)] // the arming step runs sets through this
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, name: &str) -> Option<Arc<Compiled>> {
         let sets = self.sets.lock().unwrap();
         Self::find(&sets, name).and_then(|(_, e)| e.good.clone())

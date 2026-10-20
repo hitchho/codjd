@@ -77,7 +77,6 @@ pub const GAIN_MAX_DB: f32 = 12.;
 /// - `Exp`: for faders and gains. A rising ramp is slow at first and quickest at the end; a
 ///   falling one quick at first and with a long tail, both `(e^(4p) - 1) / (e^4 - 1)` in the
 ///   direction of the louder end, which is close to constant dB per second and so sounds even.
-#[allow(dead_code)] // constructed by the set runtime (next layer)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Curve {
     Linear,
@@ -120,7 +119,6 @@ pub struct AutoItem {
     pub kind: AutoKind,
 }
 
-#[allow(dead_code)] // constructed by the set runtime (next layer)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutoKind {
     /// from `at_beat` to `end_beat` (clock beats), `from: None` = the control's value when it fires

@@ -479,6 +479,43 @@ impl Bus {
         self.sets.show(&name)
     }
 
+    // ---- set runtime (docs/dj-api.md) ----
+
+    /// make a set active (by set name, file name or stem); "" = none
+    async fn set_use(&self, name: String) -> String {
+        reply(self.codjd.call(move |e| e.set_use(&name)).await)
+    }
+
+    /// arm mix `mix` (0-based, file order): its outgoing track must be on a deck
+    async fn set_arm(&self, mix: u32) -> String {
+        reply(self.codjd.call(move |e| e.set_arm(mix as usize)).await)
+    }
+
+    /// cancel the armed or running mix's remaining automation
+    async fn set_disarm(&self) -> String {
+        reply(self.codjd.call(|e| Ok(e.set_disarm())).await)
+    }
+
+    /// after a mix ends, arm the next one whose outgoing track is now on air
+    async fn set_auto(&self, on: bool) -> String {
+        reply(self.codjd.call(move |e| Ok(e.set_auto(on))).await)
+    }
+
+    /// audition: load both tracks, outgoing `bars_before` bars before the mix start, arm, play
+    async fn set_preview(&self, mix: u32, bars_before: f64) -> String {
+        reply(self.codjd.call(move |e| e.set_preview(mix as usize, bars_before)).await)
+    }
+
+    /// load track `track` (0-based, file order) of the active set onto the free deck
+    async fn set_load(&self, track: u32) -> String {
+        reply(self.codjd.call(move |e| e.set_load(track as usize)).await)
+    }
+
+    /// the active set, its tracks and mixes, and the armed mix
+    async fn set_state(&self) -> crate::sets::runtime::SetState {
+        self.ask(|e| e.set_state()).await
+    }
+
     /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases
     async fn dj_nudge(&self, deck: u32, amount: f64) -> String {
         reply(self.codjd.call(move |e| e.deck_nudge(deck as usize, amount)).await)
@@ -763,6 +800,14 @@ mod tests {
         // a method returning a tuple sends its members as separate out-arguments: "dduudbbb"
         assert_eq!(<GridReply as Type>::SIGNATURE.to_string(), "(dduudbbb)");
         assert_eq!(<(String, String, bool) as Type>::SIGNATURE.to_string(), "(ssb)");
+    }
+
+    #[test]
+    fn set_state_signature_is_pinned() {
+        assert_eq!(
+            <crate::sets::runtime::SetState as Type>::SIGNATURE.to_string(),
+            "(ssua(sss)a(ssdd)ibidba(ds))"
+        );
     }
 
     #[test]

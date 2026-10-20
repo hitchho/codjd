@@ -11,6 +11,7 @@ pub mod model;
 pub mod parser;
 pub mod resolve;
 pub mod live;
+pub mod runtime;
 pub mod store;
 #[cfg(test)]
 mod tests;

@@ -19,7 +19,7 @@ use std::{
 
 use tracing::warn;
 
-#[allow(unused_imports)] // the set runtime uses Curve and AUTO_CAP
+#[allow(unused_imports)] // AUTO_CAP is for the tests
 pub use auto::{AutoItem, AutoKind, Control, Curve, AUTO_CAP};
 pub use beat::{sync_plan, GridSpec};
 pub use mixer::{DeckState, Mode, DECKS};

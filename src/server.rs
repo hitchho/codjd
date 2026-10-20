@@ -66,6 +66,21 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("can't watch the set folder: {e}");
     }
 
+    {
+        let sets = Arc::clone(&sets);
+        codjd.tell(move |e| e.set_sets(sets));
+        // the set runtime follows its mix about ten times a second
+        let codjd = codjd.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                codjd.tell(|e| e.set_tick());
+            }
+        });
+    }
+
     let bus = Bus {
         codjd: codjd.clone(),
         slsk,
