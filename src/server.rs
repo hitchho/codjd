@@ -729,6 +729,11 @@ impl<'a> Player {
     #[zbus(signal)]
     async fn music_added(emitter: &SignalEmitter<'_>, path: &str) -> zbus::Result<()>;
 
+    /// a file appeared in the music folder from outside musad; clients refresh the list but
+    /// shouldn't move the cursor
+    #[zbus(signal)]
+    async fn library_changed(emitter: &SignalEmitter<'_>, path: &str) -> zbus::Result<()>;
+
     #[zbus(signal)]
     #[allow(unused)]
     async fn playlists_updated(
@@ -1708,6 +1713,9 @@ pub struct Server {
     player: Player,
     #[allow(dead_code)]
     app_name: String,
+    /// music folder to watch for files added from outside
+    music_dir: PathBuf,
+    allow_formats: Option<Vec<FileFormat>>,
 }
 
 #[allow(dead_code)]
@@ -1757,6 +1765,8 @@ impl Server {
             dbus_interf: path_from_addr(&dbus_addr),
             dbus_addr,
             app_name: String::from("musa"),
+            music_dir: PathBuf::from(&config.path),
+            allow_formats: config.allow_formats.clone(),
             player: Player {
                 response_reciver,
                 sender,
@@ -1795,6 +1805,8 @@ impl Server {
             dbus_addr: String::from("net.rotko.Musa"),
             dbus_interf: String::from("/net/rotko/Musa"),
             app_name: String::from("musa"),
+            music_dir: PathBuf::from(&config.path),
+            allow_formats: config.allow_formats.clone(),
             player: Player {
                 response_reciver,
                 sender,
@@ -1813,12 +1825,41 @@ impl Server {
     /// Starts the dbus server
     pub async fn start(self) -> Result<(), Box<dyn Error>> {
         info!("Starting `musad`...");
+        let sender = self.player.sender.clone();
+        let analysis = self.player.analysis.clone();
         let _connection = connection::Builder::session()?
             .name(self.dbus_addr.clone())?
             .max_queued(1000)
             .serve_at(self.dbus_interf.clone(), self.player)?
             .build()
             .await?;
+
+        if self.music_dir.is_dir() {
+            let emitter = _connection
+                .object_server()
+                .interface::<_, Player>(self.dbus_interf.as_str())
+                .await?
+                .signal_emitter()
+                .to_owned();
+            let allow_formats = self.allow_formats;
+            let watched = crate::watcher::spawn(self.music_dir, move |path| {
+                if !is_audio(&path) || !format_allowed(&path, &allow_formats) {
+                    return;
+                }
+                // queued before the signal, so a client refetching on it sees the file
+                if sender.send(PlayAction::AddMusic(path.clone())).is_err() {
+                    return;
+                }
+                analysis.enqueue([path.clone()]);
+                let emitter = emitter.clone();
+                tokio::spawn(async move {
+                    let _ = Player::library_changed(&emitter, &path.to_string_lossy()).await;
+                });
+            });
+            if let Err(e) = watched {
+                eprintln!("can't watch the music folder: {e}");
+            }
+        }
 
         tokio::signal::ctrl_c().await?;
         Ok(())
@@ -2089,6 +2130,15 @@ fn format_allowed(path: &std::path::Path, allow_formats: &Option<Vec<FileFormat>
         return false;
     };
     formats.iter().any(|f| f.to_str().eq_ignore_ascii_case(ext))
+}
+
+/// Audio by extension; also rules out in-progress downloads (`*.part`) and cover images when no
+/// `allow_formats` is configured
+fn is_audio(path: &std::path::Path) -> bool {
+    const AUDIO: [&str; 9] = ["mp3", "flac", "ogg", "opus", "wav", "aif", "aiff", "m4a", "webm"];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| AUDIO.iter().any(|a| a.eq_ignore_ascii_case(e)))
 }
 
 /// Adds finished soulseek downloads to the library and tells clients, until disconnected

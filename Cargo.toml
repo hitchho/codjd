@@ -30,6 +30,7 @@ flate2 = "1.0"
 md5 = "0.7"
 dirs = "5.0"
 bliss-audio = { version = "0.13", default-features = false, features = ["symphonia-all", "serde"] }
+notify = "8"
 
 [features]
 full-log = []

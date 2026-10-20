@@ -6,6 +6,7 @@ mod light_client;
 mod server;
 mod soulseek;
 mod utils;
+mod watcher;
 
 #[tokio::main]
 #[instrument(name = "", skip_all)]
