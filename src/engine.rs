@@ -180,6 +180,10 @@ pub struct Engine {
     knobs: [DeckKnobs; crate::audio::DECKS],
     mixer: MixerKnobs,
     hotcues: HotcueStore,
+    /// hand corrections of detected tempos (half/double/triplet mistakes)
+    gridfix: crate::gridfix::GridFixes,
+    /// largest tempo change sync may make, as a fraction (0.16 = ±16 %, the usual pitch range)
+    sync_range: f64,
     /// the player's state; the audio thread's own view lags by a callback
     transport: Transport,
     /// tags the playing track, so a late end event from a replaced one is ignored
@@ -219,6 +223,8 @@ impl Engine {
             knobs: Default::default(),
             mixer: MixerKnobs { crossfader: 0., master, cue_mix: 0., quantize: true },
             hotcues: HotcueStore::open_default(),
+            gridfix: crate::gridfix::GridFixes::open_default(),
+            sync_range: 0.16,
             transport: Transport::Stopped,
             generation: 0,
             volume,
@@ -477,7 +483,8 @@ impl Engine {
         if m.length <= 0. {
             m.length = features.duration_secs();
         }
-        m.grid = features.grid().cloned();
+        let factor = self.gridfix.factor(&path);
+        m.grid = features.grid().map(|g| crate::gridfix::apply(g, factor));
         m.key = features.key().map(|k| k.camelot.clone()).unwrap_or_default();
         self.audio.set_grid(deck, m.grid.as_ref().map(grid_spec));
         if gain {
@@ -585,11 +592,46 @@ impl Engine {
         if !states[other].playing || states[other].waiting {
             return Err("other deck is not playing".into());
         }
-        if sync_plan(theirs.bpm * states[other].rate, own.bpm).is_none() {
+        let master_bpm = theirs.bpm * states[other].rate;
+        let Some(plan) = sync_plan(master_bpm, own.bpm) else {
             return Err("tempo too far from the other deck".into());
+        };
+        // beyond the usual pitch range the result sounds sped up or slowed down; it's more
+        // likely a wrong grid than a mix anyone wants
+        let change = plan.rate - 1.;
+        if change.abs() > self.sync_range {
+            let names = ["A", "B"];
+            return Err(format!(
+                "sync would change {} by {:+.0}% ({:.1} -> {:.1} BPM): fix a grid with :grid, \
+                 or raise sync_range",
+                names[deck],
+                change * 100.,
+                own.bpm,
+                master_bpm,
+            ));
         }
         self.audio.sync(deck);
         Ok(())
+    }
+
+    /// Corrects the detected tempo of the track on `deck` by `factor` (2, 0.5, 1.5, 2/3 for the
+    /// usual detector mistakes; 0 = back to the detected grid). Saved per track, and applied to
+    /// the deck right away. Returns the corrected BPM.
+    pub fn deck_grid_scale(&mut self, deck: usize, factor: f64) -> Result<f64, String> {
+        check_deck(deck)?;
+        if !(factor == 0. || (0.25..=4.).contains(&factor)) {
+            return Err("factor is 0.25..4 (0 resets)".into());
+        }
+        self.gridded(deck)?;
+        let path = self.meta[deck].path.clone().ok_or("nothing loaded")?;
+        self.gridfix.scale(&path, factor);
+        self.bind_analysis(deck, false);
+        Ok(self.meta[deck].grid.as_ref().map_or(0., |g| g.bpm))
+    }
+
+    /// The saved tempo correction of a track (1 = none)
+    pub fn grid_factor(&self, path: &Path) -> f64 {
+        self.gridfix.factor(path)
     }
 
     /// Temporary tempo bend, -1..1 = -4..+4 %, 0 releases it
@@ -717,6 +759,12 @@ impl Engine {
             "cue_mix" => {
                 self.mixer.cue_mix = value.clamp(0., 1.);
                 self.audio.set_cue_mix(v);
+            }
+            "sync_range" => {
+                if !(0.01..=1.).contains(&value) {
+                    return Err("sync_range is 0.01..1 (0.16 = ±16 %)".into());
+                }
+                self.sync_range = value;
             }
             "quantize" => {
                 self.mixer.quantize = value != 0.;

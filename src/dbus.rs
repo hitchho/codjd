@@ -289,8 +289,16 @@ impl Bus {
     /// says a second detector found about double, half, 3/2 or 2/3 of `bpm` (bpm is not changed).
     /// `analyzed` is false, and the rest zero, until the grid exists: the file has not been
     /// analyzed, the beat-this weights are missing, or no beats were found.
+    /// Includes a hand correction (`DjGridScale`) if there is one.
     async fn get_grid(&self, path: String) -> (f64, f64, u32, u32, f64, bool, bool, bool) {
-        grid_reply(self.analysis.features(std::path::Path::new(&path)).as_ref().and_then(|f| f.grid()))
+        let file = std::path::PathBuf::from(&path);
+        let factor = self.ask(move |e| e.grid_factor(&file)).await;
+        let factor = if factor == 0. { 1. } else { factor };
+        let grid = self
+            .analysis
+            .features(std::path::Path::new(&path))
+            .and_then(|f| f.grid().map(|g| crate::gridfix::apply(g, factor)));
+        grid_reply(grid.as_ref())
     }
 
     /// Key of the file at `path`: (camelot, name, analyzed), e.g. ("8A", "A minor", true).
@@ -436,6 +444,16 @@ impl Bus {
     /// match `deck`'s tempo to the other deck and align the beats; follows its tempo from then on
     async fn dj_sync(&self, deck: u32) -> String {
         reply(self.codjd.call(move |e| e.deck_sync(deck as usize)).await)
+    }
+
+    /// correct the detected tempo of `deck`'s track by `factor` (2, 0.5, 1.5, 0.6667; 0 resets);
+    /// saved per track. Replies "ok <bpm>" or an error
+    async fn dj_grid_scale(&self, deck: u32, factor: f64) -> String {
+        match self.codjd.call(move |e| e.deck_grid_scale(deck as usize, factor)).await {
+            Some(Ok(bpm)) => format!("ok {bpm:.2}"),
+            Some(Err(e)) => e,
+            None => "engine not running".to_string(),
+        }
     }
 
     /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases

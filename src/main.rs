@@ -6,6 +6,7 @@ mod config;
 mod dbus;
 mod dj;
 mod engine;
+mod gridfix;
 mod hotcues;
 mod library;
 mod mpris;
