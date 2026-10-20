@@ -1,4 +1,4 @@
-//! The D-Bus front end (`net.rotko.Musa.Player`): a thin layer over the engine handle, the
+//! The D-Bus front end (`net.rotko.Codj.Player`): a thin layer over the engine handle, the
 //! Soulseek service and the analyzer. Methods take `&self`, so calls run side by side instead
 //! of queueing behind each other; engine events are forwarded as signals.
 
@@ -10,7 +10,7 @@ use zbus::{interface, object_server::SignalEmitter, Connection};
 use crate::{
     analysis::Analyzer,
     config::Config,
-    engine::{Event, Musad},
+    engine::{Event, Codjd},
     library::Playlist,
     slsk::{ConnectParams, Slsk},
     soulseek::{ConnectionState, Download, RankedFile, SearchPrefs},
@@ -20,10 +20,10 @@ use crate::{
     },
 };
 
-pub const PATH: &str = "/net/rotko/Musa";
+pub const PATH: &str = "/net/rotko/Codj";
 
 pub struct Bus {
-    pub musad: Musad,
+    pub codjd: Codjd,
     pub slsk: Arc<Slsk>,
     pub analysis: Arc<Analyzer>,
 }
@@ -35,11 +35,11 @@ impl Bus {
         T: Default + Send + 'static,
         F: FnOnce(&mut crate::engine::Engine) -> T + Send + 'static,
     {
-        self.musad.call(f).await.unwrap_or_default()
+        self.codjd.call(f).await.unwrap_or_default()
     }
 }
 
-#[interface(name = "net.rotko.Musa.Player")]
+#[interface(name = "net.rotko.Codj.Player")]
 impl Bus {
     // ---- signals ----
 
@@ -50,7 +50,7 @@ impl Bus {
     /// a finished download was added to the library, clients can select it
     #[zbus(signal)]
     async fn music_added(emitter: &SignalEmitter<'_>, path: &str) -> zbus::Result<()>;
-    /// a file appeared in the music folder from outside musad; clients refresh the list but
+    /// a file appeared in the music folder from outside codjd; clients refresh the list but
     /// shouldn't move the cursor
     #[zbus(signal)]
     async fn library_changed(emitter: &SignalEmitter<'_>, path: &str) -> zbus::Result<()>;
@@ -82,68 +82,68 @@ impl Bus {
     // ---- playback ----
 
     async fn play(&self) -> RunStatus {
-        self.musad.tell(|e| e.play());
+        self.codjd.tell(|e| e.play());
         RunStatus::ok()
     }
 
     async fn toggle_play(&self) -> RunStatus {
-        self.musad.tell(|e| e.toggle());
+        self.codjd.tell(|e| e.toggle());
         RunStatus::ok()
     }
 
     async fn pause(&self) -> RunStatus {
-        self.musad.tell(|e| e.pause());
+        self.codjd.tell(|e| e.pause());
         RunStatus::ok()
     }
 
     async fn resume(&self) -> RunStatus {
-        self.musad.tell(|e| e.resume());
+        self.codjd.tell(|e| e.resume());
         RunStatus::ok()
     }
 
     async fn end(&self) -> RunStatus {
-        self.musad.tell(|e| e.stop());
+        self.codjd.tell(|e| e.stop());
         RunStatus::ok()
     }
 
     async fn play_next(&self) -> RunStatus {
-        self.musad.tell(|e| e.play_next());
+        self.codjd.tell(|e| e.play_next());
         RunStatus::ok()
     }
 
     async fn play_previous(&self) -> RunStatus {
-        self.musad.tell(|e| e.play_previous());
+        self.codjd.tell(|e| e.play_previous());
         RunStatus::ok()
     }
 
     async fn play_from_index(&self, index: u32) -> RunStatus {
-        self.musad.tell(move |e| e.play_index(index));
+        self.codjd.tell(move |e| e.play_index(index));
         RunStatus::ok()
     }
 
     /// seeks to `duration` seconds into the playing track
     async fn seek(&self, duration: f64) -> RunStatus {
-        self.musad.tell(move |e| e.seek(duration));
+        self.codjd.tell(move |e| e.seek(duration));
         RunStatus::ok()
     }
 
     async fn volume(&self, amount: f32) -> RunStatus {
-        self.musad.tell(move |e| e.set_volume(amount));
+        self.codjd.tell(move |e| e.set_volume(amount));
         RunStatus::ok()
     }
 
     async fn toggle_mute(&self) -> RunStatus {
-        self.musad.tell(|e| e.toggle_mute());
+        self.codjd.tell(|e| e.toggle_mute());
         RunStatus::ok()
     }
 
     async fn sort(&self, sort: Sort) -> RunStatus {
-        self.musad.tell(move |e| e.set_sort(sort));
+        self.codjd.tell(move |e| e.set_sort(sort));
         RunStatus::ok()
     }
 
     async fn repeat(&self, repeat: Repeat) -> RunStatus {
-        self.musad.tell(move |e| e.set_repeat(repeat));
+        self.codjd.tell(move |e| e.set_repeat(repeat));
         RunStatus::ok()
     }
 
@@ -212,7 +212,7 @@ impl Bus {
             Config::default()
         });
         if let Some(paths) = self
-            .musad
+            .codjd
             .call(move |e| {
                 e.reload(&config);
                 e.playlist.paths()
@@ -227,24 +227,24 @@ impl Bus {
 
     /// queue the playlist track at `index`; `front` makes it play next
     async fn queue_add(&self, index: u32, front: bool) -> RunStatus {
-        self.musad.tell(move |e| e.queue_add(index, front));
+        self.codjd.tell(move |e| e.queue_add(index, front));
         RunStatus::ok()
     }
 
     async fn queue_remove(&self, pos: u32) -> RunStatus {
-        self.musad.tell(move |e| e.queue_remove(pos));
+        self.codjd.tell(move |e| e.queue_remove(pos));
         RunStatus::ok()
     }
 
     /// move the queued track at `pos` one place up or down
     async fn queue_move(&self, pos: u32, up: bool) -> RunStatus {
-        self.musad.tell(move |e| e.queue_move(pos, up));
+        self.codjd.tell(move |e| e.queue_move(pos, up));
         RunStatus::ok()
     }
 
     /// play the queued track at `pos` now
     async fn queue_play(&self, pos: u32) -> RunStatus {
-        self.musad.tell(move |e| e.queue_play(pos));
+        self.codjd.tell(move |e| e.queue_play(pos));
         RunStatus::ok()
     }
 
@@ -312,7 +312,7 @@ impl Bus {
         let paths = playlist.paths();
         let picks = pick_similar(&self.analysis, &path, &playlist, &paths, &queue, n as usize);
         let added = picks.len() as u32;
-        self.musad.tell(move |e| {
+        self.codjd.tell(move |e| {
             for i in picks {
                 e.queue_add(i, false);
             }
@@ -337,36 +337,36 @@ impl Bus {
     }
 
     async fn use_playlist(&self, id: String) {
-        self.musad.tell(move |e| e.load_playlist(&id));
+        self.codjd.tell(move |e| e.load_playlist(&id));
     }
 
     async fn create_playlist(&self, id: String) {
-        self.musad.tell(move |e| e.create_playlist(&id));
+        self.codjd.tell(move |e| e.create_playlist(&id));
     }
 
     async fn delete_playlist(&self, id: String) {
-        self.musad.tell(move |e| e.delete_playlist(&id));
+        self.codjd.tell(move |e| e.delete_playlist(&id));
     }
 
     async fn remove_playlist(&self, name: String) -> RunStatus {
-        self.musad.tell(move |e| e.remove_playlist(&name));
+        self.codjd.tell(move |e| e.remove_playlist(&name));
         RunStatus::ok()
     }
 
     async fn rename_playlist(&self, old: String, new: String) -> RunStatus {
-        self.musad.tell(move |e| e.rename_playlist(&old, &new));
+        self.codjd.tell(move |e| e.rename_playlist(&old, &new));
         RunStatus::ok()
     }
 
     /// adds track `index` of playlist `source` to playlist `destination`
     async fn save_to_playlist(&self, index: u64, source: String, destination: String) -> RunStatus {
-        self.musad
+        self.codjd
             .tell(move |e| e.add_to_playlist(index as usize, &source, &destination));
         RunStatus::ok()
     }
 
     async fn delete_from_playlist(&self, index: u64, id: String) {
-        self.musad
+        self.codjd
             .tell(move |e| e.delete_from_playlist(index as usize, &id));
     }
 
@@ -375,23 +375,23 @@ impl Bus {
     /// load a file on deck 0 (A, also the player's) or 1 (B), paused at the start
     async fn dj_load(&self, deck: u32, path: String) -> String {
         let result = self
-            .musad
+            .codjd
             .call(move |e| e.deck_load(deck as usize, std::path::Path::new(&path)))
             .await;
         reply(result)
     }
 
     async fn dj_play(&self, deck: u32) -> String {
-        reply(self.musad.call(move |e| e.deck_play(deck as usize)).await)
+        reply(self.codjd.call(move |e| e.deck_play(deck as usize)).await)
     }
 
     async fn dj_pause(&self, deck: u32) -> String {
-        reply(self.musad.call(move |e| e.deck_pause(deck as usize)).await)
+        reply(self.codjd.call(move |e| e.deck_pause(deck as usize)).await)
     }
 
     async fn dj_seek(&self, deck: u32, seconds: f64) -> String {
         reply(
-            self.musad
+            self.codjd
                 .call(move |e| e.deck_seek(deck as usize, seconds))
                 .await,
         )
@@ -401,20 +401,20 @@ impl Bus {
     /// crossfader, master, cue_mix (deck ignored)
     async fn dj_set(&self, control: String, deck: u32, value: f64) -> String {
         reply(
-            self.musad
+            self.codjd
                 .call(move |e| e.deck_set(&control, deck as usize, value))
                 .await,
         )
     }
 
-    /// "internal" (musa mixes: master + headphones) or "external" (deck A and B outputs)
+    /// "internal" (codj mixes: master + headphones) or "external" (deck A and B outputs)
     async fn dj_mode(&self, mode: String) -> String {
         let mode = match mode.as_str() {
             "internal" => crate::audio::Mode::Internal,
             "external" => crate::audio::Mode::External,
             other => return format!("unknown mode {other}"),
         };
-        reply(self.musad.call(move |e| Ok(e.set_audio_mode(mode))).await)
+        reply(self.codjd.call(move |e| Ok(e.set_audio_mode(mode))).await)
     }
 
     /// per deck: (position s, playing, decoded s, decoding finished)
@@ -585,9 +585,9 @@ fn pick_similar(
 }
 
 /// Turns engine events into D-Bus signals, for as long as the connection lives
-pub fn forward_signals(connection: &Connection, musad: &Musad) -> zbus::Result<()> {
+pub fn forward_signals(connection: &Connection, codjd: &Codjd) -> zbus::Result<()> {
     let emitter = SignalEmitter::new(connection, PATH)?.into_owned();
-    let mut events = musad.subscribe();
+    let mut events = codjd.subscribe();
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {

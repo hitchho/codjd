@@ -1,4 +1,4 @@
-//! musad's audio engine: decks decoded into RAM, a mixer, and one or two output devices.
+//! codjd's audio engine: decks decoded into RAM, a mixer, and one or two output devices.
 //!
 //! [`Audio`] is the control side. It lives on the engine thread, sends commands to the real-time
 //! mixer and reads its state from atomics. A small housekeeping thread forwards events from the
@@ -22,7 +22,7 @@ use mixer::{Cmd, Mixer, RtEvent, Shared};
 pub use output::list_devices;
 pub use track::Track;
 
-/// `[audio]` in musad's config
+/// `[audio]` in codjd's config
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct AudioConfig {

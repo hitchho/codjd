@@ -1,4 +1,4 @@
-//! Starts musad: the engine, analysis, Soulseek, the folder watcher and the D-Bus front end.
+//! Starts codjd: the engine, analysis, Soulseek, the folder watcher and the D-Bus front end.
 
 use std::{error::Error, path::PathBuf, sync::Arc};
 
@@ -10,12 +10,12 @@ use crate::{
     analysis::Analyzer,
     config::Config,
     dbus::{self, Bus},
-    engine::{Event, Musad},
+    engine::{Event, Codjd},
     slsk::Slsk,
     types::{format_allowed, is_audio},
 };
 
-pub const BUS_NAME: &str = "net.rotko.Musa";
+pub const BUS_NAME: &str = "net.rotko.Codj";
 
 #[cfg_attr(not(feature = "debug"), allow(dead_code))]
 pub fn start_tracing() {
@@ -27,9 +27,9 @@ pub fn start_tracing() {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
-/// Runs musad until Ctrl+C
+/// Runs codjd until Ctrl+C
 pub async fn run() -> Result<(), Box<dyn Error>> {
-    info!("Starting `musad`...");
+    info!("Starting `codjd`...");
     let config = Config::try_from_env().unwrap_or_else(|e| {
         eprintln!("{e}\nfalling back to the default config (no music path)");
         Config::default()
@@ -37,15 +37,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let music_dir = PathBuf::from(&config.path);
     let allow_formats = config.allow_formats.clone();
 
-    let musad = Musad::start(config)?;
+    let codjd = Codjd::start(config)?;
     let analysis = Analyzer::start();
-    if let Some(paths) = musad.call(|e| e.playlist.paths()).await {
+    if let Some(paths) = codjd.call(|e| e.playlist.paths()).await {
         analysis.enqueue(paths);
     }
-    let slsk = Arc::new(Slsk::new(musad.clone(), Arc::clone(&analysis)));
+    let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
     let bus = Bus {
-        musad: musad.clone(),
+        codjd: codjd.clone(),
         slsk,
         analysis: Arc::clone(&analysis),
     };
@@ -55,27 +55,27 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .serve_at(dbus::PATH, bus)?
         .build()
         .await?;
-    dbus::forward_signals(&connection, &musad)?;
-    // media keys, playerctl and desktop widgets; musad still works if another player owns it
+    dbus::forward_signals(&connection, &codjd)?;
+    // media keys, playerctl and desktop widgets; codjd still works if another player owns it
     match connection.request_name(crate::mpris::BUS_NAME).await {
-        Ok(()) => crate::mpris::serve(&connection, &musad).await?,
+        Ok(()) => crate::mpris::serve(&connection, &codjd).await?,
         Err(e) => eprintln!("MPRIS unavailable: {e}"),
     }
 
     if music_dir.is_dir() {
-        let musad = musad.clone();
+        let codjd = codjd.clone();
         let watched = crate::watcher::spawn(music_dir, move |path| {
             if !is_audio(&path) || !format_allowed(&path, &allow_formats) {
                 return;
             }
-            let musad = musad.clone();
+            let codjd = codjd.clone();
             let analysis = Arc::clone(&analysis);
             tokio::spawn(async move {
                 let add = path.clone();
                 // added before the event, so a client refetching on it sees the file
-                if musad.call(move |e| e.add_music(add)).await == Some(true) {
+                if codjd.call(move |e| e.add_music(add)).await == Some(true) {
                     analysis.enqueue([path.clone()]);
-                    musad.emit(Event::LibraryChanged(path));
+                    codjd.emit(Event::LibraryChanged(path));
                 }
             });
         });

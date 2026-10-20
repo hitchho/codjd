@@ -334,7 +334,7 @@ pub fn pack_shared_file_list_response() -> Vec<u8> {
     w.write_u32(1);
 
     // folder name
-    w.write_string("musa shares");
+    w.write_string("codj shares");
 
     // number of files in folder
     w.write_u32(1);

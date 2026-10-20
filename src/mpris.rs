@@ -1,4 +1,4 @@
-//! MPRIS (`org.mpris.MediaPlayer2.musad`): media keys, `playerctl`, desktop and bar widgets.
+//! MPRIS (`org.mpris.MediaPlayer2.codjd`): media keys, `playerctl`, desktop and bar widgets.
 //! Another thin front end over the engine handle.
 
 use std::collections::HashMap;
@@ -12,11 +12,11 @@ use zbus::{
 };
 
 use crate::{
-    engine::{Event, Musad},
+    engine::{Event, Codjd},
     types::{PlayingStatus, Repeat, Sort},
 };
 
-pub const BUS_NAME: &str = "org.mpris.MediaPlayer2.musad";
+pub const BUS_NAME: &str = "org.mpris.MediaPlayer2.codjd";
 pub const PATH: &str = "/org/mpris/MediaPlayer2";
 
 /// `org.mpris.MediaPlayer2`
@@ -41,7 +41,7 @@ impl Root {
     }
     #[zbus(property)]
     fn identity(&self) -> &str {
-        "musa"
+        "codj"
     }
     #[zbus(property)]
     fn supported_uri_schemes(&self) -> Vec<String> {
@@ -55,7 +55,7 @@ impl Root {
 
 /// `org.mpris.MediaPlayer2.Player`
 pub struct Player {
-    pub musad: Musad,
+    pub codjd: Codjd,
 }
 
 const MICROS: f64 = 1_000_000.;
@@ -66,34 +66,34 @@ impl Player {
         T: Default + Send + 'static,
         F: FnOnce(&mut crate::engine::Engine) -> T + Send + 'static,
     {
-        self.musad.call(f).await.unwrap_or_default()
+        self.codjd.call(f).await.unwrap_or_default()
     }
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
     async fn next(&self) {
-        self.musad.tell(|e| e.play_next());
+        self.codjd.tell(|e| e.play_next());
     }
 
     async fn previous(&self) {
-        self.musad.tell(|e| e.play_previous());
+        self.codjd.tell(|e| e.play_previous());
     }
 
     async fn pause(&self) {
-        self.musad.tell(|e| e.pause());
+        self.codjd.tell(|e| e.pause());
     }
 
     async fn play_pause(&self) {
-        self.musad.tell(|e| e.toggle());
+        self.codjd.tell(|e| e.toggle());
     }
 
     async fn stop(&self) {
-        self.musad.tell(|e| e.stop());
+        self.codjd.tell(|e| e.stop());
     }
 
     async fn play(&self) {
-        self.musad.tell(|e| match e.status() {
+        self.codjd.tell(|e| match e.status() {
             PlayingStatus::Pausing => e.resume(),
             PlayingStatus::Stopped => e.toggle(),
             PlayingStatus::Playing => {}
@@ -126,7 +126,7 @@ impl Player {
         if track_id.as_str() != track_path(current) || position < 0 {
             return;
         }
-        self.musad
+        self.codjd
             .tell(move |e| e.seek(position as f64 / MICROS));
         let _ = Self::seeked(&emitter, position).await;
     }
@@ -163,7 +163,7 @@ impl Player {
             "Playlist" => Repeat::AllMusics,
             _ => Repeat::Dont,
         };
-        self.musad.tell(move |e| e.set_repeat(repeat));
+        self.codjd.tell(move |e| e.set_repeat(repeat));
     }
 
     #[zbus(property)]
@@ -174,7 +174,7 @@ impl Player {
     #[zbus(property)]
     async fn set_shuffle(&self, shuffle: bool) {
         let sort = if shuffle { Sort::Shuffle } else { Sort::ByTitleAscending };
-        self.musad.tell(move |e| e.set_sort(sort));
+        self.codjd.tell(move |e| e.set_sort(sort));
     }
 
     #[zbus(property)]
@@ -220,7 +220,7 @@ impl Player {
 
     #[zbus(property)]
     async fn set_volume(&self, volume: f64) {
-        self.musad.tell(move |e| e.set_volume(volume as f32));
+        self.codjd.tell(move |e| e.set_volume(volume as f32));
     }
 
     /// Microseconds into the track (clients poll this; there's no change signal by design)
@@ -270,12 +270,12 @@ impl Player {
 }
 
 fn track_path(index: u32) -> String {
-    format!("/net/rotko/Musa/track/{index}")
+    format!("/net/rotko/Codj/track/{index}")
 }
 
 /// Sends PropertiesChanged for what each engine event changes
-pub fn forward_changes(iface: InterfaceRef<Player>, musad: &Musad) {
-    let mut events = musad.subscribe();
+pub fn forward_changes(iface: InterfaceRef<Player>, codjd: &Codjd) {
+    let mut events = codjd.subscribe();
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
@@ -310,17 +310,17 @@ pub fn forward_changes(iface: InterfaceRef<Player>, musad: &Musad) {
 }
 
 /// Serves MPRIS on `connection` (which must own [`BUS_NAME`])
-pub async fn serve(connection: &Connection, musad: &Musad) -> zbus::Result<()> {
+pub async fn serve(connection: &Connection, codjd: &Codjd) -> zbus::Result<()> {
     let server = connection.object_server();
     server.at(PATH, Root).await?;
     server
         .at(
             PATH,
             Player {
-                musad: musad.clone(),
+                codjd: codjd.clone(),
             },
         )
         .await?;
-    forward_changes(server.interface::<_, Player>(PATH).await?, musad);
+    forward_changes(server.interface::<_, Player>(PATH).await?, codjd);
     Ok(())
 }

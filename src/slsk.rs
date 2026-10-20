@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     analysis::Analyzer,
-    engine::{Event, Musad},
+    engine::{Event, Codjd},
     soulseek::{
         find_alternates, folder_files, rank_search_results, remote_folder, sanitize_folder_name,
         ConnectionState, Download, DownloadState, RankedFile, SearchPrefs, SearchResult,
@@ -22,7 +22,7 @@ type Connect = tokio::task::JoinHandle<Result<(Arc<SoulseekClient>, String), Str
 
 pub struct Slsk {
     state: Mutex<State>,
-    musad: Musad,
+    codjd: Codjd,
     analysis: Arc<Analyzer>,
 }
 
@@ -52,7 +52,7 @@ pub struct ConnectParams {
 }
 
 impl Slsk {
-    pub fn new(musad: Musad, analysis: Arc<Analyzer>) -> Self {
+    pub fn new(codjd: Codjd, analysis: Arc<Analyzer>) -> Self {
         Self {
             state: Mutex::new(State {
                 client: None,
@@ -65,7 +65,7 @@ impl Slsk {
                 prefs: SearchPrefs::default(),
                 max_concurrent: 3,
             }),
-            musad,
+            codjd,
             analysis,
         }
     }
@@ -120,7 +120,7 @@ impl Slsk {
         let client = Arc::new(SoulseekClient::new(config, PathBuf::from(p.download_dir)));
         let mut state = self.state.lock().await;
         let max_concurrent = state.max_concurrent;
-        let musad = self.musad.clone();
+        let codjd = self.codjd.clone();
         let analysis = Arc::clone(&self.analysis);
         state.connecting = Some(tokio::spawn(async move {
             client.connect().await.map_err(|e| format!("connect error: {}", e))?;
@@ -132,7 +132,7 @@ impl Slsk {
             }
             Arc::clone(&client).spawn_receiver();
             client.set_max_concurrent(max_concurrent).await;
-            spawn_download_watcher(Arc::clone(&client), musad, analysis);
+            spawn_download_watcher(Arc::clone(&client), codjd, analysis);
             let msg = if response.is_new_account() {
                 "registered and connected"
             } else {
@@ -371,7 +371,7 @@ impl State {
 }
 
 /// Adds finished downloads to the library and tells clients, until disconnected
-fn spawn_download_watcher(client: Arc<SoulseekClient>, musad: Musad, analysis: Arc<Analyzer>) {
+fn spawn_download_watcher(client: Arc<SoulseekClient>, codjd: Codjd, analysis: Arc<Analyzer>) {
     tokio::spawn(async move {
         let mut added = HashSet::new();
         loop {
@@ -386,11 +386,11 @@ fn spawn_download_watcher(client: Arc<SoulseekClient>, musad: Musad, analysis: A
                     let path = dl.local_path.clone();
                     // added before the event, so a client refetching on it sees the file
                     let add = path.clone();
-                    if musad.call(move |e| e.add_music(add)).await.is_none() {
+                    if codjd.call(move |e| e.add_music(add)).await.is_none() {
                         return;
                     }
                     analysis.enqueue([path.clone()]);
-                    musad.emit(Event::MusicAdded(path));
+                    codjd.emit(Event::MusicAdded(path));
                 }
             }
         }

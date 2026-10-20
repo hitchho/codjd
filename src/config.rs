@@ -1,4 +1,4 @@
-//! musad's config file
+//! codjd's config file
 
 use std::path::PathBuf;
 
@@ -52,8 +52,9 @@ impl Config {
             Config::read_config(PathBuf::from(&args[1]))
         } else {
             let home = std::env::var("HOME").unwrap().to_string();
-            // ~/.config/musad, or the config from before the rename
+            // ~/.config/codjd, or a config from before a rename (musad, mplayer-server)
             let file_path = [
+                format!("{home}/.config/codjd/config.toml"),
                 format!("{home}/.config/musad/config.toml"),
                 format!("{home}/.config/mplayer-server/config.toml"),
             ]

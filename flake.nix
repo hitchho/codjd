@@ -32,7 +32,7 @@
       in
       {
         defaultPackage = naersk-lib.buildPackage {
-          name = "musad";
+          name = "codjd";
           src = ./.;
           buildInputs = with pkgs; [
             pkg-config

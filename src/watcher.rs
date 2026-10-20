@@ -1,5 +1,5 @@
 //! Watches the music folder so files added from outside (Nicotine+, a file manager, rsync, ...)
-//! join the library without restarting musad.
+//! join the library without restarting codjd.
 //!
 //! A file is only added once its size has stopped changing for a few seconds, so a copy in
 //! progress isn't picked up half-written. Folders moved in whole are walked.
@@ -161,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn picks_up_files_and_folders_moved_in() {
-        let root = std::env::temp_dir().join(format!("musad-watch-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("codjd-watch-{}", std::process::id()));
         let music = root.join("music");
         let outside = root.join("outside");
         std::fs::create_dir_all(&music).unwrap();

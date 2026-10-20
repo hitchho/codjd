@@ -4,13 +4,13 @@ authors = [
     "yasssine <yassine.bna@proton.me>",
     "Tommi Niemi <tommi@rotko.net>",
 ]
-name = "musad"
+name = "codjd"
 version = "0.2.0"
 edition = "2021"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/yassinebenarbia/mplayer-server"
-description = "musad: music player daemon with built-in Soulseek, controlled over D-Bus"
+description = "codjd: music player daemon with built-in Soulseek, controlled over D-Bus"
 keywords = ["music", "daemon", "soulseek", "dbus", "audio"]
 
 [dependencies]

@@ -1,14 +1,16 @@
-<h1 align="center">musad</h1>
+<h1 align="center">codjd</h1>
 
-**musad** is a music player daemon with built-in [Soulseek](https://www.slsknet.org) search and downloads, written in [Rust](https://www.rust-lang.org) and controlled over [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/#whatisd-bus) (`net.rotko.Musa`). [**musa**](https://github.com/yassinebenarbia/mplayer-client) is its terminal UI, but anything that speaks D-Bus can drive it (see [DOCS.md](./DOCS.md)).
+**codjd** is a music player daemon with built-in [Soulseek](https://www.slsknet.org) search and downloads, written in [Rust](https://www.rust-lang.org) and controlled over [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/#whatisd-bus) (`net.rotko.Codj`). [**codj**](https://github.com/yassinebenarbia/mplayer-client) is its terminal UI, but anything that speaks D-Bus can drive it (see [DOCS.md](./DOCS.md)).
+
+It is becoming the engine of a keyboard-driven DJ system (two decks, mixer, beat analysis; see [docs/dj-mode.md](./docs/dj-mode.md)). It was called *musad* before; configs in `~/.config/musad` and `~/.config/mplayer-server` and the cache in `~/.cache/musad` are still picked up.
 
 It keeps playing, keeps the play queue and keeps downloading when no client is open, and adds finished downloads to the library.
 
-Downloads are written as `<name>.part` and renamed when complete. A whole remote folder (an album) can be queued at once (`slsk_download_folder`), in track order, into a subfolder named after it. When a download fails, or sits in the uploader's queue for 5 minutes without the transfer starting, musad tries the same file (same name, size within 1%) from up to 3 other users from the search results, best ranked first.
+Downloads are written as `<name>.part` and renamed when complete. A whole remote folder (an album) can be queued at once (`slsk_download_folder`), in track order, into a subfolder named after it. When a download fails, or sits in the uploader's queue for 5 minutes without the transfer starting, codjd tries the same file (same name, size within 1%) from up to 3 other users from the search results, best ranked first.
 
-It speaks MPRIS (`org.mpris.MediaPlayer2.musad`), so media keys, `playerctl` and desktop or bar widgets control it with no client open: `playerctl -p musad play-pause`, `playerctl -p musad next`, `playerctl -p musad metadata`.
+It speaks MPRIS (`org.mpris.MediaPlayer2.codjd`), so media keys, `playerctl` and desktop or bar widgets control it with no client open: `playerctl -p codjd play-pause`, `playerctl -p codjd next`, `playerctl -p codjd metadata`.
 
-It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/musad/analysis.json` (`MUSAD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo is an estimate and can be off by half or double.
+It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/codjd/analysis.json` (`CODJD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo is an estimate and can be off by half or double.
 
 # Usage:
 
@@ -19,13 +21,13 @@ cargo install --features "debug" --path .
 ```
 Then run it, with the config in place first (see [Configuration](#configuration)):
 ```
-musad # optional config path here
+codjd # optional config path here
 ```
 >[!NOTE]
-> If you want to package musad for a distro, feel free to, and open an issue if you have questions.
+> If you want to package codjd for a distro, feel free to, and open an issue if you have questions.
 
 ## Configuration
-See the [example config file](./config.example.toml). Put it at `$HOME/.config/musad/config.toml` or pass its path as the first argument. A config at the old `$HOME/.config/mplayer-server/config.toml` is still read if the new one doesn't exist.
+See the [example config file](./config.example.toml). Put it at `$HOME/.config/codjd/config.toml` or pass its path as the first argument. A config at the old `$HOME/.config/mplayer-server/config.toml` is still read if the new one doesn't exist.
 
 ## Documentation
 Access the documentation in [DOCS.md](./DOCS.md).
@@ -46,4 +48,4 @@ Access the documentation in [DOCS.md](./DOCS.md).
 > and many more...
 
 # License and origin
-musad is a fork of [mplayer-server](https://github.com/yassinebenarbia/mplayer-server) by yassinebenarbia, renamed and extended (Soulseek, play queue, library updates and more). It is licensed under the [GPL-3.0-or-later](./LICENCE), like the original.
+codjd is a fork of [mplayer-server](https://github.com/yassinebenarbia/mplayer-server) by yassinebenarbia, renamed and extended (Soulseek, play queue, library updates and more). It is licensed under the [GPL-3.0-or-later](./LICENCE), like the original.

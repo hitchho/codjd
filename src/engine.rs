@@ -1,11 +1,11 @@
 //! The player core: owns the audio output, the library playlist and the play queue.
 //!
 //! The engine runs on its own thread (the audio output can't move between threads). Everything
-//! else talks to it through a [`Musad`] handle by sending it a function to run:
+//! else talks to it through a [`Codjd`] handle by sending it a function to run:
 //!
 //! ```ignore
-//! let queue = musad.call(|e| e.queue()).await;   // ask, and wait for the answer
-//! musad.tell(|e| e.set_volume(0.4));             // just do it
+//! let queue = codjd.call(|e| e.queue()).await;   // ask, and wait for the answer
+//! codjd.tell(|e| e.set_volume(0.4));             // just do it
 //! ```
 //!
 //! Each call gets its own reply channel, so an answer can never reach the wrong caller. State
@@ -43,9 +43,9 @@ pub enum Event {
     Sorted(Sort),
     RepeatChanged(Repeat),
     ConfigReloaded,
-    /// one of musa's own downloads joined the library; clients may select it
+    /// one of codj's own downloads joined the library; clients may select it
     MusicAdded(PathBuf),
-    /// a file appeared in the music folder from outside musad
+    /// a file appeared in the music folder from outside codjd
     LibraryChanged(PathBuf),
     PlaylistsUpdated(PlaylistOpperation, String),
     PlaylistLoaded(String),
@@ -57,12 +57,12 @@ type Job = Box<dyn FnOnce(&mut Engine) + Send>;
 
 /// Cheap to clone handle to the engine
 #[derive(Clone)]
-pub struct Musad {
+pub struct Codjd {
     jobs: mpsc::UnboundedSender<Job>,
     events: broadcast::Sender<Event>,
 }
 
-impl Musad {
+impl Codjd {
     /// Opens the audio output and loads the library on the engine thread
     pub fn start(config: Config) -> std::io::Result<Self> {
         let (jobs, rx) = mpsc::unbounded_channel::<Job>();
@@ -146,11 +146,11 @@ pub struct Engine {
     queue: VecDeque<Music>,
     /// playlist position to continue after once the queue has played
     resume_after_queue: Option<u32>,
-    handle: Musad,
+    handle: Codjd,
 }
 
 impl Engine {
-    fn new(config: Config, handle: Musad) -> std::io::Result<Self> {
+    fn new(config: Config, handle: Codjd) -> std::io::Result<Self> {
         let events = handle.clone();
         let mut audio = Audio::start(&config.audio, move |event| match event {
             AudioEvent::Ended { deck, generation } if deck == PLAYER_DECK => {

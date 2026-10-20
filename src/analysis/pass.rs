@@ -309,7 +309,7 @@ mod tests {
     /// cancels the -0.691 offset): -20 dBFS is -20 LUFS (EBU Tech 3341 tests use the same fact)
     #[test]
     fn loudness_matches_the_ebu_reference() {
-        let dir = std::env::temp_dir().join(format!("musad-pass-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("codjd-pass-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (rate, amp) = (48_000u32, 0.1f32);
         let mut samples = Vec::new();

@@ -412,6 +412,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "codjd"
+version = "0.2.0"
+dependencies = [
+ "bliss-audio",
+ "cpal",
+ "dirs",
+ "ebur128",
+ "flate2",
+ "lofty",
+ "md5",
+ "notify",
+ "nucleo",
+ "rand 0.9.0",
+ "regex",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1093,32 +1119,6 @@ dependencies = [
  "log",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "musad"
-version = "0.2.0"
-dependencies = [
- "bliss-audio",
- "cpal",
- "dirs",
- "ebur128",
- "flate2",
- "lofty",
- "md5",
- "notify",
- "nucleo",
- "rand 0.9.0",
- "regex",
- "rtrb",
- "serde",
- "serde_json",
- "symphonia",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zbus",
 ]
 
 [[package]]

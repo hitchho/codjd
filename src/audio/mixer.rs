@@ -17,10 +17,10 @@ pub const DECKS: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// musa mixes: master bus (crossfader, faders) and a headphone cue bus
+    /// codj mixes: master bus (crossfader, faders) and a headphone cue bus
     #[default]
     Internal,
-    /// musa is only the decks: each deck has its own output, the club mixer mixes
+    /// codj is only the decks: each deck has its own output, the club mixer mixes
     External,
 }
 

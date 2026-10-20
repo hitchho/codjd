@@ -4,7 +4,7 @@
 //!
 //! Analysis runs on its own worker threads and never blocks playback or D-Bus. A file is decoded
 //! once (`pass.rs`) and that pass feeds loudness, waveform and bliss. Results are cached in
-//! `~/.cache/musad/analysis.json` (override the directory with `MUSAD_CACHE_DIR`), keyed on
+//! `~/.cache/codjd/analysis.json` (override the directory with `CODJD_CACHE_DIR`), keyed on
 //! path + size + mtime, so a file is only analyzed again when it changes. Waveforms are too big
 //! for that file and live next to it, one per track (see `waveform.rs`).
 
@@ -113,14 +113,27 @@ pub struct Analyzer {
 const FORMAT: u16 = 2;
 const VERSION: u16 = FORMAT * 100 + FeaturesVersion::LATEST as u16;
 
+/// `CODJD_CACHE_DIR` (or the older `MUSAD_CACHE_DIR`), else `~/.cache/codjd`. A cache left in
+/// `~/.cache/musad` from before the rename is moved over once.
+pub fn cache_dir() -> Option<PathBuf> {
+    let env = std::env::var_os("CODJD_CACHE_DIR").or_else(|| std::env::var_os("MUSAD_CACHE_DIR"));
+    if let Some(dir) = env {
+        return Some(PathBuf::from(dir));
+    }
+    let base = dirs::cache_dir()?;
+    let dir = base.join("codjd");
+    let old = base.join("musad");
+    if !dir.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &dir);
+    }
+    Some(dir)
+}
+
 impl Analyzer {
     /// Loads the cache and starts the workers: half the cores, 1 to 4. Each worker holds a whole
     /// decoded file (22.05 kHz mono, ~320 MB for an hour-long mix), so more would cost memory.
     pub fn start() -> Arc<Self> {
-        let cache_path = std::env::var_os("MUSAD_CACHE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::cache_dir().map(|d| d.join("musad")))
-            .map(|d| d.join("analysis.json"));
+        let cache_path = cache_dir().map(|d| d.join("analysis.json"));
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).clamp(1, 4))
             .unwrap_or(1);
@@ -382,7 +395,7 @@ mod tests {
 
     #[test]
     fn pre_v2_cache_entries_are_dropped() {
-        let dir = std::env::temp_dir().join(format!("musad-oldcache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("codjd-oldcache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.join("analysis.json");
         let old = format!(
@@ -398,7 +411,7 @@ mod tests {
     /// Analyzes a generated WAV end to end and round-trips it through the cache file
     #[test]
     fn analyzes_a_file_and_caches_it() {
-        let dir = std::env::temp_dir().join(format!("musad-analysis-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("codjd-analysis-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("click.wav");
         write_click_track(&wav, 120., 8.);

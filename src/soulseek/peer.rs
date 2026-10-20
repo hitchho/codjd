@@ -842,7 +842,7 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<(u32, Ve
 /// pack user info response (peer code 16)
 fn pack_user_info_response() -> Vec<u8> {
     let mut w = MessageWriter::new();
-    w.write_string("musa user");
+    w.write_string("codj user");
     w.write_bool(false); // no picture
     w.write_u32(0); // total uploads
     w.write_u32(0); // queue size

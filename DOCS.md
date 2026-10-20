@@ -1,6 +1,6 @@
 # Methods
 
-This is the output of `busctl --user introspect net.rotko.Musa /net/rotko/Musa net.rotko.Musa.Player` check on the [dbus specification](https://dbus.freedesktop.org/doc/dbus-specification.html#id-1.3.8) for details about each signature/type.
+This is the output of `busctl --user introspect net.rotko.Codj /net/rotko/Codj net.rotko.Codj.Player` check on the [dbus specification](https://dbus.freedesktop.org/doc/dbus-specification.html#id-1.3.8) for details about each signature/type.
 
 | NAME                  | TYPE     | SIGNATURE                        | RESULT/VALUE          | FLAGS  |
 |-----------------------|----------|----------------------------------|-----------------------|--------|
@@ -201,16 +201,16 @@ bellow is a list of the method name and it's description (what it does)
 # Examples
 
 ```bash
-busctl --user call net.rotko.Musa /net/rotko/Musa net.rotko.Musa.Player PlayFromIndex u 0
+busctl --user call net.rotko.Codj /net/rotko/Codj net.rotko.Codj.Player PlayFromIndex u 0
 ```
 > Plays music with index 0 in playlist
 
 ```bash
-busctl --user call net.rotko.Musa /net/rotko/Musa net.rotko.Musa.Player TogglePlay
+busctl --user call net.rotko.Codj /net/rotko/Codj net.rotko.Codj.Player TogglePlay
 ```
 > Toggle play the currently playing song, if it's playing it pauses, and if it's paused it plays.
 
 ```bash
-busctl --user call net.rotko.Musa /net/rotko/Musa net.rotko.Musa.Player Playlist
+busctl --user call net.rotko.Codj /net/rotko/Codj net.rotko.Codj.Player Playlist
 ```
 > Gets current playlist

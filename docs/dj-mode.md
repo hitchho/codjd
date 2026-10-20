@@ -7,9 +7,9 @@ Decided:
 
 - Runs on **my own Linux laptop**; music and set data can live on a USB stick.
 - **Both mixing setups, switchable per gig**:
-  - *external*: musa replaces the CDJs only. Deck A → interface outputs 1/2, deck B → 3/4, into
+  - *external*: codj replaces the CDJs only. Deck A → interface outputs 1/2, deck B → 3/4, into
     two channels of the club mixer. The club mixer does EQ, faders, headphones.
-  - *internal*: musa is decks and mixer. Master → outputs 1/2 (PA), headphone cue → 3/4.
+  - *internal*: codj is decks and mixer. Master → outputs 1/2 (PA), headphone cue → 3/4.
 - **Long beatmatched blends first** (techno/house): accurate beat grid, sync, nudge, EQ/bass swaps;
   keylock soon after.
 - **Headphone cueing is essential** in internal mode → a second stereo output. No interface needed:
@@ -37,11 +37,11 @@ Normal player mode is "one deck, no plan" on the same engine.
 Prep happens in a text file, not a drag-and-drop timeline: precise, diffable, versioned in git,
 and it lives on the USB stick next to the music.
 
-- **The editor is the user's own vim/nvim.** No editor inside musa: `e` opens the set file in
-  `$EDITOR` (or a terminal/tmux split). musad watches the file and hot-reloads on save; the
-  timeline view in musa updates and shows errors inline.
+- **The editor is the user's own vim/nvim.** No editor inside codj: `e` opens the set file in
+  `$EDITOR` (or a terminal/tmux split). codjd watches the file and hot-reloads on save; the
+  timeline view in codj updates and shows errors inline.
 - Later: a small language server (completion for track and cue names, bar numbers; error
-  diagnostics), and live coding: send a selected block from vim to musad, applied quantized to
+  diagnostics), and live coding: send a selected block from vim to codjd, applied quantized to
   the next bar.
 - **The language counts bars and beats, not seconds**, and is declarative, so a planned
   transition plays the same every time and can be taken over by hand at any moment:
@@ -76,8 +76,8 @@ mix aft -> smk at aft.outro over 32 bars
 
 ## Agents as co-DJs (MCP)
 
-musad exposes itself as an MCP server (`rmcp`), a third thin front end next to D-Bus and MPRIS,
-so any agent (Claude Code, a local model) can plan and mix with you. musad holds no AI keys and
+codjd exposes itself as an MCP server (`rmcp`), a third thin front end next to D-Bus and MPRIS,
+so any agent (Claude Code, a local model) can plan and mix with you. codjd holds no AI keys and
 calls no AI APIs itself.
 
 - **Read**: library with BPM, key, loudness, similarity; now playing, queue, deck state; the set
@@ -135,7 +135,7 @@ deck B ─ gain ─ EQ3 ─ filter ─ fader ─┴─ crossfader ─ master ─
 - Quantize: cue, loop, jump and play can be set to land on the next beat or bar. This makes
   keyboard and D-Bus timing irrelevant to how tight it sounds.
 - Sync: match BPM and phase to the other deck; nudge = temporary rate bend while held.
-- The engine lives in musad (as now). The TUI, MIDI later, and planned transitions all send the
+- The engine lives in codjd (as now). The TUI, MIDI later, and planned transitions all send the
   same commands.
 
 ## Analysis v2
@@ -179,9 +179,9 @@ The hard part: keyboards have no knobs or jog wheels.
 
 ## Data and the USB stick
 
-- One `musa/` folder per stick: music, `set-<name>.toml`, and the grid/cue/analysis database,
-  all with paths relative to the stick, so the stick works on any machine running musa.
-- A portable musa/musad build on the stick too (static musl), as a fallback for another laptop.
+- One `codj/` folder per stick: music, `set-<name>.toml`, and the grid/cue/analysis database,
+  all with paths relative to the stick, so the stick works on any machine running codj.
+- A portable codj/codjd build on the stick too (static musl), as a fallback for another laptop.
 - Gig safety: record the master output to the stick; on a crash, restart and resume both decks
   at their positions; library scanning, Soulseek and analysis are off or low priority in live
   mode.
@@ -250,5 +250,5 @@ other libKeyFinder and stratum agree exactly on 37/109, libKeyFinder and timestr
 
 Pick: **beat-this large for BPM and grid** (analysis in the background, once per track), with
 timestretch's 2 s `detect_beats` as the cross-check that flags 2x/0.5x disagreements;
-**libKeyFinder for key** (needs libkeyfinder 2.2 + FFTW and a C++ build; GPL-3 matches musad).
-Not wired into musad yet.
+**libKeyFinder for key** (needs libkeyfinder 2.2 + FFTW and a C++ build; GPL-3 matches codjd).
+Not wired into codjd yet.
