@@ -4,6 +4,7 @@
 //! mixer and reads its state from atomics. A small housekeeping thread forwards events from the
 //! audio thread (a track ended) and frees tracks the mixer is done with.
 
+mod beat;
 mod eq;
 mod mixer;
 mod output;
@@ -17,7 +18,8 @@ use std::{
 
 use tracing::warn;
 
-pub use mixer::{Mode, DECKS};
+pub use beat::{sync_plan, BeatGrid, GridSpec, SyncPlan};
+pub use mixer::{DeckState, Mode, DECKS};
 use mixer::{Cmd, Mixer, RtEvent, Shared};
 pub use output::list_devices;
 pub use track::Track;
@@ -201,6 +203,56 @@ impl Audio {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// trim (auto-gain), linear, on top of the gain knob
+    pub fn set_trim(&mut self, deck: usize, gain: f32) {
+        self.send(Cmd::Trim(deck, gain));
+    }
+
+    /// The beat grid of what is on `deck`; the real-time side keeps it in frames of the track
+    pub fn set_grid(&mut self, deck: usize, grid: Option<GridSpec>) {
+        self.send(Cmd::Grid(deck, grid));
+    }
+
+    /// The CDJ cue button, pressed or released
+    pub fn cue_button(&mut self, deck: usize, pressed: bool) {
+        self.send(Cmd::CueButton(deck, pressed));
+    }
+
+    /// Cues, loops and starts snap to the beat grid
+    pub fn set_quantize(&mut self, on: bool) {
+        self.send(Cmd::Quantize(on));
+    }
+
+    /// Match the other deck's tempo and beat phase, and keep following its tempo. The caller
+    /// checks that it can work (see [`sync_plan`]); a sync that can't is ignored.
+    pub fn sync(&mut self, deck: usize) {
+        self.send(Cmd::Sync(deck));
+    }
+
+    /// Temporary tempo bend, -1..1 = -4..+4 %, 0 = released
+    pub fn nudge(&mut self, deck: usize, amount: f32) {
+        self.send(Cmd::Nudge(deck, amount));
+    }
+
+    pub fn beat_jump(&mut self, deck: usize, beats: f64) {
+        self.send(Cmd::BeatJump(deck, beats));
+    }
+
+    /// Beat loop of `beats` from the current beat; resizes a running loop; 0 exits
+    pub fn set_loop(&mut self, deck: usize, beats: f64) {
+        self.send(Cmd::Loop(deck, beats));
+    }
+
+    /// Jump to `seconds`, on the next beat when `quantized` (and quantize is on)
+    pub fn jump_to(&mut self, deck: usize, seconds: f64, quantized: bool) {
+        self.send(Cmd::JumpTo { deck, seconds, quantized });
+    }
+
+    /// Every deck's published state, all from the same audio callback
+    pub fn deck_states(&self) -> [DeckState; DECKS] {
+        self.shared.snapshot()
     }
 
     /// Seconds into the track on `deck`

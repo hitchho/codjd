@@ -3,15 +3,32 @@
 //! Nothing here locks, allocates, frees or does I/O. Commands arrive through a ring buffer,
 //! state goes out through atomics, finished-with tracks go back through another ring buffer to be
 //! freed elsewhere.
+//!
+//! Everything that has to land on a beat (quantized play, beat jump, loop wrap, quantized hot cue
+//! jump, the phase alignment of a sync) is done here, at the output frame, in track frames. A
+//! jump is a short crossfade that *ends* on the target: for the last [`XFADE_SECS`] before it
+//! lands the output blends from where the deck is to the material just before the target, so the
+//! first frame at the target (usually a kick) is at full level and nothing clicks.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
-use super::{eq::DeckFx, track::Track};
+use super::{
+    beat::{sync_plan, BeatGrid, GridSpec},
+    eq::DeckFx,
+    track::Track,
+};
 
 pub const DECKS: usize = 2;
+
+/// Length of the crossfade at a jump or loop wrap (the contract allows up to 2 ms)
+const XFADE_SECS: f64 = 0.0015;
+/// Fade-in of a start that has to land on a beat or a cue: short, so the attack isn't eaten
+const QUICK_FADE_SECS: f64 = 0.0003;
+/// Nudge at full deflection: +-4 %
+pub const NUDGE_RANGE: f64 = 0.04;
 
 /// How the decks reach the outputs
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
@@ -33,14 +50,18 @@ pub enum Cmd {
         play: bool,
         generation: u64,
     },
+    /// play; with quantize on and the other deck playing, on its next beat
     Play(usize),
     Pause(usize),
     /// jump to seconds
     Seek(usize, f64),
-    /// playback speed, 1.0 = normal (pitch moves with it for now)
+    /// playback speed, 1.0 = normal (pitch moves with it for now). A manual change unsyncs the
+    /// deck and a deck synced to it follows.
     Rate(usize, f64),
-    /// trim, linear
+    /// gain knob, linear
     Gain(usize, f32),
+    /// trim (auto-gain), linear; on top of the gain knob
+    Trim(usize, f32),
     /// EQ band (0 low, 1 mid, 2 high), -1 = kill, 0 = unity, +1 = +6 dB
     Eq(usize, usize, f32),
     /// filter knob, -1 = low-pass closed, 0 = off, 1 = high-pass closed
@@ -55,6 +76,53 @@ pub enum Cmd {
     /// headphones: 0 = cue only, 1 = master only
     CueMix(f32),
     Mode(Mode),
+    // ---- DJ decks ----
+    /// the loaded track's beat grid (None: no grid)
+    Grid(usize, Option<GridSpec>),
+    /// the CDJ cue button
+    CueButton(usize, bool),
+    /// snap cues, loops and starts to the beat grid
+    Quantize(bool),
+    /// match the other deck's tempo and align the beat phase; stays synced
+    Sync(usize),
+    /// temporary tempo bend, -1..1 maps to -4..+4 %, 0 = released
+    Nudge(usize, f32),
+    /// jump by beats, keeping the beat phase
+    BeatJump(usize, f64),
+    /// beat loop of that many beats from the current beat (resizes an active loop); 0 = exit
+    Loop(usize, f64),
+    /// jump to a position (a hot cue), on the next beat if `quantized` and quantize is on
+    JumpTo {
+        deck: usize,
+        seconds: f64,
+        quantized: bool,
+    },
+}
+
+impl Cmd {
+    /// The deck a command is for, to drop commands for decks that don't exist
+    fn deck(&self) -> Option<usize> {
+        match self {
+            Cmd::Load { deck, .. } | Cmd::JumpTo { deck, .. } => Some(*deck),
+            Cmd::Play(d)
+            | Cmd::Pause(d)
+            | Cmd::Seek(d, _)
+            | Cmd::Rate(d, _)
+            | Cmd::Gain(d, _)
+            | Cmd::Trim(d, _)
+            | Cmd::Eq(d, _, _)
+            | Cmd::Filter(d, _)
+            | Cmd::Fader(d, _)
+            | Cmd::Cue(d, _)
+            | Cmd::Grid(d, _)
+            | Cmd::CueButton(d, _)
+            | Cmd::Sync(d)
+            | Cmd::Nudge(d, _)
+            | Cmd::BeatJump(d, _)
+            | Cmd::Loop(d, _) => Some(*d),
+            Cmd::Crossfader(_) | Cmd::Master(_) | Cmd::CueMix(_) | Cmd::Mode(_) | Cmd::Quantize(_) => None,
+        }
+    }
 }
 
 /// Something the audio thread reports
@@ -67,6 +135,9 @@ pub enum RtEvent {
 #[derive(Default)]
 pub struct Shared {
     pub decks: [DeckShared; DECKS],
+    /// sequence counter around [`Mixer::publish`]: odd while it writes, so a reader can tell
+    /// when it has seen a mix of two callbacks and read again
+    pub seq: AtomicU32,
     /// output underruns / errors reported by the audio backend
     pub xruns: AtomicU64,
     /// times the second output had no audio ready
@@ -75,11 +146,63 @@ pub struct Shared {
     pub second_skips: AtomicU64,
 }
 
-#[derive(Default)]
+fn bits(v: f64) -> AtomicU64 {
+    AtomicU64::new(v.to_bits())
+}
+
+/// One deck's published state. Floats are stored as bits.
 pub struct DeckShared {
-    /// seconds into the track, as f64 bits
+    /// seconds into the track
     position: AtomicU64,
     playing: AtomicBool,
+    /// the rate that was set
+    rate: AtomicU64,
+    /// the nudge multiplier now (1.0 = none)
+    nudge: AtomicU64,
+    /// 0..1 within the beat, -1 = no grid
+    beat_phase: AtomicU64,
+    /// 1..=beats per bar, 0 = no grid
+    beat_in_bar: AtomicU32,
+    synced: AtomicBool,
+    /// 0 = no loop
+    loop_beats: AtomicU64,
+    loop_start: AtomicU64,
+    loop_end: AtomicU64,
+    cue: AtomicU64,
+}
+
+impl Default for DeckShared {
+    fn default() -> Self {
+        Self {
+            position: bits(0.),
+            playing: AtomicBool::new(false),
+            rate: bits(1.),
+            nudge: bits(1.),
+            beat_phase: bits(-1.),
+            beat_in_bar: AtomicU32::new(0),
+            synced: AtomicBool::new(false),
+            loop_beats: bits(0.),
+            loop_start: bits(0.),
+            loop_end: bits(0.),
+            cue: bits(0.),
+        }
+    }
+}
+
+/// A consistent copy of a deck's published state
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeckState {
+    pub position: f64,
+    pub playing: bool,
+    pub rate: f64,
+    pub nudge: f64,
+    pub beat_phase: f64,
+    pub beat_in_bar: u32,
+    pub synced: bool,
+    pub loop_beats: f64,
+    pub loop_start: f64,
+    pub loop_end: f64,
+    pub cue: f64,
 }
 
 impl DeckShared {
@@ -89,6 +212,43 @@ impl DeckShared {
 
     pub fn playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
+    }
+
+    fn load(&self) -> DeckState {
+        let f = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+        DeckState {
+            position: f(&self.position),
+            playing: self.playing.load(Ordering::Relaxed),
+            rate: f(&self.rate),
+            nudge: f(&self.nudge),
+            beat_phase: f(&self.beat_phase),
+            beat_in_bar: self.beat_in_bar.load(Ordering::Relaxed),
+            synced: self.synced.load(Ordering::Relaxed),
+            loop_beats: f(&self.loop_beats),
+            loop_start: f(&self.loop_start),
+            loop_end: f(&self.loop_end),
+            cue: f(&self.cue),
+        }
+    }
+}
+
+impl Shared {
+    /// All decks as of one callback (retries while the audio thread is writing; never blocks it)
+    pub fn snapshot(&self) -> [DeckState; DECKS] {
+        let mut out = [self.decks[0].load(), self.decks[1].load()];
+        for _ in 0..64 {
+            let before = self.seq.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            out = [self.decks[0].load(), self.decks[1].load()];
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == before {
+                break;
+            }
+        }
+        out
     }
 }
 
@@ -121,6 +281,41 @@ impl Smooth {
     }
 }
 
+/// An active loop, in track frames
+#[derive(Clone, Copy)]
+struct Loop {
+    start: f64,
+    end: f64,
+    beats: f64,
+}
+
+/// A jump that lands at deck position `when` on `to`; the crossfade runs up to `when`
+#[derive(Clone, Copy)]
+struct Jump {
+    when: f64,
+    to: f64,
+    /// how far a loop moves along when it lands (beat jumps and sync carry their loop)
+    shift: f64,
+}
+
+/// A jump asked for while another one is crossfading: done once that has landed
+#[derive(Clone, Copy)]
+enum Queued {
+    Loop(f64),
+    Delta(f64),
+    To { pos: f64, quantized: bool },
+}
+
+/// Per-sample constants the decks need
+#[derive(Clone, Copy)]
+struct Ctx {
+    out_rate: f64,
+    k_param: f32,
+    k_fade: f32,
+    k_quick: f32,
+    quantize: bool,
+}
+
 struct Deck {
     track: Option<Arc<Track>>,
     /// position in frames of the track's own rate
@@ -133,10 +328,35 @@ struct Deck {
     pending_seek: Option<f64>,
     pausing: bool,
     gain: Smooth,
+    /// auto-gain
+    trim: Smooth,
     fx: DeckFx,
     fader: Smooth,
     cue: bool,
+    // ---- DJ state ----
+    grid: Option<BeatGrid>,
+    /// tempo bend multiplier, 1.0 = none
+    nudge: f64,
+    nudge_to: f64,
+    /// the cue point, in track frames
+    cue_point: f64,
+    /// the cue button is held after being pressed while paused (preview)
+    cue_held: bool,
+    loop_: Option<Loop>,
+    jump: Option<Jump>,
+    queued: Option<Queued>,
+    /// play was pressed with quantize: waiting for the other deck's next beat
+    sched: bool,
+    synced: bool,
+    /// frames of the quick fade-in left
+    quick: u32,
+    /// where the last rendered frame was and how far it moved on; step 0 = nothing rendered
+    last_pos: f64,
+    last_step: f64,
 }
+
+/// The second read head of a crossfade: where it reads and how much of it to blend in
+type Alt = Option<(f64, f32)>;
 
 impl Deck {
     fn new(out_rate: f64) -> Self {
@@ -150,22 +370,232 @@ impl Deck {
             pending_seek: None,
             pausing: false,
             gain: Smooth::new(1.),
+            trim: Smooth::new(1.),
             fx: DeckFx::new(out_rate),
             fader: Smooth::new(1.),
             cue: false,
+            grid: None,
+            nudge: 1.,
+            nudge_to: 1.,
+            cue_point: 0.,
+            cue_held: false,
+            loop_: None,
+            jump: None,
+            queued: None,
+            sched: false,
+            synced: false,
+            quick: 0,
+            last_pos: 0.,
+            last_step: 0.,
+        }
+    }
+
+    /// Audible and not on its way to a stop
+    fn running(&self) -> bool {
+        self.playing && !self.pausing
+    }
+
+    /// Track frames per output frame now
+    #[inline]
+    fn step(&self, out_rate: f64) -> f64 {
+        let tr = self.track.as_ref().map_or(0., |t| t.rate as f64);
+        tr / out_rate * self.rate * self.nudge
+    }
+
+    /// Track frames covered by a crossfade at the current speed
+    #[inline]
+    fn span(&self, out_rate: f64) -> f64 {
+        self.step(out_rate) * XFADE_SECS * out_rate
+    }
+
+    fn decoded(&self) -> f64 {
+        self.track.as_ref().map_or(0., |t| t.decoded() as f64)
+    }
+
+    /// Forget everything timed that belongs to the position it was set for
+    fn clear_timed(&mut self) {
+        self.sched = false;
+        self.jump = None;
+        self.queued = None;
+        self.cue_held = false;
+    }
+
+    /// Begin playing at the current position with a quick fade-in (cue preview, beat starts)
+    fn start_quick(&mut self, ctx: &Ctx) {
+        self.fade = Smooth::new(0.);
+        self.fade.target = 1.;
+        self.playing = true;
+        self.pausing = false;
+        self.pending_seek = None;
+        self.quick = (QUICK_FADE_SECS * ctx.out_rate * 8.) as u32;
+    }
+
+    /// Moves a loop with a jump; drops it if it would leave the track
+    fn shift_loop(&mut self, by: f64) {
+        let decoded = self.decoded();
+        if let Some(l) = &mut self.loop_ {
+            if l.start + by >= 0. && l.end + by < decoded - 2. {
+                l.start += by;
+                l.end += by;
+            } else {
+                self.loop_ = None;
+            }
+        }
+    }
+
+    /// A crossfade is running (a jump about to land or a loop about to wrap): a new jump has to
+    /// wait for it, or its blend would be cut off
+    fn blending(&self, span: f64) -> bool {
+        match (self.jump, self.loop_) {
+            (Some(j), _) => self.pos >= j.when - span,
+            (None, Some(l)) => self.pos >= l.end - span,
+            _ => false,
+        }
+    }
+
+    /// Jump `delta` frames from where the deck is (when the crossfade has run), keeping the
+    /// phase: a target before the start is moved forward by whole beats
+    fn jump_by(&mut self, delta: f64, ctx: &Ctx) {
+        let (Some(track), Some(grid)) = (&self.track, self.grid) else {
+            return;
+        };
+        let decoded = track.decoded() as f64;
+        let span = self.span(ctx.out_rate);
+        // also when it would land in the last stretch of a loop: that is where the loop's own
+        // crossfade starts, and landing mid-way in one would click
+        let near_loop_end = self.loop_.is_some_and(|l| self.pos + span >= l.end - span);
+        if self.blending(span) || near_loop_end {
+            // after it has landed
+            self.queued = Some(match self.queued {
+                Some(Queued::Delta(d)) => Queued::Delta(d + delta),
+                _ => Queued::Delta(delta),
+            });
+            return;
+        }
+        if let Some(j) = &mut self.jump {
+            if j.to + delta >= 0. && j.to + delta < decoded - 2. {
+                j.to += delta;
+                j.shift += delta;
+            }
+            return;
+        }
+        let when = self.pos + span;
+        let mut to = when + delta;
+        if to < 0. {
+            to += (-to / grid.beat).ceil() * grid.beat;
+        }
+        if !(to.is_finite() && to < decoded - 2.) {
+            return;
+        }
+        self.jump = Some(Jump { when, to, shift: to - when });
+    }
+
+    /// Jump to `target`; with `quantized` the crossfade ends on this deck's next beat
+    fn jump_to(&mut self, target: f64, quantized: bool, ctx: &Ctx) {
+        let Some(track) = &self.track else { return };
+        if !(target.is_finite() && target >= 0. && target < track.decoded() as f64 - 2.) {
+            return;
+        }
+        let span = self.span(ctx.out_rate);
+        if self.blending(span) {
+            self.queued = Some(Queued::To { pos: target, quantized });
+            return;
+        }
+        let when = match self.grid {
+            // with a loop on, wait for nothing: its wrap must not be passed meanwhile
+            Some(g) if quantized && ctx.quantize && self.loop_.is_none() => {
+                g.next_at_or_after(self.pos + span)
+            }
+            _ => self.pos + span,
+        };
+        self.jump = Some(Jump { when, to: target, shift: 0. });
+    }
+
+    /// Beat loop of `beats` from the current beat; an active loop is resized keeping its start;
+    /// 0 ends it. Changes to a loop that is crossfading at its wrap wait for the wrap
+    /// (`deferred`: this is that wait over).
+    fn set_loop(&mut self, beats: f64, ctx: &Ctx, deferred: bool) {
+        if !beats.is_finite() || beats < 0. {
+            return;
+        }
+        let span = self.span(ctx.out_rate);
+        if beats == 0. {
+            let Some(l) = self.loop_ else { return };
+            if !deferred && self.blending(span) {
+                self.queued = Some(Queued::Loop(0.));
+            } else if deferred {
+                // the loop has just wrapped; leaving now means going on to where it would have
+                // gone: ahead by its length, through a crossfade
+                self.loop_ = None;
+                let when = self.pos + span;
+                self.jump = Some(Jump { when, to: when + (l.end - l.start), shift: 0. });
+            } else {
+                self.loop_ = None;
+            }
+            return;
+        }
+        let Some(grid) = self.grid else { return };
+        if !deferred && self.blending(span) {
+            self.queued = Some(Queued::Loop(beats));
+            return;
+        }
+        let beats = beats.clamp(1. / 32., 512.);
+        let len = beats * grid.beat;
+        let start = match self.loop_ {
+            Some(l) => l.start,
+            None if ctx.quantize => grid.nearest(self.pos),
+            None => self.pos,
+        };
+        let end = start + len;
+        if end >= self.decoded() - 2. {
+            return;
+        }
+        self.loop_ = Some(Loop { start, end, beats });
+        // already inside the crossfade zone or past the end (a shorter loop): land where the
+        // loop would have us, through a crossfade
+        if self.pos >= end - span {
+            if self.running() {
+                if self.jump.is_none() {
+                    let when = self.pos + span;
+                    let to = start + (when - start).rem_euclid(len);
+                    self.jump = Some(Jump { when, to, shift: 0. });
+                }
+            } else {
+                self.pos = start + (self.pos - start).rem_euclid(len);
+            }
+        }
+    }
+
+    fn apply_queued(&mut self, ctx: &Ctx) {
+        match self.queued.take() {
+            Some(Queued::Loop(beats)) => self.set_loop(beats, ctx, true),
+            Some(Queued::Delta(d)) => self.jump_by(d, ctx),
+            Some(Queued::To { pos, quantized }) => self.jump_to(pos, quantized, ctx),
+            None => {}
         }
     }
 
     /// The next output frame. `step` is track frames per output frame at rate 1.
     #[inline]
-    fn next(&mut self, out_rate: f64, k_fade: f32, ended: &mut bool) -> (f32, f32) {
+    fn next(&mut self, ctx: &Ctx, ended: &mut bool) -> (f32, f32) {
+        // the nudge glides in f64 and lands exactly: a leftover of a few ppm would be a drift
+        let dn = self.nudge_to - self.nudge;
+        self.nudge = if dn.abs() < 1e-7 { self.nudge_to } else { self.nudge + dn * ctx.k_param as f64 };
+        let nudge = self.nudge;
+        self.last_step = 0.;
         let Some(track) = &self.track else {
             return (0., 0.);
         };
         if !self.playing {
             return (0., 0.);
         }
-        let fade = self.fade.next(k_fade);
+        let k = if self.quick > 0 {
+            self.quick -= 1;
+            ctx.k_quick
+        } else {
+            ctx.k_fade
+        };
+        let fade = self.fade.next(k);
         // a pause or jump waits for the fade-out to finish
         if fade < 0.001 && (self.pausing || self.pending_seek.is_some()) {
             if let Some(to) = self.pending_seek.take() {
@@ -174,21 +604,51 @@ impl Deck {
             if self.pausing {
                 self.pausing = false;
                 self.playing = false;
+                self.jump = None;
+                self.queued = None;
                 return (0., 0.);
             }
             self.fade.target = 1.;
         }
-        let i = self.pos.floor() as isize;
-        let frac = (self.pos - i as f64) as f32;
-        let at = |n: isize| -> Option<(f32, f32)> {
-            if n < 0 {
-                Some((0., 0.))
-            } else {
-                track.frame(n as usize)
+        let step = track.rate as f64 / ctx.out_rate * self.rate * nudge;
+        let span = step * XFADE_SECS * ctx.out_rate;
+
+        // beat-timed moves: a jump landing, or a loop wrapping
+        let mut alt: Alt = None;
+        if let Some(j) = self.jump {
+            if self.pos >= j.when {
+                self.pos = j.to + (self.pos - j.when);
+                self.jump = None;
+                if j.shift != 0. {
+                    self.shift_loop(j.shift);
+                }
+                // landed outside the loop: it is over
+                if self.loop_.is_some_and(|l| self.pos < l.start - 1. || self.pos >= l.end - span) {
+                    self.loop_ = None;
+                }
+            } else if span > 0. && self.pos >= j.when - span {
+                alt = Some((j.to - (j.when - self.pos), ((self.pos - (j.when - span)) / span) as f32));
             }
+        } else if let Some(l) = self.loop_ {
+            let len = l.end - l.start;
+            if self.pos >= l.end {
+                // wrapped without a crossfade (the position was moved past the end): the
+                // fractional overshoot is kept so the loop stays exact
+                self.pos = l.start + (self.pos - l.start).rem_euclid(len);
+            } else if span > 0. && self.pos >= l.end - span {
+                alt = Some((self.pos - len, ((self.pos - (l.end - span)) / span) as f32));
+            }
+        }
+        if self.jump.is_none() && self.queued.is_some() && !self.blending(span) {
+            let ctx = *ctx;
+            self.apply_queued(&ctx);
+        }
+
+        let Some(track) = &self.track else {
+            return (0., 0.);
         };
-        let (Some(p0), Some(p1), Some(p2), Some(p3)) = (at(i - 1), at(i), at(i + 1), at(i + 2))
-        else {
+        let Some((l, r)) = read(track, self.pos) else {
+            let i = self.pos.floor() as isize;
             if track.is_done() && i as usize >= track.decoded().saturating_sub(2) {
                 self.playing = false;
                 *ended = true;
@@ -196,12 +656,37 @@ impl Deck {
             // otherwise still decoding: wait for it
             return (0., 0.);
         };
-        self.pos += track.rate as f64 / out_rate * self.rate;
-        (
-            hermite(p0.0, p1.0, p2.0, p3.0, frac) * fade,
-            hermite(p0.1, p1.1, p2.1, p3.1, frac) * fade,
-        )
+        let (l, r) = match alt {
+            Some((p, w)) => {
+                let (al, ar) = read(track, p).unwrap_or((0., 0.));
+                (l * (1. - w) + al * w, r * (1. - w) + ar * w)
+            }
+            None => (l, r),
+        };
+        self.last_pos = self.pos;
+        self.last_step = step;
+        self.pos += step;
+        (l * fade, r * fade)
     }
+}
+
+/// 4-point cubic interpolation of the track at `pos` (frames); None if not decoded yet
+#[inline]
+fn read(track: &Track, pos: f64) -> Option<(f32, f32)> {
+    let i = pos.floor() as isize;
+    let frac = (pos - i as f64) as f32;
+    let at = |n: isize| -> Option<(f32, f32)> {
+        if n < 0 {
+            Some((0., 0.))
+        } else {
+            track.frame(n as usize)
+        }
+    };
+    let (p0, p1, p2, p3) = (at(i - 1)?, at(i)?, at(i + 1)?, at(i + 2)?);
+    Some((
+        hermite(p0.0, p1.0, p2.0, p3.0, frac),
+        hermite(p0.1, p1.1, p2.1, p3.1, frac),
+    ))
 }
 
 /// 4-point cubic interpolation between p1 and p2
@@ -228,9 +713,11 @@ pub struct Mixer {
     master: Smooth,
     cue_mix: Smooth,
     mode: Mode,
+    quantize: bool,
     /// parameter glide per sample (~10 ms) and declick fade (~4 ms)
     k_param: f32,
     k_fade: f32,
+    k_quick: f32,
     cmds: rtrb::Consumer<Cmd>,
     events: rtrb::Producer<RtEvent>,
     garbage: rtrb::Producer<Arc<Track>>,
@@ -254,8 +741,10 @@ impl Mixer {
             master: Smooth::new(1.),
             cue_mix: Smooth::new(0.),
             mode,
+            quantize: true,
             k_param: (1. / (0.010 * out_rate)) as f32,
             k_fade: (1. / (0.004 * out_rate)) as f32,
+            k_quick: (1. / (QUICK_FADE_SECS * out_rate)) as f32,
             cmds,
             events,
             garbage,
@@ -263,7 +752,44 @@ impl Mixer {
         }
     }
 
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            out_rate: self.out_rate,
+            k_param: self.k_param,
+            k_fade: self.k_fade,
+            k_quick: self.k_quick,
+            quantize: self.quantize,
+        }
+    }
+
+    /// Sets `deck`'s rate and moves a deck synced to it along
+    fn set_rate(&mut self, deck: usize, rate: f64) {
+        self.decks[deck].rate = rate.clamp(0.25, 4.);
+        self.follow(deck);
+    }
+
+    /// The deck synced to `master` takes the master's tempo again
+    fn follow(&mut self, master: usize) {
+        let f = 1 - master;
+        if !self.decks[f].synced {
+            return;
+        }
+        let plan = match (self.decks[master].grid, self.decks[f].grid) {
+            (Some(mg), Some(fg)) => sync_plan(mg.bpm * self.decks[master].rate, fg.bpm),
+            _ => None,
+        };
+        match plan {
+            Some(p) => self.decks[f].rate = p.rate,
+            // no sane rate any more: stay where it is, no longer following
+            None => self.decks[f].synced = false,
+        }
+    }
+
     fn apply(&mut self, cmd: Cmd) {
+        if cmd.deck().is_some_and(|d| d >= DECKS) {
+            return;
+        }
+        let ctx = self.ctx();
         match cmd {
             Cmd::Load {
                 deck,
@@ -276,6 +802,8 @@ impl Mixer {
                 if let Some(old) = old {
                     self.dispose(old);
                 }
+                // a deck that followed this one no longer has a master to follow
+                self.decks[1 - deck].synced = false;
                 let d = &mut self.decks[deck];
                 let rate = d.track.as_ref().map_or(44_100, |t| t.rate) as f64;
                 d.pos = at * rate;
@@ -285,13 +813,38 @@ impl Mixer {
                 d.playing = play;
                 d.fade = Smooth::new(0.);
                 d.fade.target = 1.;
+                d.clear_timed();
+                d.grid = None;
+                d.loop_ = None;
+                d.synced = false;
+                d.nudge = 1.;
+                d.nudge_to = 1.;
+                d.trim = Smooth::new(1.);
+                d.cue_point = 0.;
+                d.quick = 0;
+                d.last_step = 0.;
             }
             Cmd::Play(deck) => {
+                let other_in_time = {
+                    let o = &self.decks[1 - deck];
+                    o.running() && o.grid.is_some()
+                };
+                let quantize = self.quantize;
                 let d = &mut self.decks[deck];
-                if d.track.is_some() {
-                    if !d.playing {
-                        d.fade = Smooth::new(0.);
-                    }
+                if d.track.is_none() {
+                    return;
+                }
+                // pressing play while holding cue keeps it playing on release
+                d.cue_held = false;
+                if d.playing {
+                    // already playing (or fading out: carry on)
+                    d.pausing = false;
+                    d.fade.target = if d.pending_seek.is_some() { 0. } else { 1. };
+                } else if quantize && other_in_time && d.grid.is_some() {
+                    d.sched = true;
+                } else {
+                    d.sched = false;
+                    d.fade = Smooth::new(0.);
                     d.playing = true;
                     d.pausing = false;
                     d.fade.target = 1.;
@@ -299,6 +852,9 @@ impl Mixer {
             }
             Cmd::Pause(deck) => {
                 let d = &mut self.decks[deck];
+                d.sched = false;
+                d.cue_held = false;
+                d.queued = None;
                 if d.playing {
                     d.pausing = true;
                     d.fade.target = 0.;
@@ -309,7 +865,15 @@ impl Mixer {
                 let Some(rate) = d.track.as_ref().map(|t| t.rate as f64) else {
                     return;
                 };
+                if !seconds.is_finite() {
+                    return;
+                }
                 let to = (seconds * rate).max(0.);
+                d.jump = None;
+                d.queued = None;
+                if d.loop_.is_some_and(|l| to < l.start || to >= l.end) {
+                    d.loop_ = None;
+                }
                 if d.playing {
                     d.pending_seek = Some(to);
                     d.fade.target = 0.;
@@ -317,8 +881,20 @@ impl Mixer {
                     d.pos = to;
                 }
             }
-            Cmd::Rate(deck, rate) => self.decks[deck].rate = rate.clamp(0.25, 4.),
+            Cmd::Rate(deck, rate) => {
+                if !rate.is_finite() {
+                    return;
+                }
+                // a hand on the pitch fader ends sync
+                self.decks[deck].synced = false;
+                self.set_rate(deck, rate);
+            }
             Cmd::Gain(deck, gain) => self.decks[deck].gain.target = gain.max(0.),
+            Cmd::Trim(deck, gain) => {
+                if gain.is_finite() {
+                    self.decks[deck].trim.target = gain.max(0.);
+                }
+            }
             Cmd::Eq(deck, band, v) => self.decks[deck].fx.set_band(band, v),
             Cmd::Filter(deck, v) => self.decks[deck].fx.set_filter(v),
             Cmd::Fader(deck, v) => self.decks[deck].fader.target = v.clamp(0., 1.),
@@ -327,7 +903,148 @@ impl Mixer {
             Cmd::Master(v) => self.master.target = v.max(0.),
             Cmd::CueMix(v) => self.cue_mix.target = v.clamp(0., 1.),
             Cmd::Mode(mode) => self.mode = mode,
+            Cmd::Quantize(on) => self.quantize = on,
+            Cmd::Grid(deck, spec) => {
+                let d = &mut self.decks[deck];
+                d.grid = match (&d.track, spec) {
+                    (Some(t), Some(spec)) => BeatGrid::new(spec, t.rate),
+                    _ => None,
+                };
+                if d.grid.is_none() {
+                    d.sched = false;
+                    d.loop_ = None;
+                }
+            }
+            Cmd::Nudge(deck, amount) => {
+                if amount.is_finite() {
+                    let amount = amount.clamp(-1., 1.) as f64;
+                    self.decks[deck].nudge_to = 1. + amount * NUDGE_RANGE;
+                }
+            }
+            Cmd::CueButton(deck, pressed) => self.cue_button(deck, pressed, &ctx),
+            Cmd::Sync(deck) => self.sync(deck, &ctx),
+            Cmd::BeatJump(deck, beats) => {
+                let d = &mut self.decks[deck];
+                let Some(grid) = d.grid else { return };
+                if !(beats.is_finite() && beats.abs() <= 4096.) {
+                    return;
+                }
+                let delta = beats * grid.beat;
+                if d.running() {
+                    d.jump_by(delta, &ctx);
+                } else {
+                    // stopped: just move, same phase
+                    let decoded = d.decoded();
+                    let mut to = d.pos + delta;
+                    if to < 0. {
+                        to += (-to / grid.beat).ceil() * grid.beat;
+                    }
+                    if to < decoded - 2. {
+                        d.shift_loop(to - d.pos);
+                        d.pos = to;
+                    }
+                }
+            }
+            Cmd::Loop(deck, beats) => self.decks[deck].set_loop(beats, &ctx, false),
+            Cmd::JumpTo { deck, seconds, quantized } => {
+                let d = &mut self.decks[deck];
+                let Some(rate) = d.track.as_ref().map(|t| t.rate as f64) else {
+                    return;
+                };
+                if !seconds.is_finite() || seconds < 0. {
+                    return;
+                }
+                let to = seconds * rate;
+                if d.running() {
+                    d.jump_to(to, quantized, &ctx);
+                } else if to < d.decoded() - 2. {
+                    d.jump = None;
+                    d.queued = None;
+                    d.sched = false;
+                    if d.loop_.is_some_and(|l| to < l.start || to >= l.end) {
+                        d.loop_ = None;
+                    }
+                    if d.playing {
+                        // fading out: let the seek happen under the fade
+                        d.pending_seek = Some(to);
+                    } else {
+                        d.pos = to;
+                    }
+                }
+            }
         }
+    }
+
+    /// The CDJ cue button
+    fn cue_button(&mut self, deck: usize, pressed: bool, ctx: &Ctx) {
+        let quantize = self.quantize;
+        let d = &mut self.decks[deck];
+        if d.track.is_none() {
+            return;
+        }
+        if pressed {
+            if d.running() {
+                // playing: back to the cue point and stop
+                d.clear_timed();
+                d.pending_seek = Some(d.cue_point);
+                d.pausing = true;
+                d.fade.target = 0.;
+                return;
+            }
+            // paused: set the cue here and play while held
+            let at = d.pending_seek.unwrap_or(d.pos);
+            let cue = match d.grid {
+                Some(g) if quantize => g.nearest(at),
+                _ => at,
+            };
+            d.clear_timed();
+            d.cue_point = cue;
+            d.cue_held = true;
+            if d.playing {
+                // still fading out from a stop: the move happens under the fade
+                d.pending_seek = Some(cue);
+                d.pausing = false;
+                d.fade.target = 0.;
+            } else {
+                d.pos = cue;
+                d.start_quick(ctx);
+            }
+        } else if d.cue_held {
+            d.cue_held = false;
+            if d.playing {
+                d.pending_seek = Some(d.cue_point);
+                d.pausing = true;
+                d.fade.target = 0.;
+            }
+        }
+    }
+
+    /// Match the other deck's tempo, follow it from now on, and line the beats up
+    fn sync(&mut self, deck: usize, ctx: &Ctx) {
+        let master = 1 - deck;
+        let m = &self.decks[master];
+        let (Some(mg), true) = (m.grid, m.running()) else {
+            return;
+        };
+        let mpos = m.pos;
+        let m_tempo = mg.bpm * m.rate;
+        let d = &mut self.decks[deck];
+        let Some(dg) = d.grid else { return };
+        let Some(plan) = sync_plan(m_tempo, dg.bpm) else {
+            return;
+        };
+        d.rate = plan.rate;
+        d.synced = true;
+        if !d.running() {
+            // the beats get lined up when it starts (play, quantized)
+            return;
+        }
+        // where the master is, in bars-relative beats; this deck should be at that over the
+        // octave factor, modulo whole beats
+        let target = (mg.beats_at(mpos) - mg.offset as f64) / plan.octave;
+        let err = dg.beats_at(d.pos) - target;
+        let err = err - err.round();
+        d.jump_by(-err * dg.beat, ctx);
     }
 
     /// Hands a track back to be freed off the audio thread
@@ -345,24 +1062,63 @@ impl Mixer {
         }
     }
 
+    /// A deck waiting for a beat starts on the other deck's next one; `master` was rendered
+    /// just before. Without a master that is running on a grid it starts at once.
+    fn start_scheduled(&mut self, follower: usize, master: usize) {
+        let ctx = self.ctx();
+        let m = &self.decks[master];
+        let crossing = match m.grid {
+            Some(mg) if m.running() && m.last_step > 0. => {
+                let before = mg.beats_at(m.last_pos);
+                let after = mg.beats_at(m.last_pos + m.last_step);
+                if before.floor() != after.floor() {
+                    let b = mg.frame_of(after.floor() as i64);
+                    // how far into the frame the beat falls
+                    Some(((b - m.last_pos) / m.last_step).clamp(0., 1.))
+                } else {
+                    None
+                }
+            }
+            Some(_) if m.running() => None,
+            _ => Some(0.),
+        };
+        let Some(frac) = crossing else { return };
+        let f = &mut self.decks[follower];
+        let step = f.step(self.out_rate);
+        let at = match f.grid {
+            Some(g) => g.nearest(f.pos),
+            None => f.pos,
+        };
+        f.pos = at - frac * step;
+        f.sched = false;
+        f.start_quick(&ctx);
+    }
+
     /// The next frame of every bus
     #[inline]
     pub fn next(&mut self) -> Buses {
+        let ctx = self.ctx();
         let k = self.k_param;
         let xf = self.crossfader.next(k);
         let master = self.master.next(k);
         let cue_mix = self.cue_mix.next(k);
         let mut out = Buses::default();
-        for (n, d) in self.decks.iter_mut().enumerate() {
+        // a deck waiting for the other's beat is rendered after it
+        let order = if self.decks[0].sched { [1, 0] } else { [0, 1] };
+        for n in order {
+            if self.decks[n].sched {
+                self.start_scheduled(n, 1 - n);
+            }
+            let d = &mut self.decks[n];
             let mut ended = false;
-            let (l, r) = d.next(self.out_rate, self.k_fade, &mut ended);
+            let (l, r) = d.next(&ctx, &mut ended);
             if ended {
                 let _ = self.events.push(RtEvent::Ended {
                     deck: n,
                     generation: d.generation,
                 });
             }
-            let gain = d.gain.next(k);
+            let gain = d.gain.next(k) * d.trim.next(k);
             let fader = d.fader.next(k);
             let (l, r) = d.fx.process(l * gain, r * gain, k);
             out.decks[n] = (l, r);
@@ -392,19 +1148,54 @@ impl Mixer {
         out
     }
 
-    /// Publishes deck positions; call once per callback, after rendering
+    /// Publishes deck state; call once per callback, after rendering
     pub fn publish(&self) {
+        let seq = self.shared.seq.load(Ordering::Relaxed).wrapping_add(1);
+        self.shared.seq.store(seq, Ordering::Relaxed);
+        fence(Ordering::Release);
         for (d, s) in self.decks.iter().zip(&self.shared.decks) {
-            let seconds = d.track.as_ref().map_or(0., |t| d.pos / t.rate as f64);
-            s.position.store(seconds.to_bits(), Ordering::Relaxed);
-            s.playing.store(d.playing && !d.pausing, Ordering::Relaxed);
+            let tr = d.track.as_ref().map_or(44_100., |t| t.rate as f64);
+            let at = d.pending_seek.unwrap_or(d.pos);
+            let f = |a: &AtomicU64, v: f64| a.store(v.to_bits(), Ordering::Relaxed);
+            f(&s.position, if d.track.is_some() { at / tr } else { 0. });
+            s.playing.store(d.running() || d.sched, Ordering::Relaxed);
+            f(&s.rate, d.rate);
+            f(&s.nudge, d.nudge);
+            match d.grid {
+                Some(g) if d.track.is_some() => {
+                    f(&s.beat_phase, g.phase_at(at));
+                    s.beat_in_bar.store(g.beat_in_bar(at), Ordering::Relaxed);
+                }
+                _ => {
+                    f(&s.beat_phase, -1.);
+                    s.beat_in_bar.store(0, Ordering::Relaxed);
+                }
+            }
+            s.synced.store(d.synced, Ordering::Relaxed);
+            match d.loop_ {
+                Some(l) => {
+                    f(&s.loop_beats, l.beats);
+                    f(&s.loop_start, l.start / tr);
+                    f(&s.loop_end, l.end / tr);
+                }
+                None => {
+                    f(&s.loop_beats, 0.);
+                    f(&s.loop_start, 0.);
+                    f(&s.loop_end, 0.);
+                }
+            }
+            f(&s.cue, d.cue_point / tr);
         }
+        self.shared.seq.store(seq.wrapping_add(1), Ordering::Release);
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
     }
 }
+
+#[cfg(test)]
+mod dj_tests;
 
 #[cfg(test)]
 mod tests {
