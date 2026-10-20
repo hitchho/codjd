@@ -37,11 +37,22 @@ ebur128 = "0.1"
 serde_urlencoded = "0.7"
 axum = "0.8"
 tokio-util = { version = "0.7", features = ["io"] }
+# beat and downbeat tracking (pure-Rust rten runtime; weights are loaded from the cache dir, see
+# src/analysis/models.rs)
+beat-this = { version = "1.1", default-features = false }
+# cross-check tempo and the pure-Rust key detector
+timestretch = "0.15"
+# verifies the model weights before they are loaded
+sha2 = "0.10"
+# optional: libKeyFinder, needs the system libkeyfinder 2.2 and fftw (GPL-3)
+libkeyfinder-sys = { version = "0.1", optional = true }
 
 [features]
 full-log = []
 trivial = []
 debug = []
+# key detection with libKeyFinder instead of the built-in pure-Rust detector
+keyfinder = ["dep:libkeyfinder-sys"]
 
 # analysis (bliss/fft) and decoding are 10-50x slower unoptimized; keep our own code debuggable
 [profile.dev.package."*"]

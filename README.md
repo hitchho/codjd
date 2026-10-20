@@ -10,7 +10,7 @@ Downloads are written as `<name>.part` and renamed when complete. A whole remote
 
 It speaks MPRIS (`org.mpris.MediaPlayer2.codjd`), so media keys, `playerctl` and desktop or bar widgets control it with no client open: `playerctl -p codjd play-pause`, `playerctl -p codjd next`, `playerctl -p codjd metadata`.
 
-It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/codjd/analysis.json` (`CODJD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo is an estimate and can be off by half or double.
+It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/codjd/analysis.json` (`CODJD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo from bliss is an estimate and can be off by half or double; with the beat-this weights installed (`codjd fetch-models`) it also gets a beat grid and a key (see [docs/dj-mode.md](./docs/dj-mode.md)).
 
 # Usage:
 
