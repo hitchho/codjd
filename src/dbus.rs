@@ -268,6 +268,32 @@ impl Bus {
         }
     }
 
+    /// (integrated loudness in LUFS, suggested gain in dB toward -11 LUFS, bliss bpm estimate,
+    /// has_waveform) of the file at `path`; zeros and false until it has been analyzed. The gain
+    /// is limited to +-12 dB and never lifts the sample peak above -1 dBFS.
+    async fn get_analysis(&self, path: String) -> (f64, f64, f64, bool) {
+        let path = std::path::Path::new(&path);
+        match self.analysis.features(path) {
+            Some(f) => (f.lufs(), f.gain_db(), f.bpm() as f64, self.analysis.has_waveform(path)),
+            None => (0., 0., 0., false),
+        }
+    }
+
+    /// Waveform overview of an analyzed track, merged to at most `columns` columns (never more
+    /// than the stored 50 per second). Bytes: u32 LE column count n, u32 LE duration in ms, then
+    /// n columns of 6 bytes `[peak_low, peak_mid, peak_high, rms_low, rms_mid, rms_high]`
+    /// (low < 250 Hz, mid, high > 2.5 kHz; amplitude companded: linear = (byte/255)^2).
+    /// Empty when there is no waveform.
+    async fn get_waveform(&self, path: String, columns: u32) -> Vec<u8> {
+        let analysis = Arc::clone(&self.analysis);
+        // reading and inflating a file: keep it off the async executor
+        tokio::task::spawn_blocking(move || {
+            analysis.waveform(std::path::Path::new(&path), columns as usize).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Playlist indices of the `n` tracks that sound most like the one at `path`, nearest first.
     /// Empty until `path` has been analyzed.
     async fn similar_to(&self, path: String, n: u32) -> Vec<u32> {
