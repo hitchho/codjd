@@ -10,7 +10,8 @@ pub mod lexer;
 pub mod model;
 pub mod parser;
 pub mod resolve;
-// pub mod store;
+pub mod live;
+pub mod store;
 #[cfg(test)]
 mod tests;
 
