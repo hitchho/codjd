@@ -84,6 +84,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    tokio::signal::ctrl_c().await?;
+    // stop on Ctrl+C, kill/systemd (SIGTERM) and a closed terminal (SIGHUP)
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r?,
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
+    info!("stopping");
     Ok(())
 }
