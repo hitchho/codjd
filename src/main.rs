@@ -12,6 +12,7 @@ mod library;
 mod mpris;
 mod net;
 mod server;
+mod sets;
 mod slsk;
 mod soulseek;
 mod types;
