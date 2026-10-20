@@ -211,17 +211,17 @@ track, one track at a time on a 32-thread machine.
 
 | detector | BPM vs the 13 tags | vs beat-this | time/track | notes |
 |---|---|---|---|---|
-| beat-this (large, rten, MIT weights, 83 MB) | 12/13 within 0.1 once the BPM is fitted to the beats (the 13th is a half-time tag) | - | ~12 s wall on ~4 threads | beats on a 20 ms frame grid: fit a constant grid, do not average intervals |
-| beat-this small (10 MB) | same beats on 78/109 | 78/109 | ~8 s | mel front end dominates, so little saved |
-| timestretch `detect_beats` | 11/13 within 1.2 (2 octave errors, one in each direction) | 95/109 within 1% | ~2.2 s | pure Rust, also has `detect_key` (1.4 s) |
-| stratum-dsp | 10/13 within 1.2 | 92/109 | ~8-10 s | pulls symphonia 0.5, rayon; confidence value is not informative |
-| bliss tempo | 12/13 within 1x but 1-3 BPM high | 1/109 within 1% | free | biased about +1.5%, plus 2x/1.5x errors |
+| beat-this (large, rten, MIT weights, 83 MB) | 11/13 within 0.1 BPM once fitted to the beats (Nlogax is 1 off, as for every detector; "hot minute" is tagged half-time) | - | ~12 s wall on ~4 threads | beats on a 20 ms frame grid: fit a constant grid, do not average intervals |
+| beat-this small (10 MB) | not scored separately | beats mostly identical | ~8 s | mel front end dominates, so little saved |
+| timestretch `detect_beats` | 11/13 within 1.1 (2 octave errors, one in each direction) | 95/109 within 1% | ~2.2 s | pure Rust, also has `detect_key` (1.4 s) |
+| stratum-dsp | 11/13 within 1.1 (1 octave error, 1 at 1.25x) | 92/109 | ~8-10 s | pulls symphonia 0.5, rayon; confidence value is not informative |
+| bliss tempo | 12/13 within 2.5%, but 1-3 BPM high | 1/109 within 1% | free | biased about +1.5%, plus 2x/1.5x errors |
 
 Beat-this grid shape: 93 of 109 tracks have at least 80% of beats within 35 ms of one constant
 grid (48 within 95%); 3 are really tempo-changing. The first/second-half tempo differs by more
 than 1% in 1 track. Downbeats are the weak part: 66 of 109 tracks have at least 60% of bar
-lengths exactly 4 beats, and the other detectors' bar phase agrees with beat-this on only a
-third of tracks, so expect to set beat 1 by hand sometimes.
+lengths exactly 4 beats, and the other detectors' bar phase agrees with beat-this on only
+35-50% of tracks, so expect to set beat 1 by hand sometimes.
 
 Keys (Camelot): libKeyFinder matches 2 of 7 tags exactly, stratum 1, timestretch 0; against each
 other libKeyFinder and stratum agree exactly on 37/109, libKeyFinder and timestretch on 29/109
