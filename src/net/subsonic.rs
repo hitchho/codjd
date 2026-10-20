@@ -153,6 +153,11 @@ pub async fn handle(
     match result {
         Ok(Reply::Raw(res)) => res,
         Ok(Reply::Body(b)) => render(fmt, Ok(b)),
+        // image clients expect bytes or a 4xx, not a document
+        Err(e) if name == "getCoverArt" && e.code == 70 => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .unwrap_or_default(),
         Err(e) => {
             debug!(endpoint = name, code = e.code, "error");
             render(fmt, Err(e))

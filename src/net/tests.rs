@@ -270,8 +270,8 @@ async fn stream_with_ranges() {
         assert_eq!(v["error"]["code"], 70, "{bad}");
     }
     // no cover in these files
-    let v = json(&f.app, &q(&f, &format!("/rest/getCoverArt?id={id}"))).await;
-    assert_eq!(v["error"]["code"], 70);
+    let (status, _, body) = get(&f.app, &q(&f, &format!("/rest/getCoverArt?id={id}"))).await;
+    assert_eq!((status, body.len()), (StatusCode::NOT_FOUND, 0));
     let _ = std::fs::remove_dir_all(f.dir);
 }
 
