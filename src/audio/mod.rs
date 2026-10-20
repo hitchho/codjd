@@ -4,6 +4,7 @@
 //! mixer and reads its state from atomics. A small housekeeping thread forwards events from the
 //! audio thread (a track ended) and frees tracks the mixer is done with.
 
+mod auto;
 mod beat;
 mod eq;
 mod mixer;
@@ -18,6 +19,8 @@ use std::{
 
 use tracing::warn;
 
+#[allow(unused_imports)] // the set runtime uses Curve and AUTO_CAP
+pub use auto::{AutoItem, AutoKind, Control, Curve, AUTO_CAP};
 pub use beat::{sync_plan, GridSpec};
 pub use mixer::{DeckState, Mode, DECKS};
 use mixer::{Cmd, Mixer, RtEvent, Shared};
@@ -248,6 +251,28 @@ impl Audio {
     /// Jump to `seconds`, on the next beat when `quantized` (and quantize is on)
     pub fn jump_to(&mut self, deck: usize, seconds: f64, quantized: bool) {
         self.send(Cmd::JumpTo { deck, seconds, quantized });
+    }
+
+    /// Queues a beat-timed item for the audio thread, which runs it at the exact frame (see
+    /// `docs/dj-api.md`). Errors when the pool of [`AUTO_CAP`] items or the command queue is full.
+    pub fn schedule(&mut self, item: AutoItem) -> Result<(), String> {
+        self.shared.try_schedule(&mut self.cmds, item)
+    }
+
+    /// Drops every pending and running item of `group`; ramps stop where they are
+    pub fn cancel_group(&mut self, group: u32) {
+        self.send(Cmd::AutoCancelGroup(group));
+    }
+
+    /// Drops the items that move `control` of `deck` (the crossfader ignores `deck`). The caller
+    /// does this before it applies a manual change.
+    pub fn cancel_control(&mut self, deck: usize, control: Control) {
+        self.send(Cmd::AutoCancelControl(deck, control));
+    }
+
+    /// The crossfader knob as the audio thread has it now (automation moves it too)
+    pub fn crossfader(&self) -> f32 {
+        self.shared.crossfader()
     }
 
     /// Every deck's published state, all from the same audio callback

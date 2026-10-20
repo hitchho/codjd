@@ -54,6 +54,12 @@ impl BeatGrid {
         (pos - self.first) / self.beat
     }
 
+    /// Frame of the (fractional) beat number `beat`
+    #[inline]
+    pub fn frame_at_beat(&self, beat: f64) -> f64 {
+        self.first + beat * self.beat
+    }
+
     /// Index of the beat that `pos` is in (the last beat boundary at or before it)
     #[inline]
     pub fn index_at(&self, pos: f64) -> i64 {

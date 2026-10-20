@@ -228,16 +228,14 @@ impl DeckFx {
         }
     }
 
-    /// band 0 = low, 1 = mid, 2 = high; `v` in -1..1
-    pub fn set_band(&mut self, band: usize, v: f32) {
-        if let Some(g) = self.gains.get_mut(band) {
-            g.target = band_gain(v);
-        }
+    /// The smoothed gain of a band (linear), for automation to drive
+    pub(super) fn band_smooth(&mut self, band: usize) -> Option<&mut Smooth> {
+        self.gains.get_mut(band)
     }
 
-    /// -1..1
-    pub fn set_filter(&mut self, k: f32) {
-        self.knob.target = if k.is_nan() { 0. } else { k.clamp(-1., 1.) };
+    /// The smoothed filter knob, for automation to drive
+    pub(super) fn filter_smooth(&mut self) -> &mut Smooth {
+        &mut self.knob
     }
 
     fn reset(&mut self) {

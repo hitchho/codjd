@@ -16,8 +16,9 @@ use std::sync::{
 };
 
 use super::{
+    auto::{AutoItem, AutoKind, Control, Pool, AUTO_CAP, GAIN_MIN_DB},
     beat::{sync_plan, BeatGrid, GridSpec},
-    eq::DeckFx,
+    eq::{band_gain, DeckFx},
     track::Track,
 };
 
@@ -76,6 +77,13 @@ pub enum Cmd {
     /// headphones: 0 = cue only, 1 = master only
     CueMix(f32),
     Mode(Mode),
+    // ---- automation ----
+    /// an item for the pool (the sender has reserved its slot, see [`Shared::try_schedule`])
+    Auto(AutoItem),
+    /// drop every pending and running item of a group
+    AutoCancelGroup(u32),
+    /// drop the items that move this control (a manual change is about to be applied)
+    AutoCancelControl(usize, Control),
     // ---- DJ decks ----
     /// the loaded track's beat grid (None: no grid)
     Grid(usize, Option<GridSpec>),
@@ -119,7 +127,9 @@ impl Cmd {
             | Cmd::Sync(d)
             | Cmd::Nudge(d, _)
             | Cmd::BeatJump(d, _)
-            | Cmd::Loop(d, _) => Some(*d),
+            | Cmd::Loop(d, _)
+            | Cmd::AutoCancelControl(d, _) => Some(*d),
+            Cmd::Auto(_) | Cmd::AutoCancelGroup(_) => None,
             Cmd::Crossfader(_) | Cmd::Master(_) | Cmd::CueMix(_) | Cmd::Mode(_) | Cmd::Quantize(_) => None,
         }
     }
@@ -144,6 +154,46 @@ pub struct Shared {
     pub second_underruns: AtomicU64,
     /// times the second output had too much buffered and skipped ahead (clock drift)
     pub second_skips: AtomicU64,
+    /// automation pool slots in use or reserved by a sender (see [`Shared::try_schedule`])
+    pub auto_used: AtomicU32,
+    /// the crossfader knob (control value, automation moves it too)
+    crossfader: AtomicU32,
+}
+
+impl Shared {
+    /// Reserves a pool slot for an item about to be sent; false when the pool is full. The audio
+    /// thread gives the slot back (a decrement) when the item has finished or was cancelled.
+    pub fn reserve_auto(&self) -> bool {
+        let mut n = self.auto_used.load(Ordering::Acquire);
+        loop {
+            if n >= AUTO_CAP as u32 {
+                return false;
+            }
+            match self.auto_used.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// Queues `item` for the audio thread. Errors when the pool or the command queue is full.
+    pub fn try_schedule(&self, cmds: &mut rtrb::Producer<Cmd>, item: AutoItem) -> Result<(), String> {
+        if !item.is_sane(DECKS) {
+            return Err("bad automation item".into());
+        }
+        if !self.reserve_auto() {
+            return Err(format!("automation pool full ({AUTO_CAP} items)"));
+        }
+        if cmds.push(Cmd::Auto(item)).is_err() {
+            self.auto_used.fetch_sub(1, Ordering::AcqRel);
+            return Err("audio command queue full".into());
+        }
+        Ok(())
+    }
+
+    pub fn crossfader(&self) -> f32 {
+        f32::from_bits(self.crossfader.load(Ordering::Relaxed))
+    }
 }
 
 fn bits(v: f64) -> AtomicU64 {
@@ -171,6 +221,8 @@ pub struct DeckShared {
     loop_start: AtomicU64,
     loop_end: AtomicU64,
     cue: AtomicU64,
+    /// the knobs as control values: fader, low, mid, high, filter, gain (dB); f32 bits
+    knobs: [AtomicU32; 6],
 }
 
 impl Default for DeckShared {
@@ -188,6 +240,7 @@ impl Default for DeckShared {
             loop_start: bits(0.),
             loop_end: bits(0.),
             cue: bits(0.),
+            knobs: [1f32, 0., 0., 0., 0., 0.].map(|v| AtomicU32::new(v.to_bits())),
         }
     }
 }
@@ -207,6 +260,13 @@ pub struct DeckState {
     pub loop_start: f64,
     pub loop_end: f64,
     pub cue: f64,
+    /// channel fader 0..1
+    pub fader: f32,
+    /// low, mid, high: -1..1
+    pub eq: [f32; 3],
+    pub filter: f32,
+    /// the gain knob in dB, relative to the auto-gain
+    pub gain_db: f32,
 }
 
 impl DeckShared {
@@ -220,6 +280,7 @@ impl DeckShared {
 
     fn load(&self) -> DeckState {
         let f = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+        let k = |i: usize| f32::from_bits(self.knobs[i].load(Ordering::Relaxed));
         DeckState {
             position: f(&self.position),
             playing: self.playing.load(Ordering::Relaxed),
@@ -233,6 +294,10 @@ impl DeckShared {
             loop_start: f(&self.loop_start),
             loop_end: f(&self.loop_end),
             cue: f(&self.cue),
+            fader: k(0),
+            eq: [k(1), k(2), k(3)],
+            filter: k(4),
+            gain_db: k(5),
         }
     }
 }
@@ -286,6 +351,35 @@ impl Smooth {
     }
 }
 
+/// How [`Smooth::drive`] moves a parameter
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Drive {
+    /// set the target; the glide (~10 ms) gets there, as for a hand on a knob
+    Glide,
+    /// follow a value that moves on its own every sample: no lag, but a jump to it is limited to
+    /// [`SLEW`] per sample
+    Slew,
+    /// be there now
+    Snap,
+}
+
+/// Largest step per sample of a [`Drive::Slew`] (a full sweep takes 200 samples)
+const SLEW: f32 = 0.01;
+
+impl Smooth {
+    pub(super) fn drive(&mut self, v: f32, how: Drive) {
+        self.target = v;
+        match how {
+            Drive::Glide => {}
+            Drive::Slew => {
+                let d = v - self.current;
+                self.current = if d.abs() <= SLEW { v } else { self.current + SLEW * d.signum() };
+            }
+            Drive::Snap => self.current = v,
+        }
+    }
+}
+
 /// An active loop, in track frames
 #[derive(Clone, Copy)]
 struct Loop {
@@ -310,6 +404,10 @@ enum Queued {
     /// jump by `delta` frames; a loop moves along if `carry_loop`
     Delta { delta: f64, carry_loop: bool },
     To { pos: f64, quantized: bool },
+    /// automation: jump to `pos`, ending the crossfade on a beat whatever the quantize setting
+    ToBeat(f64),
+    /// automation: a loop from `start` (frames) of `beats`
+    LoopAt { start: f64, beats: f64 },
 }
 
 /// Per-sample constants the decks need
@@ -508,18 +606,27 @@ impl Deck {
 
     /// Jump to `target`; with `quantized` the crossfade ends on this deck's next beat
     fn jump_to(&mut self, target: f64, quantized: bool, ctx: &Ctx) {
+        self.jump_to_impl(target, quantized && ctx.quantize, Queued::To { pos: target, quantized }, ctx)
+    }
+
+    /// Automation's jump: lands on a beat even with quantize off
+    fn jump_to_beat(&mut self, target: f64, ctx: &Ctx) {
+        self.jump_to_impl(target, true, Queued::ToBeat(target), ctx)
+    }
+
+    fn jump_to_impl(&mut self, target: f64, on_beat: bool, again: Queued, ctx: &Ctx) {
         let Some(track) = &self.track else { return };
         if !(target.is_finite() && target >= 0. && target < track.decoded() as f64 - 2.) {
             return;
         }
         let span = self.span(ctx.out_rate);
         if self.blending(span) {
-            self.queued = Some(Queued::To { pos: target, quantized });
+            self.queued = Some(again);
             return;
         }
         let when = match self.grid {
             // with a loop on, wait for nothing: its wrap must not be passed meanwhile
-            Some(g) if quantized && ctx.quantize && self.loop_.is_none() => {
+            Some(g) if on_beat && self.loop_.is_none() => {
                 g.next_at_or_after(self.pos + span)
             }
             _ => self.pos + span,
@@ -556,14 +663,19 @@ impl Deck {
             return;
         }
         let beats = beats.clamp(1. / 32., 512.);
-        let len = beats * grid.beat;
         let start = match self.loop_ {
             Some(l) => l.start,
             None if ctx.quantize => grid.nearest(self.pos),
             None => self.pos,
         };
+        self.enter_loop(start, beats, grid.beat, span);
+    }
+
+    /// A loop from `start` (frames) of `beats` beats of `beat` frames, wherever the deck is
+    fn enter_loop(&mut self, start: f64, beats: f64, beat: f64, span: f64) {
+        let len = beats * beat;
         let end = start + len;
-        if end >= self.decoded() - 2. {
+        if !(start >= 0. && len > 0. && end < self.decoded() - 2.) {
             return;
         }
         self.loop_ = Some(Loop { start, end, beats });
@@ -582,11 +694,25 @@ impl Deck {
         }
     }
 
+    /// Automation's loop: `beats` from the grid beat at `start` frames. Waits for a crossfade
+    /// that is running (`deferred`: it has run).
+    fn loop_at(&mut self, start: f64, beats: f64, ctx: &Ctx, deferred: bool) {
+        let Some(grid) = self.grid else { return };
+        let span = self.span(ctx.out_rate);
+        if !deferred && self.blending(span) {
+            self.queued = Some(Queued::LoopAt { start, beats });
+            return;
+        }
+        self.enter_loop(start, beats.clamp(1. / 32., 512.), grid.beat, span);
+    }
+
     fn apply_queued(&mut self, ctx: &Ctx) {
         match self.queued.take() {
             Some(Queued::Loop(beats)) => self.set_loop(beats, ctx, true),
             Some(Queued::Delta { delta, carry_loop }) => self.jump_by(delta, carry_loop, ctx),
             Some(Queued::To { pos, quantized }) => self.jump_to(pos, quantized, ctx),
+            Some(Queued::ToBeat(pos)) => self.jump_to_beat(pos, ctx),
+            Some(Queued::LoopAt { start, beats }) => self.loop_at(start, beats, ctx, true),
             None => {}
         }
     }
@@ -738,7 +864,15 @@ pub struct Mixer {
     events: rtrb::Producer<RtEvent>,
     garbage: rtrb::Producer<Arc<Track>>,
     shared: Arc<Shared>,
+    /// beat-timed automation
+    auto: Pool,
+    /// every deck's knobs as control values (fader, low, mid, high, filter, gain dB), whoever
+    /// moved them last: the hand or automation
+    ctl: [[f32; 6]; DECKS],
 }
+
+/// Tolerance of a beat comparison, in beats: the position is a sum of many f64 steps
+const BEAT_EPS: f64 = 1e-9;
 
 impl Mixer {
     pub fn new(
@@ -765,7 +899,220 @@ impl Mixer {
             events,
             garbage,
             shared,
+            auto: Pool::new(),
+            ctl: [[1., 0., 0., 0., 0., 0.]; DECKS],
         }
+    }
+
+    /// A knob's value as the mixer last had it set
+    fn control_value(&self, deck: usize, c: Control) -> f32 {
+        match c {
+            Control::Crossfader => self.crossfader.target,
+            _ => self.ctl[deck][c.index()],
+        }
+    }
+
+    /// Moves a control: `Glide` is a hand on the knob, `Slew` and `Snap` are what automation
+    /// uses to follow a ramp per sample (see [`Drive`])
+    fn set_control(&mut self, deck: usize, c: Control, v: f32, how: Drive) {
+        let v = c.clamp(v);
+        if c == Control::Crossfader {
+            self.crossfader.drive(v, how);
+            return;
+        }
+        let Some(d) = self.decks.get_mut(deck) else { return };
+        match c {
+            Control::Fader => d.fader.drive(v, how),
+            Control::Low | Control::Mid | Control::High => {
+                if let Some(s) = c.band().and_then(|b| d.fx.band_smooth(b)) {
+                    s.drive(band_gain(v), how);
+                }
+            }
+            Control::Filter => d.fx.filter_smooth().drive(v, how),
+            Control::Gain => d.gain.drive(10f32.powf(v / 20.), how),
+            Control::Crossfader => {}
+        }
+        self.ctl[deck][c.index()] = v;
+    }
+
+    /// Gives a pool slot back (and the sender's reservation)
+    fn auto_free(&mut self, slot: usize) {
+        self.auto.release(slot);
+        self.shared.auto_used.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn auto_remove(&mut self, gone: impl Fn(&AutoItem) -> bool) {
+        let n = self.auto.remove_where(gone);
+        if n > 0 {
+            self.shared.auto_used.fetch_sub(n as u32, Ordering::AcqRel);
+        }
+    }
+
+    /// A later ramp or set on a control replaces a running ramp on it
+    fn auto_drop_running(&mut self, deck: usize, c: Control, except: usize) {
+        let mut n = 0;
+        while n < self.auto.run.len() {
+            let si = self.auto.run[n] as usize;
+            if si != except && self.auto.slots[si].item.touches(deck, c) {
+                self.auto_free(si);
+            } else {
+                n += 1;
+            }
+        }
+    }
+
+    /// Fires what is due on the clock decks' beat grids and moves the running ramps one sample.
+    /// Runs at the top of every frame, before the decks render, so a change lands on the frame
+    /// whose read position first reaches the beat.
+    fn auto_tick(&mut self) {
+        if self.auto.is_empty() {
+            return;
+        }
+        let mut beat = [None; DECKS];
+        let mut live = [false; DECKS];
+        for (c, d) in self.decks.iter().enumerate() {
+            if let (Some(g), true) = (d.grid, d.track.is_some()) {
+                beat[c] = Some(g.beats_at(d.pos));
+                live[c] = d.running();
+            }
+        }
+        for c in 0..DECKS {
+            let (Some(b), true) = (beat[c], live[c]) else { continue };
+            if b + BEAT_EPS < self.auto.next_fire[c] {
+                continue;
+            }
+            // a jump on the clock deck itself has to start its crossfade a little before its beat
+            // so that it lands on it
+            let d = &self.decks[c];
+            let jump_lead = match d.grid {
+                Some(g) => (d.span(self.out_rate) + 2. * d.step(self.out_rate)) / g.beat,
+                None => 0.,
+            };
+            let now = b + BEAT_EPS;
+            let mut fired = false;
+            for _ in 0..AUTO_CAP {
+                let due = self.auto.next_due(c, now, |it| match it.kind {
+                    AutoKind::Jump { deck, .. } if deck == c => now >= it.at_beat - jump_lead,
+                    _ => now >= it.at_beat,
+                });
+                let Some(si) = due else { break };
+                self.auto_fire(si, b);
+                fired = true;
+            }
+            if fired {
+                self.auto.refresh();
+            }
+        }
+        // ramps: per sample on the clock's beat position
+        let mut n = 0;
+        while n < self.auto.run.len() {
+            let si = self.auto.run[n] as usize;
+            let slot = self.auto.slots[si];
+            let AutoKind::Ramp { deck, control, to, end_beat, curve, .. } = slot.item.kind else {
+                self.auto_free(si);
+                continue;
+            };
+            let Some(b) = beat[slot.item.clock] else {
+                n += 1;
+                continue;
+            };
+            if b + BEAT_EPS >= end_beat {
+                self.set_control(deck, control, to, Drive::Snap);
+                self.auto_free(si);
+                continue;
+            }
+            let p = (b - slot.item.at_beat) / (end_beat - slot.item.at_beat);
+            self.set_control(deck, control, curve.apply(slot.from, to, p), Drive::Slew);
+            n += 1;
+        }
+    }
+
+    /// Carries out the item in slot `si`; `b` is the clock's beat position this frame
+    fn auto_fire(&mut self, si: usize, b: f64) {
+        let ctx = self.ctx();
+        let it = self.auto.slots[si].item;
+        let clock = it.clock;
+        match it.kind {
+            AutoKind::Ramp { deck, control, from, .. } => {
+                self.auto_drop_running(deck, control, si);
+                let from = control.clamp(from.unwrap_or_else(|| self.control_value(deck, control)));
+                // stays in the pool until it has run
+                self.auto.start_running(si, from);
+                return;
+            }
+            AutoKind::Set { deck, control, value } => {
+                self.auto_drop_running(deck, control, usize::MAX);
+                self.set_control(deck, control, value, Drive::Glide);
+            }
+            AutoKind::Swap { band } => {
+                self.auto_drop_running(clock, band, usize::MAX);
+                self.auto_drop_running(1 - clock, band, usize::MAX);
+                self.set_control(clock, band, -1., Drive::Glide);
+                self.set_control(1 - clock, band, 0., Drive::Glide);
+            }
+            AutoKind::Pause { deck } => self.apply(Cmd::Pause(deck)),
+            AutoKind::LoopOff { deck } => self.apply(Cmd::Loop(deck, 0.)),
+            AutoKind::Loop { deck, start_beat, beats } => {
+                let d = &mut self.decks[deck];
+                if let Some(g) = d.grid {
+                    d.loop_at(g.frame_at_beat(start_beat), beats, &ctx, false);
+                }
+            }
+            AutoKind::Jump { deck, to_beat } => {
+                let out_rate = self.out_rate;
+                let d = &mut self.decks[deck];
+                if let Some(g) = d.grid {
+                    let to = g.frame_at_beat(to_beat);
+                    let span = d.span(out_rate);
+                    let when = g.frame_at_beat(it.at_beat);
+                    let exact = deck == clock
+                        && d.running()
+                        && d.jump.is_none()
+                        && !d.blending(span)
+                        && when > d.pos
+                        && to >= 0.
+                        && to < d.decoded() - 2.;
+                    if exact {
+                        d.jump = Some(Jump { when, to, shift: 0. });
+                    } else {
+                        d.jump_to_beat(to, &ctx);
+                    }
+                }
+            }
+            AutoKind::Play { deck, from_beat, synced } => self.auto_play(clock, deck, from_beat, synced, b - it.at_beat),
+        }
+        self.auto_free(si);
+    }
+
+    /// Starts `deck` at its grid beat `from_beat` as the clock deck passes its `at_beat`
+    /// (`over` beats ago): same beat phase from here on, and with `synced` the same tempo
+    fn auto_play(&mut self, clock: usize, deck: usize, from_beat: f64, synced: bool, over: f64) {
+        let ctx = self.ctx();
+        let Some(mg) = self.decks[clock].grid else { return };
+        let c = &self.decks[clock];
+        let c_step = c.step(self.out_rate);
+        let m_tempo = mg.bpm * c.rate;
+        // how far into this frame's span the beat was passed: the new deck is that far on
+        let ago = if c_step > 0. { (over.max(0.) * mg.beat / c_step).clamp(0., 1.) } else { 0. };
+        let d = &mut self.decks[deck];
+        let (Some(track), Some(dg)) = (&d.track, d.grid) else { return };
+        if d.running() {
+            return;
+        }
+        let at = dg.frame_at_beat(from_beat);
+        if !(at >= 0. && at < track.decoded() as f64 - 2.) {
+            return;
+        }
+        if synced {
+            if let Some(plan) = sync_plan(m_tempo, dg.bpm) {
+                d.rate = plan.rate;
+                d.synced = true;
+            }
+        }
+        d.clear_timed();
+        let step = d.step(self.out_rate);
+        d.pos = at + ago * step;
+        d.start_quick(&ctx);
     }
 
     fn ctx(&self) -> Ctx {
@@ -814,6 +1161,8 @@ impl Mixer {
                 play,
                 generation,
             } => {
+                // what was timed on the old track's grid means nothing on the new one
+                self.auto_remove(|it| it.clock == deck);
                 let old = self.decks[deck].track.replace(track);
                 if let Some(old) = old {
                     self.dispose(old);
@@ -905,17 +1254,33 @@ impl Mixer {
                 self.decks[deck].synced = false;
                 self.set_rate(deck, rate);
             }
-            Cmd::Gain(deck, gain) => self.decks[deck].gain.target = gain.max(0.),
+            Cmd::Gain(deck, gain) => {
+                let gain = if gain.is_nan() { 1. } else { gain.max(0.) };
+                self.decks[deck].gain.target = gain;
+                self.ctl[deck][Control::Gain.index()] = (20. * gain.log10()).clamp(GAIN_MIN_DB, crate::audio::auto::GAIN_MAX_DB);
+            }
             Cmd::Trim(deck, gain) => {
                 if gain.is_finite() {
                     self.decks[deck].trim.target = gain.max(0.);
                 }
             }
-            Cmd::Eq(deck, band, v) => self.decks[deck].fx.set_band(band, v),
-            Cmd::Filter(deck, v) => self.decks[deck].fx.set_filter(v),
-            Cmd::Fader(deck, v) => self.decks[deck].fader.target = v.clamp(0., 1.),
+            Cmd::Eq(deck, band, v) => {
+                if let Some(c) = Control::from_band(band) {
+                    self.set_control(deck, c, v, Drive::Glide);
+                }
+            }
+            Cmd::Filter(deck, v) => self.set_control(deck, Control::Filter, v, Drive::Glide),
+            Cmd::Fader(deck, v) => self.set_control(deck, Control::Fader, v, Drive::Glide),
             Cmd::Cue(deck, on) => self.decks[deck].cue = on,
-            Cmd::Crossfader(v) => self.crossfader.target = v.clamp(-1., 1.),
+            Cmd::Crossfader(v) => self.set_control(0, Control::Crossfader, v, Drive::Glide),
+            Cmd::Auto(item) => {
+                if !(item.is_sane(DECKS) && self.auto.insert(item)) {
+                    // cannot happen with a sender that reserved a slot; hand the slot back
+                    self.shared.auto_used.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            Cmd::AutoCancelGroup(group) => self.auto_remove(|it| it.group == group),
+            Cmd::AutoCancelControl(deck, c) => self.auto_remove(|it| it.touches(deck, c)),
             Cmd::Master(v) => self.master.target = v.max(0.),
             Cmd::CueMix(v) => self.cue_mix.target = v.clamp(0., 1.),
             Cmd::Mode(mode) => self.mode = mode,
@@ -1113,6 +1478,7 @@ impl Mixer {
     /// The next frame of every bus
     #[inline]
     pub fn next(&mut self) -> Buses {
+        self.auto_tick();
         let ctx = self.ctx();
         let k = self.k_param;
         let xf = self.crossfader.next(k);
@@ -1203,6 +1569,12 @@ impl Mixer {
             }
             f(&s.cue, d.cue_point / tr);
         }
+        for (ctl, s) in self.ctl.iter().zip(&self.shared.decks) {
+            for (v, a) in ctl.iter().zip(&s.knobs) {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+        }
+        self.shared.crossfader.store(self.crossfader.target.to_bits(), Ordering::Relaxed);
         self.shared.seq.store(seq.wrapping_add(1), Ordering::Release);
     }
 
@@ -1211,6 +1583,8 @@ impl Mixer {
     }
 }
 
+#[cfg(test)]
+mod auto_tests;
 #[cfg(test)]
 mod dj_tests;
 
