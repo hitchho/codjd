@@ -544,6 +544,16 @@ impl Engine {
         self.meta[deck].grid.clone().ok_or_else(|| "no beat grid".to_string())
     }
 
+    /// The audio thread can only jump to what is decoded; say so instead of ignoring the request
+    fn check_decoded(&self, deck: usize, seconds: f64) -> Result<(), String> {
+        let (decoded, done) = self.audio.decoded(deck);
+        if !done && seconds + 0.1 >= decoded {
+            Err("not decoded yet".into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn deck_play(&mut self, deck: usize) -> Result<(), String> {
         self.loaded(deck)?;
         if self.meta[deck].grid.is_none() {
@@ -571,7 +581,8 @@ impl Engine {
             .gridded(other)
             .map_err(|_| "other deck has no beat grid".to_string())?;
         let states = self.audio.deck_states();
-        if !states[other].playing {
+        // a deck still waiting for its quantized start is not a master yet
+        if !states[other].playing || states[other].waiting {
             return Err("other deck is not playing".into());
         }
         if sync_plan(theirs.bpm * states[other].rate, own.bpm).is_none() {
@@ -592,24 +603,30 @@ impl Engine {
     }
 
     pub fn deck_beat_jump(&mut self, deck: usize, beats: f64) -> Result<(), String> {
-        self.gridded(deck)?;
+        let grid = self.gridded(deck)?;
         if !beats.is_finite() {
             return Err("bad beats".into());
         }
+        let ahead = (self.audio.deck_states()[deck].position + beats.max(0.) * 60. / grid.bpm)
+            .max(0.);
+        self.check_decoded(deck, ahead)?;
         self.audio.beat_jump(deck, beats);
         Ok(())
     }
 
     /// Beat loop of `beats` from the current beat, resizing a running one; 0 exits
     pub fn deck_loop(&mut self, deck: usize, beats: f64) -> Result<(), String> {
+        if !beats.is_finite() || beats < 0. {
+            return Err("bad beats".into());
+        }
         if beats == 0. {
             // leaving a loop needs no grid
             self.loaded(deck)?;
         } else {
-            self.gridded(deck)?;
-        }
-        if !beats.is_finite() || beats < 0. {
-            return Err("bad beats".into());
+            let grid = self.gridded(deck)?;
+            // the loop starts at the nearest beat and must be decoded to its end
+            let end = self.audio.deck_states()[deck].position + (beats + 1.) * 60. / grid.bpm;
+            self.check_decoded(deck, end)?;
         }
         self.audio.set_loop(deck, beats);
         Ok(())
@@ -640,6 +657,7 @@ impl Engine {
                 let Some(at) = self.meta[deck].hot[slot] else {
                     return Err(format!("hot cue {slot} is empty"));
                 };
+                self.check_decoded(deck, at)?;
                 self.audio.jump_to(deck, at, true);
             }
             other => return Err(format!("unknown action {other}")),

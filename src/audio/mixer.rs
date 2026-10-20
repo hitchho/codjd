@@ -155,6 +155,8 @@ pub struct DeckShared {
     /// seconds into the track
     position: AtomicU64,
     playing: AtomicBool,
+    /// play was pressed and the deck waits for the other deck's beat (also counted in `playing`)
+    waiting: AtomicBool,
     /// the rate that was set
     rate: AtomicU64,
     /// the nudge multiplier now (1.0 = none)
@@ -176,6 +178,7 @@ impl Default for DeckShared {
         Self {
             position: bits(0.),
             playing: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
             rate: bits(1.),
             nudge: bits(1.),
             beat_phase: bits(-1.),
@@ -194,6 +197,7 @@ impl Default for DeckShared {
 pub struct DeckState {
     pub position: f64,
     pub playing: bool,
+    pub waiting: bool,
     pub rate: f64,
     pub nudge: f64,
     pub beat_phase: f64,
@@ -219,6 +223,7 @@ impl DeckShared {
         DeckState {
             position: f(&self.position),
             playing: self.playing.load(Ordering::Relaxed),
+            waiting: self.waiting.load(Ordering::Relaxed),
             rate: f(&self.rate),
             nudge: f(&self.nudge),
             beat_phase: f(&self.beat_phase),
@@ -302,7 +307,8 @@ struct Jump {
 #[derive(Clone, Copy)]
 enum Queued {
     Loop(f64),
-    Delta(f64),
+    /// jump by `delta` frames; a loop moves along if `carry_loop`
+    Delta { delta: f64, carry_loop: bool },
     To { pos: f64, quantized: bool },
 }
 
@@ -454,8 +460,10 @@ impl Deck {
     }
 
     /// Jump `delta` frames from where the deck is (when the crossfade has run), keeping the
-    /// phase: a target before the start is moved forward by whole beats
-    fn jump_by(&mut self, delta: f64, ctx: &Ctx) {
+    /// phase: a target before the start is moved forward by whole beats. A running loop moves
+    /// along (`carry_loop`: a beat jump) or stays where it is and the deck lands inside it
+    /// (a sync's small phase correction).
+    fn jump_by(&mut self, delta: f64, carry_loop: bool, ctx: &Ctx) {
         let (Some(track), Some(grid)) = (&self.track, self.grid) else {
             return;
         };
@@ -467,15 +475,19 @@ impl Deck {
         if self.blending(span) || near_loop_end {
             // after it has landed
             self.queued = Some(match self.queued {
-                Some(Queued::Delta(d)) => Queued::Delta(d + delta),
-                _ => Queued::Delta(delta),
+                Some(Queued::Delta { delta: d, carry_loop: c }) if c == carry_loop => {
+                    Queued::Delta { delta: d + delta, carry_loop }
+                }
+                _ => Queued::Delta { delta, carry_loop },
             });
             return;
         }
         if let Some(j) = &mut self.jump {
             if j.to + delta >= 0. && j.to + delta < decoded - 2. {
                 j.to += delta;
-                j.shift += delta;
+                if carry_loop {
+                    j.shift += delta;
+                }
             }
             return;
         }
@@ -484,10 +496,14 @@ impl Deck {
         if to < 0. {
             to += (-to / grid.beat).ceil() * grid.beat;
         }
+        if let (false, Some(l)) = (carry_loop, self.loop_) {
+            to = l.start + (to - l.start).rem_euclid(l.end - l.start);
+        }
         if !(to.is_finite() && to < decoded - 2.) {
             return;
         }
-        self.jump = Some(Jump { when, to, shift: to - when });
+        let shift = if carry_loop { to - when } else { 0. };
+        self.jump = Some(Jump { when, to, shift });
     }
 
     /// Jump to `target`; with `quantized` the crossfade ends on this deck's next beat
@@ -569,7 +585,7 @@ impl Deck {
     fn apply_queued(&mut self, ctx: &Ctx) {
         match self.queued.take() {
             Some(Queued::Loop(beats)) => self.set_loop(beats, ctx, true),
-            Some(Queued::Delta(d)) => self.jump_by(d, ctx),
+            Some(Queued::Delta { delta, carry_loop }) => self.jump_by(delta, carry_loop, ctx),
             Some(Queued::To { pos, quantized }) => self.jump_to(pos, quantized, ctx),
             None => {}
         }
@@ -931,7 +947,7 @@ impl Mixer {
                 }
                 let delta = beats * grid.beat;
                 if d.running() {
-                    d.jump_by(delta, &ctx);
+                    d.jump_by(delta, true, &ctx);
                 } else {
                     // stopped: just move, same phase
                     let decoded = d.decoded();
@@ -1044,7 +1060,7 @@ impl Mixer {
         let target = (mg.beats_at(mpos) - mg.offset as f64) / plan.octave;
         let err = dg.beats_at(d.pos) - target;
         let err = err - err.round();
-        d.jump_by(-err * dg.beat, ctx);
+        d.jump_by(-err * dg.beat, false, ctx);
     }
 
     /// Hands a track back to be freed off the audio thread
@@ -1159,6 +1175,7 @@ impl Mixer {
             let f = |a: &AtomicU64, v: f64| a.store(v.to_bits(), Ordering::Relaxed);
             f(&s.position, if d.track.is_some() { at / tr } else { 0. });
             s.playing.store(d.running() || d.sched, Ordering::Relaxed);
+            s.waiting.store(d.sched, Ordering::Relaxed);
             f(&s.rate, d.rate);
             f(&s.nudge, d.nudge);
             match d.grid {

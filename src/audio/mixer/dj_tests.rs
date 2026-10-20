@@ -830,3 +830,30 @@ fn random_ops(seed: u64) {
     }
     println!("seed {seed:x}: {ops} random operations, largest step {worst}");
 }
+
+#[test]
+fn sync_leaves_a_running_loop_where_it_is() {
+    let rate = 48_000;
+    let mut r = Rig::new(rate);
+    r.load(0, tone(rate, 120., SINE_HZ), Some(spec(126.37, 0.213)), 3.0, true);
+    r.load(1, tone(rate, 120., SINE_HZ), Some(spec(122., 0.4)), 7.77, true);
+    r.run(r.secs(0.3));
+    r.send(Cmd::Loop(1, 4.));
+    let l = r.d(1).loop_.unwrap();
+    // a gap that needs a real correction, in the middle of the loop
+    r.run(r.secs(0.4));
+    assert!(phase_gap(&r) > 0.05);
+    let step_check = r.secs(2.);
+    r.send(Cmd::Sync(1));
+    let worst = max_step(&mut r, step_check);
+    assert!(worst < 0.04, "sync inside a loop clicked: {worst}");
+    let l2 = r.d(1).loop_.expect("still looping");
+    assert_eq!((l2.start, l2.end), (l.start, l.end), "the loop stays on its beats");
+    assert!(phase_gap(&r) < 1e-6, "{}", phase_gap(&r));
+    assert!((r.tempo(0) - r.tempo(1)).abs() < 1e-9);
+    // and a beat jump does carry it
+    r.send(Cmd::BeatJump(1, 8.));
+    r.run(r.secs(0.3));
+    let l3 = r.d(1).loop_.unwrap();
+    assert!((l3.start - l.start - 8. * r.d(1).grid.unwrap().beat).abs() < 1e-6);
+}
