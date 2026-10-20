@@ -632,7 +632,33 @@ struct Player {
     soulseek_max_results: usize,
     soulseek_prefs: crate::soulseek::SearchPrefs,
     soulseek_max_concurrent: usize,
+    /// a connect + login running in the background
+    soulseek_connecting: Option<SoulseekConnect>,
+    /// outcome of the last connect, for clients
+    soulseek_status: String,
     analysis: std::sync::Arc<crate::analysis::Analyzer>,
+}
+
+type SoulseekConnect = tokio::task::JoinHandle<
+    Result<(std::sync::Arc<crate::soulseek::SoulseekClient>, String), String>,
+>;
+
+impl Player {
+    /// Takes over the client once a background connect has finished
+    async fn finish_slsk_connect(&mut self) {
+        if !self.soulseek_connecting.as_ref().is_some_and(|t| t.is_finished()) {
+            return;
+        }
+        let Some(task) = self.soulseek_connecting.take() else { return };
+        match task.await {
+            Ok(Ok((client, msg))) => {
+                self.soulseek = Some(client);
+                self.soulseek_status = msg;
+            }
+            Ok(Err(msg)) => self.soulseek_status = msg,
+            Err(e) => self.soulseek_status = format!("connect failed: {}", e),
+        }
+    }
 }
 
 // methods
@@ -1499,7 +1525,10 @@ impl<'a> Player {
         };
         let max_results = if max_results == 0 { 50 } else { max_results as usize };
 
-        // drop any previous client so it does not leak
+        // drop any previous client (or connect attempt) so it does not leak
+        if let Some(task) = self.soulseek_connecting.take() {
+            task.abort();
+        }
         if let Some(old) = self.soulseek.take() {
             old.disconnect().await;
             self.soulseek_results.clear();
@@ -1519,40 +1548,48 @@ impl<'a> Player {
         let download_path = PathBuf::from(download_dir);
         let client = Arc::new(SoulseekClient::new(config, download_path));
 
-        match client.connect().await {
-            Ok(_) => match client.login().await {
-                Ok(response) => {
-                    if response.success {
-                        let client_clone = Arc::clone(&client);
-                        client_clone.spawn_receiver();
-                        client.set_max_concurrent(self.soulseek_max_concurrent).await;
-                        spawn_download_watcher(
-                            Arc::clone(&client),
-                            self.sender.clone(),
-                            emitter.to_owned(),
-                            Arc::clone(&self.analysis),
-                        );
-                        self.soulseek_max_results = max_results;
-                        self.soulseek = Some(client);
-                        if response.is_new_account() {
-                            "registered and connected".to_string()
-                        } else {
-                            "connected".to_string()
-                        }
-                    } else {
-                        response
-                            .error_description()
-                            .unwrap_or_else(|| "login failed".to_string())
-                    }
-                }
-                Err(e) => format!("login error: {}", e),
-            },
-            Err(e) => format!("connect error: {}", e),
-        }
+        // connecting and logging in can take tens of seconds; doing it here would hold this
+        // D-Bus object (and every client call) for that long. The outcome is picked up by the
+        // next slsk_state/slsk_status call.
+        let max_concurrent = self.soulseek_max_concurrent;
+        let sender = self.sender.clone();
+        let analysis = Arc::clone(&self.analysis);
+        let emitter = emitter.to_owned();
+        let task = tokio::spawn(async move {
+            client.connect().await.map_err(|e| format!("connect error: {}", e))?;
+            let response = client.login().await.map_err(|e| format!("login error: {}", e))?;
+            if !response.success {
+                return Err(response
+                    .error_description()
+                    .unwrap_or_else(|| "login failed".to_string()));
+            }
+            Arc::clone(&client).spawn_receiver();
+            client.set_max_concurrent(max_concurrent).await;
+            spawn_download_watcher(Arc::clone(&client), sender, emitter, analysis);
+            let msg = if response.is_new_account() {
+                "registered and connected"
+            } else {
+                "connected"
+            };
+            Ok((client, msg.to_string()))
+        });
+        self.soulseek_max_results = max_results;
+        self.soulseek_connecting = Some(task);
+        self.soulseek_status = "connecting...".to_string();
+        self.soulseek_status.clone()
+    }
+
+    /// Last connect outcome or error, e.g. "connected" or "login failed: INVALIDPASS"
+    async fn slsk_status(&mut self) -> String {
+        self.finish_slsk_connect().await;
+        self.soulseek_status.clone()
     }
 
     /// disconnect from soulseek
     async fn slsk_disconnect(&mut self) -> String {
+        if let Some(task) = self.soulseek_connecting.take() {
+            task.abort();
+        }
         if let Some(client) = self.soulseek.take() {
             client.disconnect().await;
             "disconnected".to_string()
@@ -1562,7 +1599,11 @@ impl<'a> Player {
     }
 
     /// get soulseek connection state
-    async fn slsk_state(&self) -> crate::soulseek::ConnectionState {
+    async fn slsk_state(&mut self) -> crate::soulseek::ConnectionState {
+        self.finish_slsk_connect().await;
+        if self.soulseek_connecting.is_some() {
+            return crate::soulseek::ConnectionState::Connecting;
+        }
         if let Some(client) = &self.soulseek {
             client.state().await
         } else {
@@ -1572,6 +1613,7 @@ impl<'a> Player {
 
     /// search soulseek network (non-blocking, poll slsk_get_results for results)
     async fn slsk_search(&mut self, query: String) -> String {
+        self.finish_slsk_connect().await;
         if let Some(client) = &self.soulseek {
             match client.search(&query).await {
                 Ok(token) => {
@@ -1777,6 +1819,8 @@ impl Server {
                 soulseek_max_results: 50,
                 soulseek_prefs: Default::default(),
                 soulseek_max_concurrent: 3,
+                soulseek_connecting: None,
+                soulseek_status: String::new(),
                 analysis,
             },
         }
@@ -1817,6 +1861,8 @@ impl Server {
                 soulseek_max_results: 50,
                 soulseek_prefs: Default::default(),
                 soulseek_max_concurrent: 3,
+                soulseek_connecting: None,
+                soulseek_status: String::new(),
                 analysis,
             },
         }
