@@ -3,7 +3,7 @@
 //!
 //! download flow (we are the downloader):
 //!   1. get a P connection to the uploader (direct, else via server ConnectToPeer)
-//!   2. send QueueUpload(filename)                     -> state Pending (queued)
+//!   2. send QueueUpload(filename)                     -> state Queued
 //!   3. uploader sends TransferRequest(dir=1) on any P connection from that
 //!      user; we match it by (username, filename), reply TransferResponse
 //!      allowed                                          -> state Connecting
@@ -140,7 +140,10 @@ impl PeerShared {
 
     async fn fail(&self, id: u32, reason: String) {
         if self
-            .update_active(id, |dl| dl.state = DownloadState::Failed)
+            .update_active(id, |dl| {
+                dl.state = DownloadState::Failed;
+                dl.last_error = reason.clone();
+            })
             .await
         {
             let _ = self.event_tx.send(PeerEvent::Failed(id, reason));
@@ -151,6 +154,16 @@ impl PeerShared {
     fn forget_download(&self, id: u32) {
         self.transfers.lock().unwrap().retain(|_, v| *v != id);
         self.tasks.lock().unwrap().remove(&id);
+    }
+
+    /// stop everything still running for a download that was replaced by a retry
+    pub fn abandon(&self, id: u32) {
+        if let Some(handles) = self.tasks.lock().unwrap().remove(&id) {
+            for h in handles {
+                h.abort();
+            }
+        }
+        self.transfers.lock().unwrap().retain(|_, v| *v != id);
     }
 
     fn register_task(&self, id: u32, handle: AbortHandle) {
@@ -273,7 +286,7 @@ impl PeerShared {
         // TransferRequest (-> Connecting) immediately
         self.update_active(id, |d| {
             if d.state == DownloadState::Connecting {
-                d.state = DownloadState::Pending;
+                d.state = DownloadState::Queued;
             }
         })
         .await;
@@ -455,7 +468,10 @@ impl PeerShared {
             .filter(|d| {
                 d.username == username
                     && paths_match(&d.remote_path, filename)
-                    && matches!(d.state, DownloadState::Pending | DownloadState::Connecting)
+                    && matches!(
+                        d.state,
+                        DownloadState::Pending | DownloadState::Queued | DownloadState::Connecting
+                    )
             })
             .map(|d| d.id)
             .collect();
@@ -474,7 +490,10 @@ impl PeerShared {
         let id = self.find_waiting(username, filename).await?;
         let ok = self
             .update_active(id, |dl| {
-                if matches!(dl.state, DownloadState::Pending | DownloadState::Connecting) {
+                if matches!(
+                    dl.state,
+                    DownloadState::Pending | DownloadState::Queued | DownloadState::Connecting
+                ) {
                     dl.state = DownloadState::Connecting;
                     dl.token = token;
                     if let Some(s) = size {
@@ -969,6 +988,7 @@ mod tests {
 
         let dl = s.downloads.read().await[&1].clone();
         assert_eq!(dl.state, DownloadState::Failed);
+        assert!(dl.last_error.contains("incomplete"), "{}", dl.last_error);
         assert!(!path.exists());
         assert!(!part.exists());
     }

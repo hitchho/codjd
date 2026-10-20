@@ -171,6 +171,8 @@ pub enum DownloadState {
     Failed,
     /// cancelled by user
     Cancelled,
+    /// QueueUpload sent, waiting in the uploader's queue for a TransferRequest
+    Queued,
 }
 
 /// a file being downloaded
@@ -196,6 +198,12 @@ pub struct Download {
     pub display_name: String,
     /// transfer token
     pub token: u32,
+    /// 0 for the source picked by the user, n for the nth alternate source tried
+    pub attempt: u32,
+    /// how many alternate sources may be tried in total (0 = none known)
+    pub max_attempts: u32,
+    /// why the previous source was given up on, or why this one failed
+    pub last_error: String,
 }
 
 impl Download {
@@ -224,6 +232,9 @@ impl Download {
             quality_score,
             display_name,
             token: 0,
+            attempt: 0,
+            max_attempts: 0,
+            last_error: String::new(),
         }
     }
 
@@ -244,7 +255,10 @@ impl Download {
     pub fn is_active(&self) -> bool {
         matches!(
             self.state,
-            DownloadState::Pending | DownloadState::Connecting | DownloadState::Downloading
+            DownloadState::Pending
+                | DownloadState::Connecting
+                | DownloadState::Queued
+                | DownloadState::Downloading
         )
     }
 

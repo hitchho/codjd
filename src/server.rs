@@ -1609,7 +1609,8 @@ impl<'a> Player {
                 .iter()
                 .find(|f| f.username == username && f.file.filename == filename)
             {
-                match client.queue_download(file).await {
+                let alternates = crate::soulseek::find_alternates(&self.soulseek_ranked, file);
+                match client.queue_download(file, alternates, None).await {
                     Ok(id) => format!("queued: {} (id: {})", file.file.basename(), id),
                     Err(e) => format!("download error: {}", e),
                 }
