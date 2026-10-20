@@ -5,6 +5,7 @@ mod config;
 mod dbus;
 mod engine;
 mod library;
+mod mpris;
 mod server;
 mod slsk;
 mod soulseek;

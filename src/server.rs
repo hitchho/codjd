@@ -56,6 +56,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .build()
         .await?;
     dbus::forward_signals(&connection, &musad)?;
+    // media keys, playerctl and desktop widgets; musad still works if another player owns it
+    match connection.request_name(crate::mpris::BUS_NAME).await {
+        Ok(()) => crate::mpris::serve(&connection, &musad).await?,
+        Err(e) => eprintln!("MPRIS unavailable: {e}"),
+    }
 
     if music_dir.is_dir() {
         let musad = musad.clone();

@@ -133,6 +133,8 @@ pub struct Engine {
     queue: VecDeque<Music>,
     /// playlist position to continue after once the queue has played
     resume_after_queue: Option<u32>,
+    /// stop() was called; the sink drops its sources asynchronously, so it can still look busy
+    stopped: bool,
     handle: Musad,
 }
 
@@ -151,6 +153,7 @@ impl Engine {
             muted_volume: config.volume,
             queue: VecDeque::new(),
             resume_after_queue: None,
+            stopped: false,
             handle,
         })
     }
@@ -186,6 +189,7 @@ impl Engine {
         };
         info!("playing {}", path.display());
         self.playlist.playing_index = index;
+        self.stopped = false;
         self.sink.clear();
         self.sink.append(source);
         // runs on the audio thread when the track is done
@@ -271,6 +275,7 @@ impl Engine {
     }
 
     pub fn stop(&mut self) {
+        self.stopped = true;
         self.sink.stop();
         self.emit(Event::Ended);
     }
@@ -310,6 +315,9 @@ impl Engine {
     // ---- state ----
 
     pub fn status(&self) -> PlayingStatus {
+        if self.stopped {
+            return PlayingStatus::Stopped;
+        }
         match (self.sink.is_paused(), self.sink.empty()) {
             (_, true) => PlayingStatus::Stopped,
             (true, false) => PlayingStatus::Pausing,
@@ -455,6 +463,7 @@ impl Engine {
                 self.playlist.playing_index = 0;
                 self.queue.clear();
                 self.resume_after_queue = None;
+                self.stopped = true;
                 self.sink.stop();
                 self.emit(Event::PlaylistLoaded(name.to_string()));
             }
