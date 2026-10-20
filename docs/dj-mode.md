@@ -128,6 +128,10 @@ Per track, cached next to the current analysis:
 - **Waveform** at a few resolutions (overview + zoomed), with low/mid/high energy for colour.
 - **Loudness** (integrated LUFS) → automatic gain so tracks play at the same level.
 
+Done so far: loudness (`ebur128`, target -11 LUFS, `GetAnalysis`) and the waveform overview
+(50 columns/s, peak + RMS in low/mid/high, `GetWaveform`), both from the same single decode pass
+that feeds bliss. Beat grid and key are still open.
+
 ## Keyboard
 
 The hard part: keyboards have no knobs or jog wheels.

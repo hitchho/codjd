@@ -1,9 +1,15 @@
-//! Audio analysis of the library: tempo, loudness and a feature vector per track (via bliss),
-//! used for "similar tracks" now and for transitions later.
+//! Audio analysis of the library: a feature vector and tempo estimate (via bliss), integrated
+//! loudness (EBU R128) and a waveform overview per track, used for "similar tracks" now and for
+//! the DJ features later.
 //!
-//! Analysis runs on its own low-priority threads and never blocks playback or D-Bus. Results are
-//! cached in `~/.cache/musad/analysis.json` (override the directory with `MUSAD_CACHE_DIR`), keyed
-//! on path + size + mtime, so a file is only analyzed again when it changes.
+//! Analysis runs on its own worker threads and never blocks playback or D-Bus. A file is decoded
+//! once (`pass.rs`) and that pass feeds loudness, waveform and bliss. Results are cached in
+//! `~/.cache/musad/analysis.json` (override the directory with `MUSAD_CACHE_DIR`), keyed on
+//! path + size + mtime, so a file is only analyzed again when it changes. Waveforms are too big
+//! for that file and live next to it, one per track (see `waveform.rs`).
+
+mod pass;
+pub mod waveform;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,10 +21,7 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
-use bliss_audio::{
-    decoder::{symphonia::SymphoniaDecoder, Decoder},
-    AnalysisIndex, FeaturesVersion,
-};
+use bliss_audio::{Song, AnalysisIndex, FeaturesVersion};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -30,7 +33,21 @@ pub struct Features {
     version: u16,
     /// bliss feature vector (normalized to [-1, 1])
     vector: Vec<f32>,
+    /// integrated loudness, LUFS (EBU R128, -70 for silence)
+    lufs: f64,
+    /// sample peak in dBFS (0 = full scale)
+    peak_db: f64,
+    duration_ms: u64,
 }
+
+/// Loudness the suggested gain aims for. Club masters of techno typically sit around -7 to -9
+/// LUFS integrated; -11 leaves room to add gain without clipping and matches streaming-ish
+/// levels, so tracks from different eras land close together at the mixer.
+pub const TARGET_LUFS: f64 = -11.;
+/// Suggested gain never exceeds this either way
+const MAX_GAIN_DB: f64 = 12.;
+/// A boost never takes the sample peak above this
+const PEAK_CEILING_DB: f64 = -1.;
 
 impl Features {
     /// Estimated tempo. aubio's estimate: often right, sometimes off by half or double
@@ -42,6 +59,18 @@ impl Features {
     /// Mean loudness in dBFS (bliss maps -90..0 dB onto -1..1)
     pub fn loudness_db(&self) -> f32 {
         (self.vector[AnalysisIndex::MeanLoudness as usize] + 1.) / 2. * 90. - 90.
+    }
+
+    /// Integrated loudness in LUFS
+    pub fn lufs(&self) -> f64 {
+        self.lufs
+    }
+
+    /// Gain in dB that brings the track to [`TARGET_LUFS`], within +-12 dB and without pushing
+    /// the sample peak above -1 dBFS
+    pub fn gain_db(&self) -> f64 {
+        let wanted = (TARGET_LUFS - self.lufs).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
+        wanted.min(PEAK_CEILING_DB - self.peak_db)
     }
 
     fn distance(&self, other: &Features) -> f32 {
@@ -67,11 +96,16 @@ pub struct Analyzer {
     pending: Mutex<HashSet<PathBuf>>,
     work: Mutex<mpsc::Sender<PathBuf>>,
     cache_path: Option<PathBuf>,
+    /// where waveform files go; None (tests) keeps them off disk
+    wave_dir: Option<PathBuf>,
     done: AtomicUsize,
     total: AtomicUsize,
 }
 
-const VERSION: u16 = FeaturesVersion::LATEST as u16;
+/// Bump when the cached content changes shape; old entries are then analyzed again.
+/// 1: bliss only. 2: + loudness, peak, duration, waveform files.
+const FORMAT: u16 = 2;
+const VERSION: u16 = FORMAT * 100 + FeaturesVersion::LATEST as u16;
 
 impl Analyzer {
     /// Loads the cache and starts the workers: half the cores, 1 to 4. Each worker holds a whole
@@ -105,6 +139,7 @@ impl Analyzer {
             failed: Mutex::default(),
             pending: Mutex::default(),
             work: Mutex::new(tx),
+            wave_dir: cache_path.as_deref().and_then(Path::parent).map(|d| d.join("waveforms")),
             cache_path,
             done: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
@@ -149,6 +184,24 @@ impl Analyzer {
 
     pub fn features(&self, path: &Path) -> Option<Features> {
         self.cache.lock().unwrap().get(path).cloned()
+    }
+
+    fn wave_file(&self, path: &Path) -> Option<PathBuf> {
+        let key = md5::compute(path.as_os_str().as_encoded_bytes());
+        Some(self.wave_dir.as_ref()?.join(format!("{key:x}.mwf")))
+    }
+
+    /// Whether a waveform for `path` is stored
+    pub fn has_waveform(&self, path: &Path) -> bool {
+        self.features(path).is_some() && self.wave_file(path).is_some_and(|f| f.is_file())
+    }
+
+    /// The waveform of an analyzed track merged down to at most `columns` columns, in the
+    /// layout of [`waveform::pack`]
+    pub fn waveform(&self, path: &Path, columns: usize) -> Option<Vec<u8>> {
+        self.features(path)?;
+        let wave = waveform::Waveform::from_bytes(&std::fs::read(self.wave_file(path)?).ok()?)?;
+        Some(waveform::pack(wave.duration_ms, &wave.resampled(columns)))
     }
 
     /// The `n` analyzed `candidates` closest to `path`, nearest first (`path` itself excluded).
@@ -206,7 +259,8 @@ fn worker(rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>, analyzer: std::sync::Weak<Ana
     loop {
         let next = rx.lock().unwrap().recv();
         let Ok(path) = next else { return };
-        let result = analyze(&path);
+        let Some(wave_file) = analyzer.upgrade().map(|a| a.wave_file(&path)) else { return };
+        let result = analyze(&path, wave_file);
         if result.is_none() {
             warn!(path = %path.display(), "can't analyze");
         }
@@ -220,15 +274,44 @@ fn worker(rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>, analyzer: std::sync::Weak<Ana
     }
 }
 
-fn analyze(path: &Path) -> Option<Features> {
+fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Features> {
     let (size, mtime) = stat(path)?;
-    let song = SymphoniaDecoder::song_from_path(path).ok()?;
+    let started = Instant::now();
+    let pass = pass::run(path)
+        .map_err(|e| warn!(path = %path.display(), error = %e, "decode failed"))
+        .ok()?;
+    let decoded = started.elapsed();
+    let analysis = Song::analyze(&pass.mono).ok()?;
+    if let Some(file) = wave_file {
+        if let Err(e) = write_atomic(&file, &pass.waveform.to_bytes()) {
+            warn!(error = %e, "can't save waveform");
+        }
+    }
+    info!(
+        path = %path.display(),
+        decode_ms = decoded.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        lufs = format!("{:.1}", pass.lufs),
+        "analyzed"
+    );
     Some(Features {
         size,
         mtime,
         version: VERSION,
-        vector: song.analysis.as_vec(),
+        vector: analysis.as_vec(),
+        lufs: pass.lufs,
+        peak_db: 20. * pass.peak.max(1e-6).log10(),
+        duration_ms: pass.duration_ms,
     })
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 fn stat(path: &Path) -> Option<(u64, u64)> {
@@ -247,6 +330,9 @@ mod tests {
             mtime: 0,
             version: VERSION,
             vector,
+            lufs: -14.,
+            peak_db: -3.,
+            duration_ms: 0,
         }
     }
 
@@ -258,6 +344,18 @@ mod tests {
         let f = features(v);
         assert!((f.bpm() - 128.).abs() < 0.01);
         assert!((f.loudness_db() + 12.).abs() < 0.01);
+    }
+
+    #[test]
+    fn gain_aims_for_target_within_limits() {
+        let at = |lufs: f64, peak_db: f64| Features { lufs, peak_db, ..features(vec![]) };
+        assert!((at(-14., -6.).gain_db() - 3.).abs() < 1e-9);
+        assert!((at(-8., -0.5).gain_db() + 3.).abs() < 1e-9);
+        // a boost is held back by the peak: -14 LUFS wants +3 dB but the peak is at -2 dBFS
+        assert!((at(-14., -2.).gain_db() - 1.).abs() < 1e-9);
+        // very quiet tracks get at most +12 dB
+        assert!((at(-40., -30.).gain_db() - 12.).abs() < 1e-9);
+        assert!((at(0., -30.).gain_db() + 11.).abs() < 1e-9);
     }
 
     #[test]
@@ -294,6 +392,13 @@ mod tests {
         let f = a.features(&wav).expect("analyzed");
         assert_eq!(f.vector.len(), bliss_audio::NUMBER_FEATURES);
         assert!(f.bpm() > 0.);
+        assert!(f.lufs() < 0. && f.lufs() > -40., "lufs {}", f.lufs());
+        assert!(a.has_waveform(&wav));
+        let packed = a.waveform(&wav, 100).unwrap();
+        assert_eq!(&packed[..4], &100u32.to_le_bytes());
+        assert_eq!(packed.len(), 8 + 100 * 6);
+        assert_eq!(a.waveform(&wav, 100_000).unwrap().len(), 8 + 8 * 50 * 6);
+        assert!(a.waveform(&dir.join("unknown.wav"), 10).is_none());
         // already cached: not queued again
         a.enqueue([wav.clone()]);
         assert_eq!(a.progress(), (1, 1));
