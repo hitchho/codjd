@@ -4,7 +4,7 @@
 
 It keeps playing, keeps the play queue and keeps downloading when no client is open, and adds finished downloads to the library.
 
-Downloads are written as `<name>.part` and renamed when complete. A whole remote folder (an album) can be queued at once (`slsk_download_folder`), in track order, into a subfolder named after it. When a download fails, or sits in the uploader's queue for 5 minutes without moving, musad tries the same file (same name, size within 1%) from up to 3 other users from the search results, best ranked first.
+Downloads are written as `<name>.part` and renamed when complete. A whole remote folder (an album) can be queued at once (`slsk_download_folder`), in track order, into a subfolder named after it. When a download fails, or sits in the uploader's queue for 5 minutes without the transfer starting, musad tries the same file (same name, size within 1%) from up to 3 other users from the search results, best ranked first.
 
 It analyzes the library in the background (tempo, loudness and a timbre/chroma fingerprint per track, via [bliss](https://github.com/Polochon-street/bliss-rs), pure Rust, no ffmpeg). Results are cached in `~/.cache/musad/analysis.json` (`MUSAD_CACHE_DIR` overrides the directory) and only changed files are analyzed again. Clients use it for "more like this"; tempo is an estimate and can be off by half or double.
 
