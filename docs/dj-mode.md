@@ -70,9 +70,29 @@ mix aft -> smk at aft.outro over 32 bars
   parameter ramps and deck commands; the audio thread glides to them. A slow script means a late
   fader move, never a dropout. The interface is language-neutral (beat clock in, ramps and
   commands out) so Lua (mlua, already in the client), Rhai, or Plush can be tried side by side.
-- Open question: whether "coding songs" also means making music (patterns, samples, synths over
-  the decks, Tidal/Strudel style). If so, it becomes a pattern layer on the same beat clock with
-  a sampler in the engine, after the set language.
+- Making music in code too (decided): **patch decks**, below.
+
+## Patch decks (endgame: synths and sequencers, playable by prompting an agent)
+
+Modeled on NoiseCraft (maximecb/noisecraft): a patch is a JSON graph of nodes (oscillators,
+filters, envelopes, delay, distortion, step sequencers, clock), one data type (floats, no
+audio/control split), edited through explicit actions (create node, connect, set param, toggle a
+step, set/queue a pattern), compiled to a flat program run in the audio thread.
+
+- Native in codjd: node graph in Rust, DSP nodes from `fundsp` (MIT), compiled to a flat schedule
+  and run as an extra deck in the real-time mixer; the clock is the beat grid, so sequencers lock
+  to the playing track. Custom nodes later as WebAssembly (tier 3).
+- Format: our JSON, plus import of NoiseCraft `.ncft` files (its shared patch library). Its code is
+  not copied: it is browser JS (AudioWorklet), and GPL-2.0 (no "or later" found), which may not mix
+  with GPL-3; the format and ideas are reimplemented.
+- Agents edit patches over MCP with the same action vocabulary (`create_node`, `connect`,
+  `set_param`, `set_pattern`, `queue_pattern`), e.g. "a 16-step acid line in A minor locked to
+  deck A, filter opening over 8 bars".
+- Set files reference patches (`patch acid "acid.json"`, `bars 0..16: acid.cutoff 0.2 -> 0.8`).
+- Live safety: a new or edited patch plays on the cue bus (headphones) until the DJ sends it to the
+  master with a key; a limiter and a CPU budget per patch, so a bad patch mutes itself instead of
+  glitching the set.
+- Comes after the set runtime (it reuses its beat clock and automation).
 
 ## Agents as co-DJs (MCP)
 
