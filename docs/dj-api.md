@@ -80,3 +80,50 @@ D-Bus signatures: `DeckInfo` = `(bsssddbddddubddddadsdd(ddd)ddb)`, `MixerInfo` =
 - Sync = equal effective BPM (rate set so `track_bpm × rate` equals the master's) plus a one-time
   phase alignment. With equal tempo and sample-accurate playback the phase does not drift; a
   synced deck follows later tempo changes of the master.
+
+## Automation (beat-timed, used by sets)
+
+Planned transitions are executed by the audio thread, on a **clock deck's beat grid**, at the
+exact frame, so a mix plays identically every time and never depends on the caller's timing.
+
+Engine API (Rust, `Audio` / `Engine`; not D-Bus):
+
+```rust
+pub enum Control { Fader, Low, Mid, High, Filter, Gain /* dB, relative */, Crossfader }
+pub enum Curve { Linear, Smooth /* S-curve */, Exp }
+
+pub struct AutoItem {
+    pub group: u32,          // a mix's id; cancel_group removes all its pending items
+    pub clock: usize,        // deck whose beat grid times this item (the outgoing deck)
+    pub at_beat: f64,        // beat index on the clock deck's grid (grid beat 0 = first_beat_s)
+    pub kind: AutoKind,
+}
+
+pub enum AutoKind {
+    Ramp { deck: usize, control: Control, from: Option<f32>, to: f32, end_beat: f64, curve: Curve },
+    Set { deck: usize, control: Control, value: f32 },
+    Swap { band: Control },                                  // clock deck's band kill, other deck's band 0
+    Play { deck: usize, from_beat: f64, synced: bool },      // start `deck` at its grid beat `from_beat`, beat-aligned to the clock
+    Pause { deck: usize },
+    Loop { deck: usize, start_beat: f64, beats: f64 },       // on `deck`'s grid
+    LoopOff { deck: usize },
+    Jump { deck: usize, to_beat: f64 },                      // quantized, keeps phase
+}
+
+Audio::schedule(item)          // queued for the audio thread; never allocates there
+Audio::cancel_group(group)
+Audio::cancel_control(deck, control)   // called by Engine on any manual change of that control
+```
+
+Rules:
+
+- An item fires when the clock deck's playback position crosses `at_beat` while it plays; a ramp
+  then runs until the clock reaches `end_beat` (interpolating per sample on the clock's beat
+  position, so tempo changes stretch it correctly). `from: None` starts from the control's value
+  at `at_beat`.
+- A ramp and a later manual change: manual wins, the ramp is dropped (`cancel_control`).
+- The audio thread holds a fixed-size pool of items (e.g. 512); `schedule` beyond it returns an
+  error instead of allocating.
+- Items whose time is already past when scheduled fire immediately (`Set`, `Swap`, `Play`...) or
+  jump to their current interpolated value (`Ramp`).
+- `DeckInfo`/`MixerInfo` report the values as they move, so the UI shows automation live.
