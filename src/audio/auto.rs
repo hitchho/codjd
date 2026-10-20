@@ -260,7 +260,7 @@ impl Pool {
                 && s.item.clock == clock
                 && s.item.at_beat - lead(&s.item) <= beat
                 && fireable(&s.item)
-                && best.is_none_or(|(q, _)| s.seq.wrapping_sub(self.seq) < q.wrapping_sub(self.seq))
+                && best.is_none_or(|(q, _)| self.seq.wrapping_sub(s.seq) > self.seq.wrapping_sub(q))
             {
                 best = Some((s.seq, i));
             }

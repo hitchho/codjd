@@ -342,10 +342,12 @@ impl Smooth {
     pub(super) fn next(&mut self, k: f32) -> f32 {
         let d = self.target - self.current;
         // land exactly: no endless tail of ever smaller steps
-        if d.abs() < 1e-6 {
+        let next = self.current + d * k;
+        // also when the step is too small to move an f32 (it would stall short of the target)
+        if d.abs() < 1e-6 || next == self.current {
             self.current = self.target;
         } else {
-            self.current += d * k;
+            self.current = next;
         }
         self.current
     }
