@@ -74,6 +74,28 @@ mix aft -> smk at aft.outro over 32 bars
   the decks, Tidal/Strudel style). If so, it becomes a pattern layer on the same beat clock with
   a sampler in the engine, after the set language.
 
+## Agents as co-DJs (MCP)
+
+musad exposes itself as an MCP server (`rmcp`), a third thin front end next to D-Bus and MPRIS,
+so any agent (Claude Code, a local model) can plan and mix with you. musad holds no AI keys and
+calls no AI APIs itself.
+
+- **Read**: library with BPM, key, loudness, similarity; now playing, queue, deck state; the set
+  file.
+- **Prep**: edit the set file (the same file open in vim: changes hot-reload, git shows exactly
+  what the agent did), render transition previews, build crates by BPM/key/mood, search Soulseek
+  for missing tracks.
+- **Live, with guardrails**: by default only the deck that is *not* on air; anything affecting
+  the master needs the DJ's approval keypress; everything quantized to the grid and logged.
+  Widen per gig for real co-DJing.
+
+## Scripts that make sound, safely
+
+Scripts (Lua, Rhai or Plush; agents through MCP) may also *generate or transform audio* (record,
+chop, reverse, resample, render a pattern) but always ahead of time, into finished buffers handed
+to a sampler slot. The real-time mixer only ever plays finished buffers; no script feeds the
+audio callback. This is how a Plush-style record/edit/loop workflow fits at a gig.
+
 ## Audio engine (replaces rodio)
 
 ```
@@ -153,7 +175,8 @@ The hard part: keyboards have no knobs or jog wheels.
 5. **Planned transitions** running by themselves, with override.
 6. **Gig kit**: portable build, set recording, resume after crash.
 
-Then keylock, MIDI controllers, Rekordbox export.
+The MCP front end can come early (it's thin and helps testing); live-mode agent access comes
+with step 4's guardrails. Then keylock, MIDI controllers, Rekordbox export.
 
 ## Libraries (researched 2026-10-20)
 
