@@ -34,6 +34,9 @@ cpal = { version = "0.18", features = ["pipewire"] }
 rtrb = "0.4"
 symphonia = { version = "0.6", features = ["all", "opt-simd"] }
 ebur128 = "0.1"
+serde_urlencoded = "0.7"
+axum = "0.8"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [features]
 full-log = []
@@ -43,3 +46,6 @@ debug = []
 # analysis (bliss/fft) and decoding are 10-50x slower unoptimized; keep our own code debuggable
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -15,6 +15,9 @@ pub struct Config {
     /// outputs and mixing mode
     #[serde(default)]
     pub audio: crate::audio::AudioConfig,
+    /// network front end (OpenSubsonic API); off unless this section exists
+    #[serde(default)]
+    pub net: Option<crate::net::NetConfig>,
 }
 
 impl Default for Config {
@@ -28,6 +31,7 @@ impl Default for Config {
             // FIXME
             playlist_save_path: String::default(),
             audio: Default::default(),
+            net: None,
         }
     }
 }

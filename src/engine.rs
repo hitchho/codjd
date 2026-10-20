@@ -140,6 +140,8 @@ pub struct Engine {
     pub playlist: Playlist,
     store: PlaylistStore,
     allow_formats: Option<Vec<FileFormat>>,
+    /// the music folder from the config
+    music_dir: PathBuf,
     /// volume to go back to when unmuting
     muted_volume: f32,
     /// tracks to play before continuing the playlist
@@ -169,6 +171,7 @@ impl Engine {
             playlist: Playlist::from_config(&config),
             store: PlaylistStore::new(&config.playlist_save_path),
             allow_formats: config.allow_formats.clone(),
+            music_dir: PathBuf::from(&config.path),
             muted_volume: volume,
             queue: VecDeque::new(),
             resume_after_queue: None,
@@ -528,9 +531,16 @@ impl Engine {
         added
     }
 
+    /// The music folder and allowed formats; the network front end lists the library from these
+    /// (the playlist may be a named one)
+    pub fn library_root(&self) -> (PathBuf, Option<Vec<FileFormat>>) {
+        (self.music_dir.clone(), self.allow_formats.clone())
+    }
+
     pub fn reload(&mut self, config: &Config) {
         self.playlist.reload_from_config(config);
         self.allow_formats = config.allow_formats.clone();
+        self.music_dir = PathBuf::from(&config.path);
         self.store = PlaylistStore::new(&config.playlist_save_path);
         self.emit(Event::ConfigReloaded);
     }

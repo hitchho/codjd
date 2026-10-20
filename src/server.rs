@@ -36,11 +36,20 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     });
     let music_dir = PathBuf::from(&config.path);
     let allow_formats = config.allow_formats.clone();
+    let net_config = config.net.clone();
 
     let codjd = Codjd::start(config)?;
     let analysis = Analyzer::start();
     if let Some(paths) = codjd.call(|e| e.playlist.paths()).await {
         analysis.enqueue(paths);
+    }
+    if let Some(net) = net_config {
+        let codjd = codjd.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::net::serve(codjd, net).await {
+                eprintln!("network front end: {e}");
+            }
+        });
     }
     let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
