@@ -10,7 +10,7 @@
 //!   4. uploader opens an F connection (to our listener, or we connect after
 //!      a server ConnectToPeer "F"), sends the raw transfer token, we reply
 //!      with a raw u64 offset and read `size` bytes     -> state Downloading
-//!      -> Complete / Failed
+//!      into `<local_path>.part`, renamed to local_path -> Complete / Failed
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -185,7 +185,7 @@ impl PeerShared {
                 Some(dl) if dl.is_active() => {
                     let had_data = dl.state == DownloadState::Downloading || dl.downloaded > 0;
                     dl.state = DownloadState::Cancelled;
-                    Some((had_data, dl.local_path.clone()))
+                    Some((had_data, dl.part_path()))
                 }
                 _ => None,
             }
@@ -560,15 +560,56 @@ impl PeerShared {
         let _ = task.await;
     }
 
-    async fn receive_file(&self, id: u32, mut stream: TcpStream) -> Result<(), SoulseekError> {
-        let (path, size) = {
+    /// receive into `<local_path>.part` and rename it to `local_path` once all bytes are in,
+    /// so a half-written file never sits under the final audio name. The .part file is
+    /// removed on failure (and by `cancel`).
+    async fn receive_file(&self, id: u32, stream: TcpStream) -> Result<(), SoulseekError> {
+        let (path, part, size) = {
             let downloads = self.downloads.read().await;
             match downloads.get(&id) {
-                Some(d) if d.is_active() => (d.local_path.clone(), d.size),
+                Some(d) if d.is_active() => (d.local_path.clone(), d.part_path(), d.size),
                 _ => return Ok(()),
             }
         };
+        match self.receive_into(id, stream, &part, size).await {
+            Ok(true) => {}
+            // cancelled while receiving, cancel() cleans up
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(e);
+            }
+        }
+        if let Err(e) = tokio::fs::rename(&part, &path).await {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(SoulseekError::Io(e));
+        }
 
+        if self
+            .update_active(id, |d| {
+                d.downloaded = d.size;
+                d.state = DownloadState::Complete;
+            })
+            .await
+        {
+            let _ = self.event_tx.send(PeerEvent::Progress(id, size, size));
+            let _ = self.event_tx.send(PeerEvent::Completed(id));
+        } else {
+            // cancelled between the last byte and the rename
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        self.forget_download(id);
+        Ok(())
+    }
+
+    /// the transfer itself; Ok(false) when the download stopped being active
+    async fn receive_into(
+        &self,
+        id: u32,
+        mut stream: TcpStream,
+        part: &std::path::Path,
+        size: u64,
+    ) -> Result<bool, SoulseekError> {
         stream.write_all(&pack_file_offset(0)).await?;
         stream.flush().await?;
 
@@ -576,18 +617,18 @@ impl PeerShared {
             .update_active(id, |d| d.state = DownloadState::Downloading)
             .await
         {
-            return Ok(());
+            return Ok(false);
         }
         let _ = self.event_tx.send(PeerEvent::Started(id));
 
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = part.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let file = File::create(&path).await?;
+        let file = File::create(part).await?;
         if !self.is_active(id).await {
             drop(file);
-            let _ = tokio::fs::remove_file(&path).await;
-            return Ok(());
+            let _ = tokio::fs::remove_file(part).await;
+            return Ok(false);
         }
         let mut writer = BufWriter::new(file);
 
@@ -615,12 +656,13 @@ impl PeerShared {
                     })
                     .await;
                 if !still_active {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let _ = self.event_tx.send(PeerEvent::Progress(id, downloaded, size));
             }
         }
         writer.flush().await?;
+        writer.into_inner().sync_all().await?;
 
         if downloaded < size {
             return Err(SoulseekError::Io(std::io::Error::new(
@@ -628,19 +670,7 @@ impl PeerShared {
                 format!("incomplete: {} of {} bytes", downloaded, size),
             )));
         }
-
-        if self
-            .update_active(id, |d| {
-                d.downloaded = d.size;
-                d.state = DownloadState::Complete;
-            })
-            .await
-        {
-            let _ = self.event_tx.send(PeerEvent::Progress(id, size, size));
-            let _ = self.event_tx.send(PeerEvent::Completed(id));
-        }
-        self.forget_download(id);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -888,9 +918,58 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), data);
+        // written as .part, renamed on completion
+        assert!(!s.downloads.read().await[&1].part_path().exists());
         let d = s.downloads.read().await;
         assert_eq!(d[&1].state, DownloadState::Complete);
         assert_eq!(d[&1].downloaded, 100_000);
+        assert_eq!(d[&1].local_path, path);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn partial_transfer_never_lands_under_final_name() {
+        let path = std::env::temp_dir().join(format!("slsk-part-{}.flac", std::process::id()));
+        let mut d = dl(1);
+        d.local_path = path.clone();
+        d.size = 300_000;
+        let part = d.part_path();
+        assert_eq!(
+            part.file_name().unwrap().to_str().unwrap(),
+            format!("slsk-part-{}.flac.part", std::process::id())
+        );
+        let s = shared_with(d);
+        s.accept_upload("bob", "a\\b.mp3", 43, Some(300_000)).await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s2 = Arc::clone(&s);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            s2.handle_file_connection(stream).await;
+        });
+
+        let mut up = TcpStream::connect(addr).await.unwrap();
+        up.write_all(&crate::soulseek::protocol::pack_file_transfer_init(43)).await.unwrap();
+        let mut off = [0u8; 8];
+        up.read_exact(&mut off).await.unwrap();
+        up.write_all(&vec![7u8; 150_000]).await.unwrap();
+        // mid-transfer: only the .part file exists
+        for _ in 0..100 {
+            if s.downloads.read().await[&1].downloaded > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(part.exists());
+        assert!(!path.exists());
+        // uploader goes away halfway
+        drop(up);
+        server.await.unwrap();
+
+        let dl = s.downloads.read().await[&1].clone();
+        assert_eq!(dl.state, DownloadState::Failed);
+        assert!(!path.exists());
+        assert!(!part.exists());
     }
 }

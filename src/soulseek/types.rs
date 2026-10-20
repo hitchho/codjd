@@ -252,6 +252,14 @@ impl Download {
         self.state == DownloadState::Complete
     }
 
+    /// where the file is written while it's being received; renamed to `local_path` when
+    /// complete so nothing watching the music folder sees a half-written audio file
+    pub fn part_path(&self) -> PathBuf {
+        let mut p = self.local_path.clone().into_os_string();
+        p.push(".part");
+        PathBuf::from(p)
+    }
+
     pub fn is_failed(&self) -> bool {
         matches!(self.state, DownloadState::Failed | DownloadState::Cancelled)
     }
