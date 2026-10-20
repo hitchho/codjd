@@ -69,15 +69,14 @@ struct MixerInfo {
 }
 ```
 
-D-Bus signatures: `DeckInfo` = `(bsssdddbdddduubddddadsdd(ddd)ddb)`, `MixerInfo` = `(dddsbt)`.
+D-Bus signatures: `DeckInfo` = `(bsssddbddddubddddadsdd(ddd)ddb)`, `MixerInfo` = `(dddsbt)`.
 
 ## Timing rules (engine)
 
 - Everything that should land on the beat (quantized play, beat jump, loop start/end, hot cue
   jump) is executed **inside the audio thread at the exact frame**, not by the caller's timing.
 - A loop is sample-accurate: at `loop_end` the read position wraps to `loop_start` in the same
-  callback, with the usual declick only if the jump isn't on a zero crossing... in practice a
-  very short (≤ 2 ms) crossfade at the wrap point to avoid clicks.
+  callback, with a very short (≤ 2 ms) crossfade at the wrap point so it doesn't click.
 - Sync = equal effective BPM (rate set so `track_bpm × rate` equals the master's) plus a one-time
   phase alignment. With equal tempo and sample-accurate playback the phase does not drift; a
   synced deck follows later tempo changes of the master.
