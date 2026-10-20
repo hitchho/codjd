@@ -83,7 +83,7 @@ impl BeatGrid {
     #[inline]
     pub fn beat_in_bar(&self, pos: f64) -> u32 {
         let k = self.index_at(pos);
-        (k - self.offset as i64).rem_euclid(self.per_bar as i64) as u32 + 1
+        k.wrapping_sub(self.offset as i64).rem_euclid(self.per_bar as i64) as u32 + 1
     }
 
     /// Frame of the beat boundary nearest to `pos`, never before 0

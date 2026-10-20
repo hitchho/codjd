@@ -626,8 +626,7 @@ impl Engine {
                 let mut at = self.audio.deck_states()[deck].position;
                 if self.mixer.quantize {
                     if let Some(g) = &self.meta[deck].grid {
-                        let beat = 60. / g.bpm;
-                        at = (g.first_beat_s + ((at - g.first_beat_s) / beat).round() * beat).max(0.);
+                        at = snap_to_beat(g, at);
                     }
                 }
                 self.hotcues.set(&path, slot, Some(at))?;
@@ -1000,6 +999,12 @@ fn apply_volume(audio: &mut Audio, volume: f32) {
     }
 }
 
+/// The grid beat nearest to `seconds`, never before the start
+fn snap_to_beat(g: &Grid, seconds: f64) -> f64 {
+    let beat = 60. / g.bpm;
+    (g.first_beat_s + ((seconds - g.first_beat_s) / beat).round() * beat).max(0.)
+}
+
 fn grid_spec(g: &Grid) -> GridSpec {
     GridSpec {
         bpm: g.bpm,
@@ -1014,5 +1019,39 @@ fn check_deck(deck: usize) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("no deck {deck}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(bpm: f64, first: f64) -> Grid {
+        Grid {
+            bpm,
+            first_beat_s: first,
+            downbeat_offset: 0,
+            beats_per_bar: 4,
+            confidence: 1.,
+            variable: false,
+            octave_doubt: false,
+        }
+    }
+
+    #[test]
+    fn hot_cues_snap_to_the_nearest_beat() {
+        let g = grid(120., 0.25);
+        assert_eq!(snap_to_beat(&g, 10.), 10.25);
+        assert!((snap_to_beat(&g, 10.4) - 10.25).abs() < 1e-12);
+        assert!((snap_to_beat(&g, 10.6) - 10.75).abs() < 1e-12);
+        // before the first beat: not before the start
+        assert_eq!(snap_to_beat(&g, 0.), 0.);
+        assert!((snap_to_beat(&g, 0.2) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn only_the_two_decks_exist() {
+        assert!(check_deck(1).is_ok());
+        assert_eq!(check_deck(2), Err("no deck 2".to_string()));
     }
 }
