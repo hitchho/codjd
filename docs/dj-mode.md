@@ -172,9 +172,10 @@ available before the grid is.
   library: `pacman -S libkeyfinder` on Arch (libkeyfinder 2.2 and fftw, plus a C++ compiler; for
   a private install point `PKG_CONFIG_PATH` at its `lib/pkgconfig`, and `LD_LIBRARY_PATH` at its
   `lib` to run). GPL-3, as codjd is. Switching detectors re-analyzes cached tracks.
-- Cost: about 12 s per track with beat-this's large model (plus the 2 s cross-check and a couple
-  of seconds for the key) on top of the 5-8 s fast pass, so a first scan of a big library takes
-  a while; each worker thread keeps its own copy of the model (about 200 MB). A cache entry made
+- Cost: about 15 s per 5-minute track for the grid (beat-this, the 2 s cross-check and the key)
+  when it has the machine to itself, 25-40 s when four workers run at once, on top of the fast
+  pass; the key alone is about a second. A first scan of a big library takes a while. Each
+  worker thread keeps its own copy of the model in memory. A cache entry made
   before the weights were there gets its grid on the next scan once they are.
 - **Weights.** beat-this's `beat_this.onnx` (83 MB) and `mel_spectrogram.onnx` (0.3 MB) are not
   shipped. They live in `~/.cache/codjd/models/beat-this/` (under `CODJD_CACHE_DIR` if set) and

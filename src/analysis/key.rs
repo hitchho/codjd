@@ -54,3 +54,26 @@ pub fn detect(mono: &[f32], rate: u32) -> Option<Key> {
     let k = timestretch::detect_key(mono, rate)?;
     Some(Key::new(k.root, matches!(k.mode, KeyMode::Minor), SOURCE))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An A minor triad with a bass A: the detector must land on A minor or its relative, C major
+    /// (8A / 8B)
+    #[test]
+    fn a_minor_chord_is_on_the_a_minor_wheel_position() {
+        let rate = 22_050.;
+        let tones = [(110., 1.), (220., 1.), (261.63, 0.7), (329.63, 0.7), (440., 0.8)];
+        let mono: Vec<f32> = (0..rate as usize * 20)
+            .map(|i| {
+                let t = i as f32 / rate;
+                tones.iter().map(|(f, a)| a * (std::f32::consts::TAU * f * t).sin()).sum::<f32>() * 0.1
+            })
+            .collect();
+        let key = detect(&mono, rate as u32).expect("a key");
+        assert!(key.camelot == "8A" || key.camelot == "8B", "{key:?}");
+        assert_eq!(key.source, SOURCE);
+        assert!(detect(&vec![0.; 22_050 * 5], 22_050).is_none() || SOURCE == "timestretch");
+    }
+}
