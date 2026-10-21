@@ -180,8 +180,9 @@ with `DjLoad`.
   first"`); auto mode and `SetPreview` do not check. A synced `Play` that exceeds `sync_range` is
   refused before anything is loaded. Arming after the mix start has passed moves the incoming deck's
   start to the next whole beat.
-- A plan that loops the outgoing deck carries `in_clock` (in `SetShow`): a loop wraps the clock deck's
-  beat position, so items due after the first outgoing loop (and ramps ending after it) are
+- A plan whose outgoing deck loops or stops before the mix ends carries `in_clock` (in `SetShow`): a loop
+  wraps the clock deck's beat position and a pause freezes it, so items due after the first outgoing loop
+  or stop (and ramps ending after it) are
   scheduled with the incoming deck as the clock, at its own beats (`play from` + mix beat, re-based
   by `jump`s, by the tempo ratio when `unsynced`, plus the late-arm shift). `Swap` there is
   scheduled as two `Set`s, because `Swap` kills the clock deck's band. `mix_beat` and the end of
@@ -206,6 +207,23 @@ with `DjLoad`.
 
 All need an active set (`SetUse`) and reply `"ok ..."` or an error string. Edits are written, then
 hot-reloaded; the reply comes after the reload, so a following `SetState` shows the result.
+
+## Recipes and warnings (D-Bus)
+
+Transition recipes (`mix a -> b at <pos> recipe <name>`, see set-language.md, Recipes) are expanded
+when the set loads, so plans and the runtime do not know about them.
+
+| method | args | does |
+|---|---|---|
+| `SetRecipes` | — | `a(ssu)`: (name, one-line explanation for a beginner, default bars) of every recipe: `blend` 32, `bassswap` 16, `echo-out` 8, `cut` 1, `filter-blend` 16 |
+| `SetRecipeText` | `s recipe, s from, s to, u bars` | `s`: the recipe written out as a commented `mix <from> -> <to> at bar 1 over <bars> bars` block (a `# <recipe>: <explanation>` line, then a comment per group of lines saying why). `bars` 0 = the default. It parses and compiles to the same plan as the `recipe` header form at the same place. `from`/`to` are track ids of the set it will be pasted into; if `to` is a track of the active set with a cue `drop`, `echo-out` jumps to it. Unknown recipe or too few bars: a D-Bus error (`recipe blend needs at least 8 bars (got 4)`) |
+| `SetWarnings` | `s name` | `as`: `file:line:col: message` for each warning of the latest save of a set (by name, file name or stem); empty if none. Errors stay in `SetErrors`; warnings never keep a file from loading. Today: a recipe mix not starting on a phrase (every 8 bars from bar 1, first beat) |
+
+`SetShow` also carries `warnings`. Signatures: `SetRecipes` `a(ssu)`, `SetRecipeText` `(sssu)` in
+and `s` out, `SetWarnings` `s` in and `as` out.
+
+There is no echo effect in the engine yet: `echo-out` is a shrinking loop (4, 2, 1 beats) plus a
+high-pass sweep and a fade, see the loop clock rule under Runtime behavior.
 
 ## Set sources (D-Bus, for agents and editors)
 

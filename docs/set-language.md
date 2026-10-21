@@ -58,10 +58,14 @@ library. Zero or several matches are errors that list the candidates. Lines in i
 - `loop <name> bar <n> [beat <m>] len <k> beat(s)|bar(s)`: a named loop.
 
 ### `mix <a> -> <b> at <position> over <n> bars`
+### `mix <a> -> <b> at <position> recipe <name> [over <n> bars]`
 A transition from track `a` (outgoing, on air) to `b` (incoming). `<position>` is
 `<a>.<cue>` or `bar <n> [beat <m>]` on `a`'s grid: where the mix starts, which is mix bar 0.
 Inside the block, **bar numbers count from the mix start, on `a`'s grid** (`a` is the master; `b`
 is synced to it unless `unsynced`).
+
+The second form starts from a **recipe**, a ready-made transition (see Recipes below); the lines
+under it are optional and applied on top of it.
 
 Lines:
 
@@ -90,6 +94,78 @@ Controls: `fader` (0..1), `low`, `mid`, `high` (−1 kill … 0 unity … +1 = +
 Curves: `linear` (default for faders and the crossfader), `smooth` (S-curve; default for EQ and
 filter), `exp`.
 
+## Recipes
+
+A recipe is a transition somebody already thought through. Write the header, get the whole mix:
+
+```
+mix aft -> smk at aft.outro recipe blend
+```
+
+`recipe <name>` comes after the position; `over <n> bars` after it replaces the recipe's length
+(the length is only optional with a recipe). Under the header you may add ordinary mix lines.
+Each recipe has a default length and a shortest one (shorter is an error: `recipe blend needs at
+least 8 bars (got 4)`); the timings scale with the length (halves and quarters of it, in whole
+bars). The incoming deck is loaded neutral by the runtime (fader up, EQ and filter flat), so the
+recipes only write what they change.
+
+| recipe | bars (default / least) | what it does, for someone who has never DJ'd |
+|---|---|---|
+| `blend` | 32 / 8 | **A long, smooth overlap: never two basslines at once.** The new track starts with its bass killed and fades in over the first half. At the middle the bass swaps (old bass out, new bass in, on one beat). Over the second half the old track is filtered down and faded out, then stops at the end. |
+| `bassswap` | 16 / 4 | **A short overlap where the bass changes hands on one beat.** The new track is at full volume within 2 bars (bass still killed), the swap is at the middle, both tracks run without the old bass until the last quarter, where the old one filters and fades out and stops at the end. |
+| `echo-out` | 8 / 4 | **The old track stutters away in shrinking loops while it turns thin, then the new one hits.** The new track runs silently from the start; the old one loops 4 beats, then 2, then 1, while a high-pass sweep and a fade thin it out. At the end the old track stops and the new one jumps to its `drop` cue (or, with no cue called `drop`, back to its first downbeat) at full volume. |
+| `cut` | 1 / 1 | **Hard cut: works on a big drop.** The new track starts at full volume exactly at the mix start and the old one stops on the same beat. |
+| `filter-blend` | 16 / 8 | **Muffle the old track while the new one opens up from thin to full.** The old track's low-pass filter closes (0 to -0.7) while the new track's high-pass opens (+0.7 to 0), and the faders crossfade; the old track stops at the end. |
+
+There is **no echo effect yet**: `echo-out` fakes it with a shrinking loop (4, 2, 1 beats, all from
+the same start, so they repeat the same bit tighter and tighter), a high-pass sweep and a fade.
+A real echo will replace the loops later, the recipe's name stays. Because the old deck loops,
+the runtime times the end of that mix on the new deck (see Semantics).
+
+**Phrases.** Dance music is built in blocks of 8 bars (a phrase): things start and change on bar
+1, 9, 17, 25 ... A mix started anywhere else sounds like it falls over. Put a recipe on a phrase
+start: a cue (`at aft.outro`) or `at bar 33`. If a recipe mix starts elsewhere, codjd still loads
+the set but warns: `recipe blend starts at bar 37: mixes usually start on a phrase (bar 33 or 41)`
+(`SetWarnings`, see Warnings).
+
+**Learning from a recipe.** `SetRecipeText` (D-Bus; `:mix new <recipe>` in codj) gives the recipe
+fully written out in this language, one comment per group of lines saying why it is there, e.g.
+
+```
+# blend: A long, smooth overlap: never two basslines at once.
+mix aft -> smk at bar 1 over 32 bars
+  # start the new track from its first downbeat, beat-matched to the old one
+  smk play
+  # keep the new track's bass out until the swap: two basslines at once turn to mud
+  bar 0 smk.low kill
+  ...
+```
+
+The written-out block and the one-line form compile to the same plan, so you can start from the
+recipe line and expand it only when you want to change something.
+
+### Merge rule (recipe plus your own lines)
+
+1. The recipe's items come first, then the block's own items.
+2. A line of the block that touches something removes the recipe's items that touch the same
+   thing, whatever their time. "The same thing" is: a control of a deck (`smk.fader`, `aft.low`,
+   `xfade` is the crossfader), a band's `swap <band>`, `<t> stop`, loops of a deck (`loop`,
+   `loop off`), jumps of a deck (`jump`).
+3. Everything the block does not touch stays. `<b> play` replaces the recipe's play line (a
+   second `play` line in the block is still an error).
+
+So `bars 0..8 smk.fader 0 -> 1` (a quick fade-in) replaces the recipe's `smk.fader` ramp and
+nothing else; `bar 20 swap low` moves the swap and keeps the bass kill before it; `bar 30 aft
+stop` moves the stop. Items at the same time keep that order: the recipe's, then yours.
+
+## Warnings
+
+Errors stop a file from loading; warnings do not. A warning says the set works but is probably
+not what was meant: for now, a recipe mix that does not start on a phrase (every 8 bars from bar
+1, on the first beat). They have the same `file:line:col: message` form, point at the `at` position
+(its bar number, or the track of `<track>.<cue>`), and are read with `SetWarnings`; `SetErrors`
+and `SetCheck` list errors only.
+
 ## Semantics
 
 - Tracks without a beat grid can be in a set, but a `mix` touching them is an error ("no beat
@@ -98,12 +174,13 @@ filter), `exp`.
   the audio engine at the exact frame (see `docs/dj-api.md`, automation).
 - **Manual control wins**: touching a control by hand (key, MCP, D-Bus `DjSet`) cancels that
   control's remaining automation in the running mix; the rest of the mix continues.
-- **Loops on the outgoing deck**: a loop makes the outgoing deck's own beat position wrap, so it
-  can't time anything after it. From the first `a loop ...` of a mix, every later item (and every
-  ramp that ends later) is timed on the incoming deck's beats instead (it has played since mix
-  bar 0); you write nothing different, and `swap` there becomes two plain sets. Put `a loop off`
-  at least a beat before `a stop`: a loop-off on the very beat of the stop can be left waiting for
-  a wrap on a deck that is already paused.
+- **Loops and stops on the outgoing deck**: the outgoing deck times the mix, but a loop makes its
+  beat position wrap and a `stop` makes it stand still, so after the first `a loop ...` or
+  `a stop` it can't time anything. If the mix goes on after that, every later item (and every ramp
+  that ends later) is timed on the incoming deck's beats instead (it has played since mix bar 0);
+  you write nothing different, and `swap` there becomes two plain sets. Put `a loop off` at least
+  a beat before `a stop`: a loop-off on the very beat of the stop can be left waiting for a wrap
+  on a deck that is already paused.
 - At the end of a mix, controls stay where the mix left them.
 - Order: tracks are played in file order; a `mix` connects two of them. A set without `mix`
   blocks is just a crate.
@@ -155,7 +232,10 @@ Choices the sections above leave open; this is what the parser and the compiler 
 - `loop <k> beats` and `jump <±k> beats` have no fixed position in the file; the compiler
   computes where the deck is at that moment: `a` from the mix start, `b` from `play from`, both
   advancing with `a`'s beats (`b` at its own tempo ratio when `unsynced`), re-based by earlier
-  `jump`s, rounded to a whole beat. Loops are not modeled. The plan holds the absolute beats.
+  `jump`s, rounded to a whole beat. The plan holds the absolute beats. Loops are modeled only as
+  far as a loop's start goes: `loop <k> beats` while an earlier loop of that deck is on (no `loop
+  off` between) resizes it and keeps its start, like the loop button, and a `jump <±k> beats`
+  carries it along; otherwise the loop starts at the deck's computed beat.
 
 ### Values
 - Ranges: `fader` 0..1; `low`/`mid`/`high`/`filter` and `xfade` -1..1; `gain` (track and mix)
@@ -183,8 +263,12 @@ exist is an error without a search. The library is the daemon's playlist (`Playl
 
 ### D-Bus
 `SetList() -> a(ssu)` (name, file, error count), `SetErrors(s) -> as` (`file:line:col: message`),
-`SetShow(s) -> s` (JSON: name, file, errors, and the active resolved model with its compiled
-plans, `{"name","file","errors","active":{"set","plans"}}`).
+`SetShow(s) -> s` (JSON: name, file, errors, warnings, and the active resolved model with its
+compiled plans, `{"name","file","errors","warnings","active":{"set","plans"}}`), `SetWarnings(s) ->
+as` (`file:line:col: message`, see Warnings), `SetRecipes() -> a(ssu)` (name, one-line explanation,
+default bars) and `SetRecipeText(s recipe, s from, s to, u bars) -> s` (the recipe written out as a
+commented block, `bars` 0 = the default; `from`/`to` are track ids; the header reads `at bar 1`,
+move it where you want; if `to` is a track of the active set with a cue `drop`, `echo-out` uses it).
 
 ## Editing from codj (capture and recording)
 
