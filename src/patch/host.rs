@@ -40,6 +40,13 @@ pub trait PatchHost {
     /// Swaps `program` into `slot`; the slot starts cue-only with the fader at 1. Node state of a
     /// program already there carries over for nodes whose id survived.
     fn patch_load(&mut self, slot: usize, program: Self::Program);
+    /// A structural edit: `Audio::patch_swap(slot, program, keep_live)`. Carries node state over
+    /// (by node id and kind) and keeps the slot's strip; unlike `patch_load` it adopts state.
+    /// The document layer passes `keep_live = false` (cue-only after a structural edit).
+    fn patch_swap(&mut self, slot: usize, program: Self::Program, keep_live: bool);
+    /// Drops the slot's knob automation (it is by knob index); called before a swap that
+    /// changes the knob list
+    fn patch_cancel_knob_automation(&mut self, slot: usize);
     fn patch_unload(&mut self, slot: usize);
     fn patch_knob(&mut self, slot: usize, knob: usize, value: f32);
     #[allow(clippy::too_many_arguments)]
@@ -58,6 +65,8 @@ pub mod fake {
     #[derive(Clone, Debug, PartialEq)]
     pub enum Call {
         Load(usize, PatchGraph),
+        Swap(usize, PatchGraph, bool),
+        CancelKnobAuto(usize),
         Unload(usize),
         Knob(usize, usize, f32),
         Cell { slot: usize, seq: usize, pattern: usize, step: u16, row: u8, on: bool, velocity: f32 },
@@ -90,6 +99,14 @@ pub mod fake {
 
         fn patch_load(&mut self, slot: usize, program: PatchGraph) {
             self.calls.push(Call::Load(slot, program));
+        }
+
+        fn patch_swap(&mut self, slot: usize, program: PatchGraph, keep_live: bool) {
+            self.calls.push(Call::Swap(slot, program, keep_live));
+        }
+
+        fn patch_cancel_knob_automation(&mut self, slot: usize) {
+            self.calls.push(Call::CancelKnobAuto(slot));
         }
 
         fn patch_unload(&mut self, slot: usize) {

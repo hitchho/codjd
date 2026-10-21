@@ -7,7 +7,8 @@
 //!
 //! - `type Program = crate::patch::program::Program;`
 //! - `compile` -> `crate::patch::program::compile(graph, sample_rate)`
-//! - `patch_load/unload/knob/cell/pattern/live` -> the `Audio::patch_*` calls of the same name
+//! - `patch_load/swap/unload/knob/cell/pattern/live` -> the `Audio::patch_*` calls of the same name;
+//!   `patch_cancel_knob_automation` -> cancel the slot's `Control::Knob` automation (`cancel_control`)
 //!   (through `Engine`'s `audio` field: add the `Engine::patch_*` wrappers there, they need
 //!   private fields)
 //! - `patch_rt` -> the slot's RT state (cpu, muted reason, knob values, sequencer positions,
@@ -43,6 +44,12 @@ impl PatchHost for Engine {
     fn patch_load(&mut self, _slot: usize, program: NotBuilt) {
         match program {}
     }
+
+    fn patch_swap(&mut self, _slot: usize, program: NotBuilt, _keep_live: bool) {
+        match program {}
+    }
+
+    fn patch_cancel_knob_automation(&mut self, _slot: usize) {}
 
     fn patch_unload(&mut self, _slot: usize) {}
 

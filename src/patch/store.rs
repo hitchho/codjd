@@ -117,6 +117,8 @@ impl PatchStore {
             }
             _ => {}
         }
+        // MERGE(patch-engine): also run `patch::program::compile` here (and in `PatchCheck`), so
+        // a patch the engine would refuse to load (a cycle without a Delay or Hold) isn't saved
         let errors = doc::check(text);
         if !errors.is_empty() {
             return Err(refusal(&errors));

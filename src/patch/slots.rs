@@ -109,6 +109,7 @@ impl Slots {
     /// `slot` (cue-only). The slot's edit history starts empty.
     pub fn load<H: PatchHost>(&mut self, h: &mut H, slot: usize, name: &str, json: &str) -> Result<(), String> {
         check_slot(slot)?;
+        let name = name.strip_suffix(".json").unwrap_or(name);
         let (doc, graph) = doc::load(json).map_err(lines)?;
         let program = h.compile(&graph, h.sample_rate()).map_err(|e| format!("can't compile {name}: {e}"))?;
         h.patch_load(slot, program);
@@ -153,17 +154,21 @@ impl Slots {
         };
         s.history.record(&s.doc, actions::coalesce_key(action));
         s.doc = new;
+        let knobs_changed = s.graph.knobs != graph.knobs;
         s.graph = graph;
         match program {
-            Some(p) => Self::swap(s, h, slot, p),
+            Some(p) => Self::swap(s, h, slot, p, knobs_changed),
             None => Self::dispatch(&s.graph, h, slot, &effects),
         }
         Ok(())
     }
 
     /// A structural change: the engine swaps programs and the slot is cue-only again
-    fn swap<H: PatchHost>(s: &mut Loaded, h: &mut H, slot: usize, program: H::Program) {
-        h.patch_load(slot, program);
+    fn swap<H: PatchHost>(s: &mut Loaded, h: &mut H, slot: usize, program: H::Program, knobs_changed: bool) {
+        if knobs_changed {
+            h.patch_cancel_knob_automation(slot);
+        }
+        h.patch_swap(slot, program, false);
         s.live = false;
     }
 
@@ -231,8 +236,9 @@ impl Slots {
             None => match h.compile(&graph, h.sample_rate()) {
                 Ok(p) => {
                     s.doc = target;
+                    let knobs_changed = s.graph.knobs != graph.knobs;
                     s.graph = graph;
-                    Self::swap(s, h, slot, p);
+                    Self::swap(s, h, slot, p, knobs_changed);
                 }
                 Err(e) => {
                     undo_step(s, &target);
@@ -264,7 +270,7 @@ impl Slots {
             if let Ok(d) = doc::parse(json) {
                 s.saved = d;
             }
-            s.name = name.to_string();
+            s.name = name.strip_suffix(".json").unwrap_or(name).to_string();
             s.base_hash = hash.to_string();
         }
     }
@@ -422,7 +428,7 @@ mod tests {
         assert!(s.state(&mut h)[1].live);
         s.action(&mut h, 1, r#"{"op":"set_input","to":["6","reso"],"value":0.1}"#).unwrap();
         let calls = h.take();
-        assert!(matches!(calls.as_slice(), [Call::Load(1, g)] if g.nodes[5].inputs[2] == crate::patch::graph::Input::Const(0.1)));
+        assert!(matches!(calls.as_slice(), [Call::Swap(1, g, false)] if g.nodes[5].inputs[2] == crate::patch::graph::Input::Const(0.1)));
         assert!(!s.state(&mut h)[1].live, "cue-only after a structural edit");
 
         // the compiler refuses: nothing changes, no history entry
@@ -453,7 +459,7 @@ mod tests {
         assert_eq!(h.take(), vec![Call::Cell { slot: 1, seq: 0, pattern: 0, step: 1, row: 1, on: false, velocity: 0. }]);
         // the node: a swap
         s.undo(&mut h, 1).unwrap();
-        assert!(matches!(h.take().as_slice(), [Call::Load(1, g)] if g.nodes.len() == 8));
+        assert!(matches!(h.take().as_slice(), [Call::Swap(1, g, false)] if g.nodes.len() == 8));
         assert!(s.doc(1).unwrap().nodes.get("9").is_none());
         s.undo(&mut h, 1).unwrap();
         assert_eq!(h.take(), vec![Call::Knob(1, 0, 0.3)]);
@@ -463,7 +469,7 @@ mod tests {
         s.redo(&mut h, 1).unwrap();
         assert_eq!(h.take(), vec![Call::Knob(1, 0, 0.9)]);
         s.redo(&mut h, 1).unwrap();
-        assert!(matches!(h.take().as_slice(), [Call::Load(1, g)] if g.nodes.len() == 9));
+        assert!(matches!(h.take().as_slice(), [Call::Swap(1, g, false)] if g.nodes.len() == 9));
         s.redo(&mut h, 1).unwrap();
         assert_eq!(s.redo(&mut h, 1).unwrap_err(), "nothing to redo");
         assert!(s.state(&mut h)[1].dirty);
@@ -486,6 +492,9 @@ mod tests {
     #[test]
     fn save_flow_tracks_the_base_and_dirty() {
         let (mut s, mut h) = loaded();
+        // a name given with its extension is the same patch
+        s.load(&mut h, 1, "acid.json", ACID).unwrap();
+        assert_eq!(s.in_slot(1), Some(("acid".to_string(), false)));
         let job = s.save_job(1).unwrap();
         assert_eq!(job.from, "acid");
         assert_eq!(job.base_hash, crate::sets::write::hash(ACID.as_bytes()));
@@ -493,7 +502,7 @@ mod tests {
         s.action(&mut h, 1, r#"{"op":"knob","name":"cutoff","value":0.9}"#).unwrap();
         let job = s.save_job(1).unwrap();
         assert!(s.state(&mut h)[1].dirty);
-        s.saved(1, "acid2", "abc", &job.json);
+        s.saved(1, "acid2.json", "abc", &job.json);
         let st = &s.state(&mut h)[1];
         assert!(!st.dirty);
         assert_eq!(st.name, "acid2");
@@ -542,6 +551,20 @@ mod tests {
         assert_eq!(h.take().len(), 2);
         // a structural edit on the pad: a new LFO shape
         s.action(&mut h, 2, r#"{"op":"set_param","id":"7","param":"max","value":0.5}"#).unwrap();
-        assert!(matches!(h.take().as_slice(), [Call::Load(2, _)]));
+        assert!(matches!(h.take().as_slice(), [Call::Swap(2, _, false)]));
+    }
+
+    #[test]
+    fn a_swap_that_changes_the_knob_list_cancels_knob_automation_first() {
+        let (mut s, mut h) = loaded();
+        s.action(&mut h, 1, r#"{"op":"add_node","id":"9","type":"Knob","name":"extra"}"#).unwrap();
+        let c = h.take();
+        assert!(matches!(c.as_slice(), [Call::CancelKnobAuto(1), Call::Swap(1, _, false)]), "{c:?}");
+        s.action(&mut h, 1, r#"{"op":"set_input","to":["6","reso"],"value":0.2}"#).unwrap();
+        assert!(matches!(h.take().as_slice(), [Call::Swap(1, _, false)]));
+        s.undo(&mut h, 1).unwrap();
+        assert!(matches!(h.take().as_slice(), [Call::Swap(1, _, false)]));
+        s.undo(&mut h, 1).unwrap();
+        assert!(matches!(h.take().as_slice(), [Call::CancelKnobAuto(1), Call::Swap(1, _, false)]));
     }
 }
