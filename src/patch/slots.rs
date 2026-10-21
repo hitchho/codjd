@@ -507,4 +507,41 @@ mod tests {
         s.unload(&mut h, 1).unwrap();
         assert!(h.calls.is_empty());
     }
+
+    #[test]
+    fn the_example_patches_load_and_edit() {
+        let mut s = Slots::default();
+        let mut h = Fake::default();
+        s.load(&mut h, 0, "drums", include_str!("../../examples/patches/drums.json")).unwrap();
+        s.load(&mut h, 1, "acid", include_str!("../../examples/patches/acid.json")).unwrap();
+        s.load(&mut h, 2, "pad", include_str!("../../examples/patches/pad.json")).unwrap();
+        h.take();
+        let st = s.state(&mut h);
+        let names = |i: usize| st[i].knobs.iter().map(|k| k.0.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(0), ["kick_level", "clap_level", "hat_level", "kick_decay"]);
+        assert_eq!(names(1), ["decay", "cutoff", "reso", "envmod"]);
+        assert_eq!(names(2), ["lfo_rate", "lfo_depth", "cutoff", "reso", "space_level"]);
+        assert_eq!(st[0].sequencers[0].0, "kit");
+        assert!(st[3].loaded == false);
+        // knob by name, a cell on the drum grid, the pattern
+        s.action(&mut h, 0, r#"{"op":"knob","name":"hat_level","value":0.2}"#).unwrap();
+        s.action(&mut h, 0, r#"{"op":"cell","seq":"kit","pattern":0,"step":1,"row":2,"on":true,"velocity":0.5}"#).unwrap();
+        s.action(&mut h, 0, r#"{"op":"pattern","seq":"kit","pattern":1}"#).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Call::Knob(0, 2, 0.2),
+                Call::Cell { slot: 0, seq: 0, pattern: 0, step: 1, row: 2, on: true, velocity: 0.5 },
+                Call::Pattern(0, 0, 1, false),
+            ]
+        );
+        // a polyphonic drum step takes several rows; a mono line replaces the note on a step
+        s.action(&mut h, 0, r#"{"op":"cell","seq":"kit","pattern":0,"step":0,"row":3,"on":true}"#).unwrap();
+        assert_eq!(h.take().len(), 1);
+        s.action(&mut h, 1, r#"{"op":"cell","seq":"seq","pattern":0,"step":0,"row":5,"on":true}"#).unwrap();
+        assert_eq!(h.take().len(), 2);
+        // a structural edit on the pad: a new LFO shape
+        s.action(&mut h, 2, r#"{"op":"set_param","id":"7","param":"max","value":0.5}"#).unwrap();
+        assert!(matches!(h.take().as_slice(), [Call::Load(2, _)]));
+    }
 }

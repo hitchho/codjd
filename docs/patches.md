@@ -184,3 +184,36 @@ codj DJ mode gets a patch pane (slots, knobs, a vim-key sequencer grid: `hjkl` m
 MCP tools mirroring the D-Bus methods (`patch_list`, `patch_source`, `patch_check`, `patch_write`,
 `patch_action`, `patch_import`, `patch_state` always allowed; `patch_load`, `patch_live`,
 `patch_unload` need `--live`).
+
+## Document layer: rules the sections above leave open
+
+What the file validator, the actions and the stores do (`src/patch/`); none of it changes the
+contract above.
+
+- **Order**: nodes keep the order of the file; knobs and sequencers are listed (`PatchState`, the
+  knob index of `Audio::patch_knob`) in that order. Unknown fields (top level and per node) are
+  kept when codjd writes a patch itself (`PatchSave`); `PatchWrite` stores the text as given.
+- **Names**: `Knob` and sequencer nodes need a `name`, unique among their kind, made of letters,
+  digits, `_` and `-` starting with a letter (the set language writes `<patch>.<knob>`); a knob
+  can't be called `fader`, `low`, `mid`, `high`, `filter` or `gain` (those are the patch deck's
+  mixer in sets).
+- **Params**: typed per node as in the table; defaults are filled in the graph. A numeric param
+  named like an input (`"att": 0.005` on an `ADSR`, as in the example) is that input's constant
+  (giving both is an error). `scale` is a name from the engine's list, optionally with a root
+  letter first (`A minor`, `F# dorian`); `root` is the MIDI note of row 0. `row_names` is an array
+  of texts (the graph carries them joined with `,`). A `MonoSeq` pattern has at most one note per
+  step; `patterns` holds at most 8; a pattern that is missing is empty.
+- **Actions** are applied to a copy and validated; a refused action changes nothing (and the
+  compiler's refusal of a structural result counts). `remove_node` of a node that still feeds
+  another is refused (disconnect first). `knob`, `cell` and `pattern` (and `set_param` of a
+  knob's `value` or a sequencer's `pattern`) are live, anything else, `set_input` included, is
+  structural. `pattern` is queued for the next bar unless `"now": true`. A `cell` on a `MonoSeq`
+  step replaces the note there. Knob moves of one knob in a row are one undo step; history keeps
+  200 steps per slot; undoing a live edit is a direct engine call too.
+- **Live safety**: after a structural edit (and after `PatchLoad`) the slot is cue-only again.
+- **Storage**: `PatchWrite` refuses a stale `base_hash` (`patch changed since you read it`),
+  invalid text, bad names and authors; commit message `codj: patch <name> created|edited` (or
+  `codj (agent: x): ...`), `.bak` without git. `PatchSave` to the patch the slot was loaded from
+  is based on the version it loaded (so a file changed meanwhile is a conflict); under another
+  name it creates a new patch. `PatchImport` refuses a name that exists.
+- **Sets**: `slot` in a set file is 1-4 (P1-P4), the bus's `slot` is 0-3.

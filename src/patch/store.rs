@@ -75,15 +75,7 @@ impl PatchStore {
     /// order of the compiled graph. The error is the reason the patch can't be used.
     pub fn info(&self, name: &str) -> Result<crate::sets::PatchInfo, String> {
         let (text, _) = self.source(name)?;
-        let (_, g) = doc::load(&text).map_err(|e| e.join("; "))?;
-        Ok(crate::sets::PatchInfo {
-            knobs: g
-                .knobs
-                .iter()
-                .map(|(n, i)| (n.clone(), g.nodes[*i].num("min").unwrap_or(0.), g.nodes[*i].num("max").unwrap_or(1.)))
-                .collect(),
-            sequencers: g.sequencers.iter().map(|(n, _)| n.clone()).collect(),
-        })
+        info_of(&text)
     }
 
     /// `PatchWrite`. Replies with the new hash.
@@ -142,6 +134,9 @@ impl PatchStore {
     /// hash and the notes (what was dropped or approximated).
     pub fn import(&self, ncft_path: &str, name: &str, author: &str) -> Result<(String, Vec<String>), String> {
         let prefix = commit_prefix(author)?;
+        if self.resolve(name).is_some() {
+            return Err(format!("patch \"{name}\" exists: import under another name (or write over it with PatchWrite)"));
+        }
         let src = std::fs::read_to_string(ncft_path).map_err(|e| format!("can't read {ncft_path}: {e}"))?;
         let title = Path::new(ncft_path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let (doc, notes) = import::import_ncft(&src, &title)?;
@@ -150,6 +145,19 @@ impl PatchStore {
         let hash = self.write_as(name, doc.to_json().as_bytes(), "", &prefix, Some(&format!("imported from {file}")))?;
         Ok((hash, notes))
     }
+}
+
+/// What a set can address in a patch file's text: its knobs (name, min, max) and sequencers
+pub fn info_of(json: &str) -> Result<crate::sets::PatchInfo, String> {
+    let (_, g) = doc::load(json).map_err(|e| e.join("; "))?;
+    Ok(crate::sets::PatchInfo {
+        knobs: g
+            .knobs
+            .iter()
+            .map(|(n, i)| (n.clone(), g.nodes[*i].num("min").unwrap_or(0.), g.nodes[*i].num("max").unwrap_or(1.)))
+            .collect(),
+        sequencers: g.sequencers.iter().map(|(n, _)| n.clone()).collect(),
+    })
 }
 
 #[cfg(test)]

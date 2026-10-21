@@ -1,0 +1,27 @@
+# a mix with the patch decks playing along: copy ../patches/*.json into <sets dir>/patches/ first
+# `patch <id> "<file>" slot <1-4>` loads patches/<file>.json into P1-P4 when the set is used (the
+# patch starts in the headphones only, `<id> live` sends it to the master).
+# `<id>.<knob>` sets or ramps a knob of the patch file, `<id>.fader|low|mid|high|filter|gain` is the
+# patch deck's mixer, `<id> pattern <A-H>` queues a pattern for the next bar on every sequencer.
+# The tracks are searched in the library by "artist - title" or file name; change them to yours.
+set "patches: drums and an acid line over a blend"
+
+patch kit  "drums" slot 1
+patch acid "acid"  slot 2
+patch pad  "pad"   slot 3
+
+track warm "Pneumatix - Aftertekno"
+  cue outro bar 113
+
+track mid "Aasi & Swooh - Smokin"
+  cue drop bar 17
+
+mix warm -> mid at warm.outro over 32 bars
+  mid play from drop
+  bars 0..8    kit.fader 0 -> 0.8; pad.fader 0 -> 0.6; pad.lfo_depth 0.1 -> 0.4
+  bar 8        kit live; pad live
+  bars 8..24   acid.cutoff 0.15 -> 0.7 smooth; acid.fader 0 -> 0.7
+  bar 12       acid live
+  bar 16       kit pattern B; acid pattern B
+  bars 24..32  pad.fader 0.6 -> 0; kit.hat_level 0.5 -> 0.1
+  bar 28       acid cue

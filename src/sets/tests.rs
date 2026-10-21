@@ -890,3 +890,39 @@ fn patch_items_merge_with_a_recipe_like_track_items() {
     assert!(matches!(m[2].action, Action::KnobRamp { .. }));
     assert!(matches!(m[3].action, Action::Live { live: false, .. }));
 }
+
+#[test]
+fn the_patch_examples_are_valid_and_the_example_set_loads() {
+    use crate::patch::{doc, store::info_of};
+    let files = [
+        ("acid", include_str!("../../examples/patches/acid.json")),
+        ("drums", include_str!("../../examples/patches/drums.json")),
+        ("pad", include_str!("../../examples/patches/pad.json")),
+    ];
+    let mut env = FakeEnv { root: "/music".into(), has_patch_dir: true, ..Default::default() };
+    for (name, text) in files {
+        let errors = doc::check(text);
+        assert!(errors.is_empty(), "{name}: {errors:#?}");
+        // formatted like our own writer would (two-space indent is a convention, not a rule)
+        assert!(doc::parse(text).unwrap().to_json().contains("\"codj_patch\": 1"));
+        env.patches.insert(name.to_string(), info_of(text).unwrap());
+    }
+    // what the example set addresses
+    let acid = &env.patches["acid"];
+    assert_eq!(acid.knobs.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["decay", "cutoff", "reso", "envmod"]);
+    assert_eq!(acid.sequencers, ["seq"]);
+    assert_eq!(env.patches["drums"].sequencers, ["kit"]);
+    assert!(env.patches["pad"].sequencers.is_empty());
+
+    env.add("Pneumatix", "Aftertekno", "aftertekno.flac", Some(grid(124., 0.1, 0)));
+    env.add("Aasi & Swooh", "Smokin", "smokin.flac", Some(grid(126., 0.2, 1)));
+    let l = load(Path::new("patches.codj"), include_str!("../../examples/sets/patches.codj"), &env);
+    assert!(l.diags.is_empty(), "{:#?}", l.diags);
+    assert!(l.warnings.is_empty(), "{:#?}", l.warnings);
+    let c = l.compiled.unwrap();
+    assert_eq!(c.set.patches.iter().map(|p| (p.id.as_str(), p.slot)).collect::<Vec<_>>(), [("kit", 0), ("acid", 1), ("pad", 2)]);
+    let items = &c.plans[0].items;
+    // pattern B on the kit's one sequencer and the acid's
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Pattern { pattern: 1, .. })).count(), 2);
+    assert!(items.iter().any(|i| matches!(i, PlanItem::Live { slot: 1, live: true, .. })));
+}

@@ -148,15 +148,21 @@ impl NodeDoc {
 
 /// Parses a patch file's text. Errors carry the position serde found.
 pub fn parse(json: &str) -> Result<PatchDoc, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
-    match v.get("codj_patch") {
+    // the version first, for a message that says what is wrong with a file that isn't ours; the
+    // document is read from the text itself (through a `Value` the node order would be lost)
+    #[derive(Deserialize)]
+    struct Head {
+        codj_patch: Option<Value>,
+    }
+    let head: Head = serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
+    match head.codj_patch {
         None => return Err("not a patch file: `codj_patch` (the format version, 1) is missing".into()),
         Some(Value::Number(n)) if n.as_u64() == Some(VERSION as u64) => {}
         Some(other) => {
             return Err(format!("`codj_patch` is {other}, this codjd reads version {VERSION}"));
         }
     }
-    serde_json::from_value(v).map_err(|e| format!("patch file: {e}"))
+    serde_json::from_str(json).map_err(|e| format!("patch file: {e}"))
 }
 
 /// The errors of a patch file's text: syntax, then everything [`to_graph`] checks
@@ -745,6 +751,12 @@ pub(crate) mod tests {
         let text = r#"{"codj_patch":1,"future":{"a":[1,2]},"nodes":{"10":{"type":"Const","x":3.5,"y":1.0,"note":"hi","params":{"value":0.5}},"2":{"type":"AudioOut","ins":{"left":["10","out"]}}}}"#;
         let doc = parse(text).unwrap();
         assert_eq!(doc.nodes.keys().collect::<Vec<_>>(), ["10", "2"], "file order, not sorted");
+        // ... in an order that is neither numeric nor alphabetical
+        let odd = r#"{"codj_patch":1,"nodes":{"7":{"type":"Knob","name":"b"},"10":{"type":"Knob","name":"a"},"2":{"type":"Knob","name":"c"},"1":{"type":"AudioOut"}}}"#;
+        let d = parse(odd).unwrap();
+        assert_eq!(d.nodes.keys().collect::<Vec<_>>(), ["7", "10", "2", "1"]);
+        assert_eq!(to_graph(&d).unwrap().knobs.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["b", "a", "c"]);
+        assert_eq!(parse(&d.to_json()).unwrap().nodes.keys().collect::<Vec<_>>(), ["7", "10", "2", "1"]);
         assert_eq!(doc.extra["future"], serde_json::json!({"a":[1,2]}));
         assert_eq!(doc.nodes["10"].extra["note"], "hi");
         let again = parse(&doc.to_json()).unwrap();

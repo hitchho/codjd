@@ -57,6 +57,15 @@ library. Zero or several matches are errors that list the candidates. Lines in i
 - `cue <name> bar <n> [beat <m>]`: a named position. `bar 1 beat 1` is the first downbeat.
 - `loop <name> bar <n> [beat <m>] len <k> beat(s)|bar(s)`: a named loop.
 
+### `patch <id> "<name>" slot <n>`
+Declares a patch deck player (docs/patches.md): `patches/<name>.json` in the set folder is loaded
+into slot `n` (**1-4**, P1-P4) when the set is used (`SetUse`). The patch starts in the headphones
+only; a slot that already holds the patch keeps it, with its live edits; a slot with *another*
+patch that has unsaved edits refuses the `SetUse` (PatchSave or PatchUnload it first). A patch
+that fails to load is logged and the set stays usable. The id is used in mix items like a track id
+(and can't be one). The patch file is read when the set is loaded: knobs and sequencers are
+checked against it, so a set with `acid.cutof` is refused with the list of the knobs.
+
 ### `mix <a> -> <b> at <position> over <n> bars`
 ### `mix <a> -> <b> at <position> recipe <name> [over <n> bars]`
 A transition from track `a` (outgoing, on air) to `b` (incoming). `<position>` is
@@ -185,6 +194,32 @@ and `SetCheck` list errors only.
 - Order: tracks are played in file order; a `mix` connects two of them. A set without `mix`
   blocks is just a crate.
 
+### Patch items in a mix
+
+Inside a mix, a declared patch is addressed by its id, timed on the mix like the track items:
+
+- `<id>.<knob> <from> -> <to> [curve]` (on a `bars` line) and `<id>.<knob> = <v>`: a knob of the
+  patch file, in the range its `min`..`max` allows (linear unless a curve is named).
+- `<id>.<fader|low|mid|high|filter|gain>` (ramp, `= v`, `low|mid|high kill`): the patch deck's
+  mixer, as for a track deck (the engine's deck is `2 + slot`, P1 = deck 2). A knob can't have
+  these names in the patch file (the patch is refused).
+- `<id> pattern <A-H>`: queues that pattern on every sequencer of the patch for the next bar.
+- `<id> live` / `<id> cue`: the patch deck to the master, or back to the headphones only.
+  (There is no automation item for it in the engine; the runtime does it from its tick, up to
+  100 ms late.)
+
+```
+patch acid "acid" slot 1
+
+mix aft -> smk at aft.outro recipe blend
+  bars 0..16   acid.cutoff 0.2 -> 0.8 smooth; acid.fader 0 -> 0.7
+  bar 8        acid pattern B
+  bar 12       acid live
+  bar 28       acid cue
+```
+`examples/sets/patches.codj` is a full one, with `examples/patches/*.json` (copy them to
+`<sets dir>/patches/`). `stop`, `loop` and `jump` are track actions: on a patch id they are refused.
+
 ## Errors
 
 Every error has `file:line:col: message` (file name without directory, 1-based line, 1-based **byte** column as vim's quickfix counts), e.g.
@@ -197,7 +232,7 @@ breaks a running set.
 Choices the sections above leave open; this is what the parser and the compiler do.
 
 ### Syntax
-- Reserved words: `set`, `track`, `mix`, `bar`, `bars`, `swap` can't be track ids (they start lines
+- Reserved words: `set`, `track`, `mix`, `bar`, `bars`, `swap`, `patch` can't be track or patch ids (they start lines
   or items).
 - `play` may omit `from`: `smk play`, `smk play unsynced` (first downbeat).
 - A mix block is one `<b> play` line (at most one) and any number of `bar`/`bars` lines. Items in a

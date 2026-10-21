@@ -1,0 +1,27 @@
+{
+  "codj_patch": 1,
+  "title": "slow pad",
+  "nodes": {
+    "1": { "type": "Saw", "name": "root", "x": 20, "y": 20, "ins": { "freq": 110.0 } },
+    "2": { "type": "Saw", "name": "root detuned", "x": 20, "y": 100, "ins": { "freq": 110.6 } },
+    "3": { "type": "Saw", "name": "third", "x": 20, "y": 180, "ins": { "freq": 130.81 } },
+    "4": { "type": "Tri", "name": "fifth", "x": 20, "y": 260, "ins": { "freq": 164.81 } },
+    "5": { "type": "Mix4", "name": "chord", "x": 200, "y": 120,
+           "ins": { "in0": ["1", "out"], "in1": ["2", "out"], "in2": ["3", "out"], "in3": ["4", "out"], "g0": 0.3, "g1": 0.3, "g2": 0.25, "g3": 0.4 } },
+    "6": { "type": "Knob", "name": "lfo_rate", "x": 200, "y": 300, "params": { "min": 0.02, "max": 2.0, "value": 0.12 } },
+    "7": { "type": "Sine", "name": "lfo", "x": 360, "y": 300, "params": { "min": 0.0, "max": 1.0 }, "ins": { "freq": ["6", "out"] } },
+    "8": { "type": "Knob", "name": "lfo_depth", "x": 360, "y": 380, "params": { "min": 0.0, "max": 0.5, "value": 0.25 } },
+    "9": { "type": "Mul", "name": "sweep", "x": 520, "y": 330, "ins": { "in0": ["7", "out"], "in1": ["8", "out"] } },
+    "10": { "type": "Knob", "name": "cutoff", "x": 520, "y": 250, "params": { "min": 0.05, "max": 0.8, "value": 0.3 } },
+    "11": { "type": "Add", "name": "cutoff+lfo", "x": 680, "y": 290, "ins": { "in0": ["10", "out"], "in1": ["9", "out"] } },
+    "12": { "type": "Knob", "name": "reso", "x": 680, "y": 380, "params": { "min": 0.0, "max": 0.9, "value": 0.35 } },
+    "13": { "type": "Filter", "name": "lp", "x": 840, "y": 160, "params": { "mode": "lp" },
+            "ins": { "in": ["5", "out"], "cutoff": ["11", "out"], "reso": ["12", "out"] } },
+    "14": { "type": "Delay", "name": "space", "x": 1000, "y": 160, "params": { "max": 1.0 }, "ins": { "in": ["13", "out"], "time": 0.375 } },
+    "15": { "type": "Add", "name": "dry+wet", "x": 1160, "y": 160, "ins": { "in0": ["13", "out"], "in1": ["16", "out"] } },
+    "16": { "type": "Mul", "name": "wet", "x": 1160, "y": 260, "ins": { "in0": ["14", "out"], "in1": ["17", "out"] } },
+    "17": { "type": "Knob", "name": "space_level", "x": 1000, "y": 300, "params": { "min": 0.0, "max": 0.8, "value": 0.3 } },
+    "18": { "type": "Notes", "x": 20, "y": 400, "params": { "text": "A minor drone; the cutoff breathes with a slow sine. Fade it in with the fader." } },
+    "19": { "type": "AudioOut", "x": 1320, "y": 160, "ins": { "left": ["15", "out"], "right": ["15", "out"] } }
+  }
+}
