@@ -17,6 +17,58 @@ pub struct MixPlan {
     pub length_beats: f64,
     /// sorted by time; items at the same beat keep file order
     pub items: Vec<PlanItem>,
+    /// Set when the outgoing deck loops: the loop wraps its beat position, so its clock stops
+    /// counting. Items from then on are timed on the incoming deck's grid instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_clock: Option<InClock>,
+}
+
+/// Where the incoming deck is on its own grid at a mix beat (a piecewise line: it starts at
+/// `play from`, a `jump` re-bases it), and the mix beat from which the outgoing clock can't be
+/// trusted any more (its first loop)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InClock {
+    /// mix beat of the outgoing deck's first loop
+    pub after: f64,
+    /// by mix beat; the first starts at 0
+    pub segs: Vec<InSeg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct InSeg {
+    /// mix beat where the segment starts
+    pub rel: f64,
+    /// the incoming deck's grid beat there
+    pub beat: f64,
+    /// grid beats per mix beat
+    pub rate: f64,
+}
+
+impl InClock {
+    /// The incoming deck's grid beat at mix beat `rel`; the incoming deck started `late` whole
+    /// beats into its track (a late arm)
+    pub fn beat(&self, rel: f64, late: f64) -> f64 {
+        let (i, s) = self.segs.iter().enumerate().rev().find(|(_, s)| s.rel <= rel + 1e-9).unwrap_or((0, &self.segs[0]));
+        s.beat + if i == 0 { late } else { 0. } + (rel - s.rel) * s.rate
+    }
+
+    /// The mix beat at which the incoming deck is at grid beat `beat`, looking at the part of
+    /// the mix from `after` on
+    pub fn rel(&self, beat: f64, late: f64) -> f64 {
+        let mut best = None;
+        for (i, s) in self.segs.iter().enumerate() {
+            let end = self.segs.get(i + 1).map_or(f64::INFINITY, |n| n.rel);
+            if end <= self.after {
+                continue;
+            }
+            let rel0 = s.rel.max(self.after);
+            let beat0 = self.beat(rel0, late);
+            if beat0 <= beat + 1e-9 {
+                best = Some(rel0 + (beat - beat0) / s.rate);
+            }
+        }
+        best.unwrap_or(self.after)
+    }
 }
 
 /// Mirrors the engine's `AutoKind`, with a time. `Deck::Out` is the outgoing track, `Deck::In` the
@@ -48,6 +100,14 @@ pub enum PlanItem {
 }
 
 impl PlanItem {
+    /// where the item is done: a ramp's end, else its time
+    pub fn end_beat_rel(&self) -> f64 {
+        match self {
+            PlanItem::Ramp { end_beat_rel, .. } => *end_beat_rel,
+            other => other.start_beat_rel(),
+        }
+    }
+
     pub fn start_beat_rel(&self) -> f64 {
         match self {
             PlanItem::Ramp { start_beat_rel, .. } => *start_beat_rel,
@@ -141,11 +201,26 @@ fn compile_mix(set: &Set, m: &Mix) -> Option<MixPlan> {
             }
         });
     }
+    // the outgoing deck's first loop stops its clock; the incoming deck keeps time after it
+    let first_loop = items
+        .iter()
+        .filter_map(|i| match i {
+            PlanItem::Loop { deck: Deck::Out, at_beat_rel, .. } => Some(*at_beat_rel),
+            _ => None,
+        })
+        .min_by(f64::total_cmp);
+    let in_clock = first_loop.map(|after| {
+        let rate = tracker.rate[Deck::In as usize];
+        let mut segs = vec![InSeg { rel: 0., beat: m.play_from_beat, rate }];
+        segs.extend(tracker.jumps[Deck::In as usize].iter().map(|&(rel, beat)| InSeg { rel, beat, rate }));
+        InClock { after, segs }
+    });
     Some(MixPlan {
         from_track: m.from.clone(),
         to_track: m.to.clone(),
         start_beat: m.start_beat,
         length_beats: m.length_bars * bpb,
         items,
+        in_clock,
     })
 }

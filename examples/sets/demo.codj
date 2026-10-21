@@ -40,4 +40,5 @@ mix mid -> peak at mid.outro over 8 bars
   bars 0..6    peak.fader 0 -> 1
   bar 6        mid loop 2 beats; swap low
   bars 6..8    xfade -1 -> 1; mid.filter 0 -> 0.8 exp
-  bar 8        mid stop; mid loop off
+  bar 7.5      mid loop off        # leave the loop a beat or two before the stop: a loop off on the
+  bar 8        mid stop            # same beat as the stop can be left waiting for a wrap that never comes

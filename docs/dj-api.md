@@ -180,6 +180,12 @@ with `DjLoad`.
   first"`); auto mode and `SetPreview` do not check. A synced `Play` that exceeds `sync_range` is
   refused before anything is loaded. Arming after the mix start has passed moves the incoming deck's
   start to the next whole beat.
+- A plan that loops the outgoing deck carries `in_clock` (in `SetShow`): a loop wraps the clock deck's
+  beat position, so items due after the first outgoing loop (and ramps ending after it) are
+  scheduled with the incoming deck as the clock, at its own beats (`play from` + mix beat, re-based
+  by `jump`s, by the tempo ratio when `unsynced`, plus the late-arm shift). `Swap` there is
+  scheduled as two `Set`s, because `Swap` kills the clock deck's band. `mix_beat` and the end of
+  the mix are read from the incoming deck the same way.
 - Hot reload: a re-saved active file re-arms an armed, not yet started mix when its plan or tracks
   changed; a started mix keeps its plan and the new version serves the next one. A mix that no
   longer exists disarms. `SetPreview` starts the outgoing deck once the decoder has caught up.

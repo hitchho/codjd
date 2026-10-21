@@ -122,6 +122,8 @@ struct Armed {
     out_path: PathBuf,
     in_path: PathBuf,
     started: bool,
+    /// whole beats the incoming deck's start was moved on by a late arm
+    late: f64,
 }
 
 /// A preview waits for the decoder before it starts the outgoing deck
@@ -183,40 +185,53 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
     // set files count the crossfader from the outgoing deck's side (-1) to the incoming (+1);
     // the engine counts from deck A: flip when B is the outgoing deck
     let side = |c: model::Control, v: f32| if c == model::Control::Crossfader && out == 1 { -v } else { v };
-    plan.items
-        .iter()
-        .map(|it| {
-            let (at_beat, kind) = match *it {
-                PlanItem::Ramp { deck: d, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
-                    at(start_beat_rel),
-                    AutoKind::Ramp {
-                        deck: deck(d),
-                        control: control(c),
-                        from: from.map(|v| side(c, v)),
-                        to: side(c, to),
-                        end_beat: at(end_beat_rel),
-                        curve: curve(cv),
-                    },
-                ),
-                PlanItem::Set { deck: d, control: c, value, at_beat_rel } => {
-                    (at(at_beat_rel), AutoKind::Set { deck: deck(d), control: control(c), value: side(c, value) })
-                }
-                PlanItem::Swap { band, at_beat_rel } => (at(at_beat_rel), AutoKind::Swap { band: control(band) }),
-                PlanItem::Play { from_beat, synced, at_beat_rel } => {
-                    (at(at_beat_rel + late), AutoKind::Play { deck: inn, from_beat: from_beat + late, synced })
-                }
-                PlanItem::Pause { deck: d, at_beat_rel } => (at(at_beat_rel), AutoKind::Pause { deck: deck(d) }),
-                PlanItem::Loop { deck: d, start_beat, beats, at_beat_rel } => {
-                    (at(at_beat_rel), AutoKind::Loop { deck: deck(d), start_beat, beats })
-                }
-                PlanItem::LoopOff { deck: d, at_beat_rel } => (at(at_beat_rel), AutoKind::LoopOff { deck: deck(d) }),
-                PlanItem::Jump { deck: d, to_beat, at_beat_rel } => {
-                    (at(at_beat_rel), AutoKind::Jump { deck: deck(d), to_beat })
-                }
-            };
-            AutoItem { group, clock: out, at_beat, kind }
-        })
-        .collect()
+    let in_clock = plan.in_clock.as_ref();
+    let mut out_items = Vec::with_capacity(plan.items.len());
+    for it in &plan.items {
+        // once the outgoing deck loops its clock stands still: what is due later is timed on
+        // the incoming deck, which plays from the mix start (`Play` itself fires before that)
+        let late_item = in_clock.filter(|c| !matches!(it, PlanItem::Play { .. }) && it.end_beat_rel() > c.after + 1e-9);
+        let (clock, bt) = match late_item {
+            Some(c) => (inn, Box::new(move |rel: f64| c.beat(rel, late)) as Box<dyn Fn(f64) -> f64>),
+            None => (out, Box::new(at) as Box<dyn Fn(f64) -> f64>),
+        };
+        let (at_beat, kind) = match *it {
+            PlanItem::Ramp { deck: d, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
+                bt(start_beat_rel),
+                AutoKind::Ramp {
+                    deck: deck(d),
+                    control: control(c),
+                    from: from.map(|v| side(c, v)),
+                    to: side(c, to),
+                    end_beat: bt(end_beat_rel),
+                    curve: curve(cv),
+                },
+            ),
+            PlanItem::Set { deck: d, control: c, value, at_beat_rel } => {
+                (bt(at_beat_rel), AutoKind::Set { deck: deck(d), control: control(c), value: side(c, value) })
+            }
+            PlanItem::Swap { band, at_beat_rel } if late_item.is_some() => {
+                // `Swap` kills the clock deck's band: with the incoming deck as clock, say it in two sets
+                let b = bt(at_beat_rel);
+                out_items.push(AutoItem { group, clock, at_beat: b, kind: AutoKind::Set { deck: out, control: control(band), value: -1. } });
+                (b, AutoKind::Set { deck: inn, control: control(band), value: 0. })
+            }
+            PlanItem::Swap { band, at_beat_rel } => (bt(at_beat_rel), AutoKind::Swap { band: control(band) }),
+            PlanItem::Play { from_beat, synced, at_beat_rel } => {
+                (at(at_beat_rel + late), AutoKind::Play { deck: inn, from_beat: from_beat + late, synced })
+            }
+            PlanItem::Pause { deck: d, at_beat_rel } => (bt(at_beat_rel), AutoKind::Pause { deck: deck(d) }),
+            PlanItem::Loop { deck: d, start_beat, beats, at_beat_rel } => {
+                (bt(at_beat_rel), AutoKind::Loop { deck: deck(d), start_beat, beats })
+            }
+            PlanItem::LoopOff { deck: d, at_beat_rel } => (bt(at_beat_rel), AutoKind::LoopOff { deck: deck(d) }),
+            PlanItem::Jump { deck: d, to_beat, at_beat_rel } => {
+                (bt(at_beat_rel), AutoKind::Jump { deck: deck(d), to_beat })
+            }
+        };
+        out_items.push(AutoItem { group, clock, at_beat, kind });
+    }
+    out_items
 }
 
 /// `1.5` -> "1.5", `16.0` -> "16"
@@ -515,10 +530,21 @@ impl Runtime {
 
     // ---- following ----
 
-    /// Beats since the mix start on the outgoing deck's grid
+    /// Beats since the mix start on the outgoing deck's grid. Once the outgoing deck loops its
+    /// own position stands still, and the incoming deck says how far the mix has got.
     fn mix_beat(h: &mut dyn Host, a: &Armed) -> Option<f64> {
         let v = h.deck(a.out);
-        v.grid.as_ref().map(|g| beat_at(g, v.position) - a.plan.start_beat)
+        let mb = v.grid.as_ref().map(|g| beat_at(g, v.position) - a.plan.start_beat)?;
+        match &a.plan.in_clock {
+            Some(c) if mb >= c.after - 1e-9 => {
+                let i = h.deck(a.inn);
+                match i.grid.as_ref().filter(|_| i.playing) {
+                    Some(g) => Some(c.rel(beat_at(g, i.position), a.late).max(c.after)),
+                    None => Some(mb),
+                }
+            }
+            _ => Some(mb),
+        }
     }
 
     /// Called by the engine about ten times a second
@@ -595,7 +621,7 @@ impl Runtime {
             self.disarm(h);
             return;
         }
-        let Some(mb) = out.grid.as_ref().map(|g| beat_at(g, out.position) - a.plan.start_beat) else { return };
+        let Some(mb) = Self::mix_beat(h, a) else { return };
         let (len, was_started) = (a.plan.length_beats, a.started);
         if !was_started && mb >= 0. && out.playing {
             if let Some(a) = &mut self.armed {
@@ -712,6 +738,7 @@ impl Runtime {
             out_path,
             in_path,
             started: false,
+            late,
         });
         Ok(())
     }
@@ -866,6 +893,48 @@ mix smk -> xyz at bar 9 over 4 bars
         };
         assert_eq!(xf(0), 0.5);
         assert_eq!(xf(1), -0.5);
+    }
+
+    #[test]
+    fn items_after_an_outgoing_loop_are_timed_on_the_incoming_deck() {
+        let c = compiled(
+            "track aft \"Aftertekno.flac\"\n  cue outro bar 5\ntrack smk \"Smokin.flac\"\n  cue hook bar 3\n\
+             mix aft -> smk at aft.outro over 8 bars\n  smk play from hook\n  bars 0..2 smk.fader 0 -> 1\n  \
+             bar 4 aft loop 4 beats\n  bars 3..7 aft.fader 1 -> 0\n  bar 6 swap low\n  bar 8 aft stop\n",
+        );
+        let plan = &c.plans[0];
+        let (s, from) = (plan.start_beat, plan_play_from(plan));
+        let ic = plan.in_clock.as_ref().unwrap();
+        assert_eq!(ic.after, 16.);
+        let items = map_plan_late(plan, 0, 1, 7, 0.);
+        let on = |clock: usize| items.iter().filter(|i| i.clock == clock).map(|i| i.at_beat).collect::<Vec<_>>();
+        // before and at the loop: the outgoing clock (the play, the first fade, the loop itself)
+        assert_eq!(on(0), vec![s, s, s + 16.]);
+        // later: b's beats, from where it started (smk is at beat `from` at mix beat 0); the swap is two sets
+        assert_eq!(on(1), vec![from + 12., from + 24., from + 24., from + 32.]);
+        assert!(items.contains(&AutoItem {
+            group: 7,
+            clock: 1,
+            at_beat: from + 12.,
+            kind: AutoKind::Ramp { deck: 0, control: AC::Fader, from: Some(1.), to: 0., end_beat: from + 28., curve: ACurve::Linear }
+        }));
+        // a swap on b's clock is two plain sets
+        let sets: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i.kind {
+                AutoKind::Set { deck, control: AC::Low, value } if i.clock == 1 => Some((deck, value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sets, vec![(0, -1.), (1, 0.)]);
+        assert!(!items.iter().any(|i| matches!(i.kind, AutoKind::Swap { .. })));
+        // a late arm moves b's start, and with it b's clock
+        let late = map_plan_late(plan, 0, 1, 7, 2.);
+        assert!(late.iter().filter(|i| i.clock == 1).all(|i| i.at_beat >= from + 14.));
+        // the way back: b's beat to mix beat
+        assert_eq!(ic.beat(20., 0.), from + 20.);
+        assert_eq!(ic.rel(from + 20., 0.), 20.);
+        assert_eq!(ic.rel(from + 22., 2.), 20.);
     }
 
     #[test]

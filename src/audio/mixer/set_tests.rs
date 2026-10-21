@@ -172,3 +172,67 @@ fn a_four_bar_mix_runs_through_the_mixer_on_the_clock_decks_beats() {
     assert!(!h.r.d(0).running());
     assert_eq!(rt.state(&mut h).armed, -1);
 }
+
+#[test]
+fn items_after_the_outgoing_deck_loops_run_on_the_incoming_clock() {
+    // a loops 2 beats from mix bar 2 on: its own beat position stands still from there, but the
+    // fade, the stop and the end of the mix still land on their beats (timed on b)
+    let mut env = FakeEnv { root: "/m".into(), ..Default::default() };
+    let (a, b) = (env.add("A", "a", "a.flac", Some(grid(120., 0.1, 0))), env.add("B", "b", "b.flac", Some(grid(126., 0.3, 0))));
+    let src = "track a \"a.flac\"\ntrack b \"b.flac\"\nmix a -> b at bar 2 over 4 bars\n  b play\n  \
+               bars 0..2 b.fader 0 -> 1\n  bar 2 a loop 2 beats\n  bars 2..4 a.fader 1 -> 0; a.filter 0 -> 0.8\n  \
+               bar 3 swap low\n  bar 3.5 a loop off\n  bar 4 a stop\n";
+    let loaded = crate::sets::load(Path::new("/sets/loop.codj"), src, &env);
+    assert!(loaded.diags.is_empty(), "{:?}", loaded.diags);
+    let compiled = Arc::new(loaded.compiled.unwrap());
+    assert!(compiled.plans[0].in_clock.is_some());
+    let ga = compiled.set.track("a").unwrap().grid.clone().unwrap();
+    let start = compiled.plans[0].start_beat;
+
+    let mut h = RigHost {
+        r: Rig::new(SR),
+        tracks: HashMap::from([(a.clone(), silence(TR, 40.)), (b.clone(), silence(TR, 40.))]),
+        paths: [None, None],
+        grids: [None, None],
+    };
+    let mut rt = Runtime::default();
+    rt.activate("/sets/loop.codj".into(), compiled);
+    h.load(0, &a, ga.first_beat_s + (start - 2.) * 0.5, Some(&ga), None).unwrap();
+    h.play(0).unwrap();
+    rt.arm(&mut h, 0).unwrap();
+
+    let (mut looped, mut stopped_at, mut swapped, mut finished) = (false, None, None, false);
+    let mut b_start = None;
+    for n in 0..160_000 {
+        h.r.m.next();
+        if n % 800 == 0 {
+            rt.tick(&mut h);
+        }
+        looped |= h.r.d(0).loop_.is_some();
+        if b_start.is_none() && h.r.d(1).running() {
+            b_start = Some(h.r.d(1).grid.unwrap().beats_at(h.r.d(1).last_pos));
+        }
+        if swapped.is_none() && h.r.m.control_value(0, Control::Low) == -1. {
+            let d = h.r.d(1);
+            swapped = Some((d.grid.unwrap().beats_at(d.last_pos), h.r.m.control_value(1, Control::Low)));
+        }
+        if stopped_at.is_none() && looped && !h.r.m.shared.decks[0].playing() {
+            let d = h.r.d(1);
+            stopped_at = Some(d.grid.unwrap().beats_at(d.last_pos));
+        }
+        if stopped_at.is_some() && n % 800 == 0 && rt.state(&mut h).armed == -1 {
+            finished = true;
+            break;
+        }
+    }
+    assert!(looped, "a never looped");
+    let b0 = b_start.expect("b never started");
+    // the swap is on mix beat 12 and the stop on 16, read on b's own beats (equal tempo when synced)
+    let (sb, low_b) = swapped.expect("no swap after the loop");
+    assert!((sb - (b0 + 12.)).abs() < 0.05 && low_b == 0., "swap at b beat {sb}, b started at {b0}");
+    let st = stopped_at.expect("a never stopped: its loop froze the clock");
+    assert!((st - (b0 + 16.)).abs() < 0.05, "stopped at b beat {st}, b started at {b0}");
+    assert_eq!(h.r.m.control_value(0, Control::Fader), 0.);
+    assert!(h.r.d(0).loop_.is_none());
+    assert!(finished, "the mix never finished");
+}

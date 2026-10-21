@@ -98,6 +98,12 @@ filter), `exp`.
   the audio engine at the exact frame (see `docs/dj-api.md`, automation).
 - **Manual control wins**: touching a control by hand (key, MCP, D-Bus `DjSet`) cancels that
   control's remaining automation in the running mix; the rest of the mix continues.
+- **Loops on the outgoing deck**: a loop makes the outgoing deck's own beat position wrap, so it
+  can't time anything after it. From the first `a loop ...` of a mix, every later item (and every
+  ramp that ends later) is timed on the incoming deck's beats instead (it has played since mix
+  bar 0); you write nothing different, and `swap` there becomes two plain sets. Put `a loop off`
+  at least a beat before `a stop`: a loop-off on the very beat of the stop can be left waiting for
+  a wrap on a deck that is already paused.
 - At the end of a mix, controls stay where the mix left them.
 - Order: tracks are played in file order; a `mix` connects two of them. A set without `mix`
   blocks is just a crate.
