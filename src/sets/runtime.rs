@@ -180,6 +180,9 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
         Deck::In => inn,
     };
     let at = |rel: f64| plan.start_beat + rel;
+    // set files count the crossfader from the outgoing deck's side (-1) to the incoming (+1);
+    // the engine counts from deck A: flip when B is the outgoing deck
+    let side = |c: model::Control, v: f32| if c == model::Control::Crossfader && out == 1 { -v } else { v };
     plan.items
         .iter()
         .map(|it| {
@@ -189,14 +192,14 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
                     AutoKind::Ramp {
                         deck: deck(d),
                         control: control(c),
-                        from,
-                        to,
+                        from: from.map(|v| side(c, v)),
+                        to: side(c, to),
                         end_beat: at(end_beat_rel),
                         curve: curve(cv),
                     },
                 ),
                 PlanItem::Set { deck: d, control: c, value, at_beat_rel } => {
-                    (at(at_beat_rel), AutoKind::Set { deck: deck(d), control: control(c), value })
+                    (at(at_beat_rel), AutoKind::Set { deck: deck(d), control: control(c), value: side(c, value) })
                 }
                 PlanItem::Swap { band, at_beat_rel } => (at(at_beat_rel), AutoKind::Swap { band: control(band) }),
                 PlanItem::Play { from_beat, synced, at_beat_rel } => {
@@ -846,6 +849,23 @@ mix smk -> xyz at bar 9 over 4 bars
     fn put(h: &mut Fake, deck: usize, c: &Compiled, mix_beat: f64) {
         let g = h.decks[deck].grid.clone().unwrap();
         h.decks[deck].position = g.first_beat_s + (start_beat(c) + mix_beat) * 60. / g.bpm;
+    }
+
+    #[test]
+    fn crossfader_counts_from_the_outgoing_side() {
+        // `xfade = 0.5` leans toward the incoming deck: +0.5 when A is outgoing, -0.5 when B is
+        let c = compiled(SRC);
+        let xf = |out: usize| {
+            map_plan(&c.plans[1], out, 1 - out, 1)
+                .into_iter()
+                .find_map(|i| match i.kind {
+                    AutoKind::Set { control: AC::Crossfader, value, .. } => Some(value),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(xf(0), 0.5);
+        assert_eq!(xf(1), -0.5);
     }
 
     #[test]

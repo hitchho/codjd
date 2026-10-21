@@ -568,6 +568,15 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
             .find(|(d, c, _)| *c == control && (*d == deck || control == Control::Crossfader))
             .map_or_else(|| neutral(control), |x| x.2);
         let range = range_of(control);
+        // set files count the crossfader from the outgoing deck's side (-1) to the incoming (+1);
+        // the engine counts from deck A: flip when B is the outgoing deck
+        let flipped: Vec<(f64, f64)>;
+        let (samples, init) = if control == Control::Crossfader && inp.out == 1 {
+            flipped = samples.iter().map(|&(t, v)| (t, -v)).collect();
+            (&flipped[..], -init)
+        } else {
+            (&samples[..], init)
+        };
         for m in simplify(samples, init, range) {
             match m {
                 Move::Ramp(s) => items.push(Item {
