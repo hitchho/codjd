@@ -475,7 +475,22 @@ fn control_order(c: Control) -> u8 {
 
 /// Builds the mix block from the log. Errors say what is missing.
 pub fn build(inp: &Input) -> Result<Draft, String> {
-    if inp.events.is_empty() {
+    // cueing up the incoming deck before it starts (a hot cue, a seek, a loop, a pause) is not
+    // part of the mix: its Play event already carries where it started
+    let mut in_started = inp.in_at_start.is_some();
+    let events: Vec<&RecEvent> = inp
+        .events
+        .iter()
+        .filter(|e| match &e.ev {
+            Ev::Play { deck, .. } if *deck != inp.out => {
+                in_started = true;
+                true
+            }
+            Ev::Jump { deck, .. } | Ev::Pause { deck } | Ev::Loop { deck, .. } => *deck == inp.out || in_started,
+            _ => true,
+        })
+        .collect();
+    if events.is_empty() {
         return Err("nothing recorded: no control was touched".into());
     }
     let (go, gi) = (inp.grids[inp.out], inp.grids[1 - inp.out]);
@@ -484,7 +499,7 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
     let bo = |secs: f64| (secs - go.first_beat_s) * go.bpm / 60.;
 
     // start: the first event, floored to a bar of the outgoing track
-    let first = inp.events.iter().map(|e| bo(e.at)).fold(f64::INFINITY, f64::min);
+    let first = events.iter().map(|e| bo(e.at)).fold(f64::INFINITY, f64::min);
     let bar0 = ((first + 1e-3 - off) / bpb).floor().max(0.);
     let start_beat = off + bar0 * bpb;
     let t_of = |secs: f64| (bo(secs) - start_beat).max(0.);
@@ -494,7 +509,7 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
     let mut series: BTreeMap<(u8, u8, Role), Vec<(f64, f64)>> = BTreeMap::new();
     let mut items: Vec<Item> = vec![];
     let mut play: Option<(f64, f64, bool)> = None; // (t, position secs, synced)
-    for e in inp.events {
+    for e in &events {
         let t = t_of(e.at);
         match &e.ev {
             Ev::Knob { deck, control, value } => {
@@ -647,7 +662,7 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
         ((i.t0 * 1000.) as i64, (i.t1.unwrap_or(i.t0) * 1000.) as i64, i.is_ramp(), c, r)
     };
     items.sort_by_key(rank);
-    let last_t = inp.events.iter().map(|e| t_of(e.at)).fold(0., f64::max);
+    let last_t = events.iter().map(|e| t_of(e.at)).fold(0., f64::max);
     let end = items.iter().map(|i| i.t1.unwrap_or(i.t0)).fold(last_t, f64::max);
     let length_bars = (((end - 1e-3) / bpb).ceil().max(1.)) as u32;
 
@@ -962,6 +977,31 @@ mod tests {
             RecEvent { at: at(8.), ev: Ev::Play { deck: 1, pos: 0.1 + 18. * 0.5, synced: false } },
         ];
         assert_eq!(draft(ev, vec![], None).unwrap().play, "smk play from bar 3 unsynced");
+    }
+
+    #[test]
+    fn cueing_up_the_incoming_deck_before_it_starts_is_not_part_of_the_mix() {
+        // a hot cue on the paused deck B 30 beats before it starts: from its beat 10 to its beat
+        // 40 (hook = 66 is not it); then play at aft's beat 130, one fader move
+        let ev = vec![
+            RecEvent { at: at(100.), ev: Ev::Jump { deck: 1, from: 0.1 + 10. * 0.5, to: 0.1 + 40. * 0.5 } },
+            RecEvent { at: at(110.), ev: Ev::Loop { deck: 1, beats: 4. } },
+            RecEvent { at: at(112.), ev: Ev::Pause { deck: 1 } },
+            RecEvent { at: at(130.), ev: Ev::Play { deck: 1, pos: 0.1 + 40. * 0.5, synced: true } },
+            knob(131., 0, Control::Fader, 0.5),
+            // after it started, jumps count
+            RecEvent { at: at(136.), ev: Ev::Jump { deck: 1, from: 0.1 + 46. * 0.5, to: 0.1 + 54. * 0.5 } },
+        ];
+        let d = draft(ev, vec![], None).unwrap();
+        // the mix starts at bar 33 (beat 128), not 25; B was at its beat 40 at mix beat 2, so
+        // at beat 38 at the start: 36 beats after the downbeat on grid beat 2 = bar 10
+        assert_eq!((d.start_bar, d.play.as_str()), (33, "smk play from bar 10"));
+        assert_eq!(d.lines, ["bar 0.75  aft.fader = 0.5", "bar 2  smk jump 8 beats"]);
+        assert_eq!(d.length_bars, 2);
+        // the same with B already playing when the recording started: the jump is a move
+        let ev = vec![RecEvent { at: at(100.), ev: Ev::Jump { deck: 1, from: 0.1 + 10. * 0.5, to: 0.1 + 40. * 0.5 } }];
+        let d = draft(ev, vec![], Some((0.1 + 10. * 0.5, true))).unwrap();
+        assert_eq!(d.lines, ["bar 0  smk jump 30 beats"]);
     }
 
     #[test]
