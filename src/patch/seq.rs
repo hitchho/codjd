@@ -131,6 +131,8 @@ pub struct SeqState {
     last_edge: u64,
     est: f32,
     // gates: a countdown in samples, the height, and a retrigger waiting for one sample of gap
+    /// rows whose gate was high on the previous sample
+    high: u8,
     left: [f32; MAX_ROWS_GATE],
     height: [f32; MAX_ROWS_GATE],
     pend_len: [f32; MAX_ROWS_GATE],
@@ -165,6 +167,7 @@ impl SeqState {
             tick: 0,
             last_edge: u64::MAX,
             est: 0.125 * sr,
+            high: 0,
             left: [0.; MAX_ROWS_GATE],
             height: [1.; MAX_ROWS_GATE],
             pend_len: [0.; MAX_ROWS_GATE],
@@ -234,6 +237,7 @@ impl SeqState {
         self.last_edge = old.last_edge;
         self.est = old.est;
         self.left = old.left;
+        self.high = old.high;
         self.height = old.height;
         self.pend_len = old.pend_len;
         self.pend_vel = old.pend_vel;
@@ -265,6 +269,7 @@ impl SeqState {
                 self.left[r] -= 1.;
             }
         }
+        self.high = (0..MAX_ROWS_GATE).fold(0u8, |m, r| if gates[r] > 0. { m | 1 << r } else { m });
         if self.mono {
             out[0] = self.freq;
             out[1] = gates[0];
@@ -318,7 +323,14 @@ impl SeqState {
             }
         };
         self.pos = pos;
-        let len = gate_t * self.est;
+        // gates last a share of the step: its true length from a grid-locked clock (swing makes
+        // them differ), else the spacing of the last two edges
+        let step_frames = match info {
+            Some(c) if self.div == 1 => c.step_len,
+            Some(c) => c.nominal_len * self.div as f32,
+            None => self.est,
+        };
+        let len = gate_t * step_frames;
         let step = pos as usize;
         let cur = self.cur as usize;
         let mut gap = 0u8;
@@ -327,7 +339,7 @@ impl SeqState {
             if row != NO_NOTE {
                 self.freq = self.note_hz(row);
                 let vel = 1.;
-                if self.left[0] > 0. {
+                if self.left[0] > 0. || self.high & 1 != 0 {
                     self.left[0] = 0.;
                     gap |= 1;
                 }
@@ -338,7 +350,7 @@ impl SeqState {
             let mask = self.bank.mask[cur][step];
             for r in 0..MAX_ROWS_GATE {
                 if mask & (1 << r) != 0 {
-                    if self.left[r] > 0. {
+                    if self.left[r] > 0. || self.high & (1 << r) != 0 {
                         self.left[r] = 0.;
                         gap |= 1 << r;
                     }

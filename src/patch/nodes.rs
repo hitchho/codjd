@@ -24,6 +24,9 @@ pub struct ClockInfo {
     /// step relative to the bar grid (steps count from a bar start), swing applied
     pub step: i64,
     pub bar: i64,
+    /// frames in the current step (swing makes them differ) and in a nominal one
+    pub step_len: f32,
+    pub nominal_len: f32,
 }
 
 /// Per-sample context shared by all nodes
@@ -355,19 +358,21 @@ impl Clock {
     #[inline]
     fn tick(&mut self, env: &mut Env, node: usize, out: &mut [f32]) {
         let feed: &ClockFeed = env.feed;
-        let deck = |d: &DeckClock| (d.beat + env.i as f64 * d.dbeat, d.per_bar.max(1), d.offset, d.playing);
+        let deck = |d: &DeckClock| {
+            (d.beat + env.i as f64 * d.dbeat, d.per_bar.max(1), d.offset, d.playing, d.dbeat)
+        };
         let free_step = self.bpm / 60. * env.inv_sr;
-        let (beat, per_bar, offset, playing) = match self.src {
+        let (beat, per_bar, offset, playing, dbeat) = match self.src {
             Src::Free => {
                 let b = self.free;
                 self.free += free_step;
-                (b, 4, 0, true)
+                (b, 4, 0, true, free_step)
             }
             Src::Master if !feed.master.playing => {
                 // no deck on air to follow: run at the clock's own tempo
                 let b = self.free;
                 self.free += free_step;
-                (b, 4, 0, true)
+                (b, 4, 0, true, free_step)
             }
             Src::Master => deck(&feed.master),
             Src::A => deck(&feed.a),
@@ -385,10 +390,15 @@ impl Clock {
         let b = 0.5 * (1. + self.swing);
         let (odd, local) = if f < b { (0, f / b) } else { (1, (f - b) / (1. - b)) };
         let step = 2 * pair as i64 + odd;
+        // how long this step lasts, in frames: a pair is two nominal steps, split by the swing
+        let nominal = (1. / self.spb / dbeat.max(1e-12)) as f32;
+        let share = if odd == 0 { b } else { 1. - b } as f32;
         env.clocks[node] = ClockInfo {
             valid: true,
             step,
             bar: (rel / per_bar as f64).floor() as i64,
+            step_len: nominal * 2. * share,
+            nominal_len: nominal,
         };
         out[0] = if local < 0.5 { 1. } else { 0. };
         out[1] = (rel - rel.floor()) as f32;

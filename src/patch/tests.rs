@@ -515,7 +515,7 @@ fn master_without_a_deck_runs_free_at_its_own_tempo() {
     let mut p = seq_probe(
         NodeKind::MonoSeq,
         &[t("source", "master"), n("bpm", 120.)],
-        &[pats(vec![pat(16, &[(0, 0), (1, 0), (2, 0)])]), n("gateT", 0.25)],
+        &[pats(vec![pat(16, &[(0, 0), (1, 0), (2, 0)])])],
     );
     let e = edges(&left(&render(&mut p, 24000, stopped())), 0.5);
     assert_eq!(e, vec![0, 6000, 12000]);
@@ -548,18 +548,100 @@ fn monoseq_steps_land_on_the_clock_grid_and_play_the_scale() {
 }
 
 #[test]
-fn monoseq_retriggers_a_gate_that_is_still_open_with_a_one_sample_gap() {
-    // swing 0.5: steps start at 0, 9000, 12000. The note at 9000 gates for as long as the step
-    // before it lasted (9000), so it is still open when the next note comes
+fn swung_gates_last_a_share_of_their_own_step() {
+    // swing 0.5: steps start at 0, 9000, 12000, 21000; they last 9000 and 3000 frames
     let mut p = seq_probe(
         NodeKind::MonoSeq,
         &[t("source", "a"), n("swing", 0.5)],
-        &[n("gateT", 1.), pats(vec![pat(16, &[(0, 0), (1, 1), (2, 2)])])],
+        &[pats(vec![pat(16, &[(0, 0), (1, 1), (2, 2), (3, 3)])])],
     );
+    let gate = left(&render(&mut p, 24000, steady(120.)));
+    assert_eq!(edges(&gate, 0.5), vec![0, 9000, 12000, 21000]);
+    for (start, len) in [(0usize, 9000usize), (9000, 3000), (12000, 9000), (21000, 3000)] {
+        let want = len / 2;
+        assert_eq!(gate[start + want - 1], 1., "{start}");
+        assert_eq!(gate[start + want], 0., "{start}");
+    }
+    // gateT scales it
+    let mut b = B::new();
+    let clock = b.add(NodeKind::Clock, &[], &[t("source", "a"), n("swing", 0.5)]);
+    let s = b.add(
+        NodeKind::MonoSeq,
+        &[("clock", from(clock)), ("gateT", c(1.))],
+        &[pats(vec![pat(16, &[(0, 0), (1, 1), (2, 2)])])],
+    );
+    b.out_mono_gate(s);
+    let mut p = compile(&b.build());
+    let gate = left(&render(&mut p, 24000, steady(120.)));
+    // a full-length gate would run into the next one: a one-sample gap keeps the edge
+    assert_eq!(edges(&gate, 0.5), vec![0, 9001, 12001]);
+    assert_eq!((gate[8999], gate[9000], gate[9001]), (1., 0., 1.));
+    assert_eq!((gate[11999], gate[12000]), (1., 0.));
+}
+
+#[test]
+fn monoseq_retriggers_a_gate_that_is_still_open_with_a_one_sample_gap() {
+    // the sequencer counts the edges of a clock it cannot see through (a Nop): gates last a share
+    // of the *previous* spacing. Swing 0.5 makes the spacings 9000 and 3000, so the gate that
+    // starts after the long step is still open when the next note comes
+    let mut b = B::new();
+    let clock = b.add(NodeKind::Clock, &[], &[t("source", "a"), n("swing", 0.5)]);
+    let nop = b.add(NodeKind::Nop, &[("in", from(clock))], &[]);
+    let s = b.add(
+        NodeKind::MonoSeq,
+        &[("clock", from(nop)), ("gateT", c(1.))],
+        &[pats(vec![pat(16, &[(0, 0), (1, 1), (2, 2)])])],
+    );
+    b.out_mono_gate(s);
+    let mut p = compile(&b.build());
     let gate = left(&render(&mut p, 24000, steady(120.)));
     assert_eq!(edges(&gate, 0.5), vec![0, 9000, 12001]);
     assert_eq!(gate[11999], 1.);
     assert_eq!(gate[12000], 0.);
+}
+
+#[test]
+fn clock_dividers_chain_on_the_grid_and_when_counting() {
+    // Clock(4 per beat) -> Div(2) -> Div(3): every 6th step
+    let chain = |through: Option<NodeKind>| {
+        let mut b = B::new();
+        let clock = b.add(NodeKind::Clock, &[], &[t("source", "a")]);
+        let first = match through {
+            Some(k) => b.add(k, &[("in", from(clock))], &[]),
+            None => clock,
+        };
+        let d2 = b.add(NodeKind::ClockDiv, &[("clock", from(first))], &[n("factor", 2.)]);
+        let d3 = b.add(NodeKind::ClockDiv, &[("clock", from(d2))], &[n("factor", 3.)]);
+        let cells: Vec<(u16, u8)> = (0..16).map(|i| (i as u16, (i % 12) as u8)).collect();
+        let s = b.add(NodeKind::MonoSeq, &[("clock", from(d3))], &[pats(vec![pat(16, &cells)])]);
+        b.seq("s", s);
+        b.out(d3, d3);
+        let last = b.g.nodes.len() - 1;
+        b.g.nodes[last].inputs = vec![from(d3), from_out(s, 1)];
+        compile(&b.build())
+    };
+    // on the grid: edges every 36000 frames (6 steps of 6000), the sequencer steps at 1/6 rate
+    let mut p = chain(None);
+    let o = render(&mut p, 36000 * 5 + 1, steady(120.));
+    assert_eq!(edges(&left(&o), 0.5), (0..6).map(|i| i * 36000).collect::<Vec<_>>());
+    assert_eq!(p.seq_state(0).unwrap().2, 5);
+    // and it resets with the bar: 16 steps x 6 = 96 clock steps = 6 bars = 576000 frames
+    let mut p = chain(None);
+    let feed = steady(120.);
+    render(&mut p, 576_000, feed);
+    assert_eq!(p.seq_state(0).unwrap().2, 15);
+    render(&mut p, 1, feed.advanced(576_000));
+    assert_eq!(p.seq_state(0).unwrap().2, 0, "the pattern comes round with the bar");
+    // a deck that jumps a bar ahead keeps the divided steps on the music
+    let mut p = chain(None);
+    let mut d = DeckClock::steady(120., SR as f64);
+    d.beat = 4. * 6.; // 6 bars in: abs step 96
+    render(&mut p, 1, ClockFeed::all(d));
+    assert_eq!(p.seq_state(0).unwrap().2, 0);
+    // counting: the divider cannot see the Clock through a Nop, it counts edges: 0, 2, 4...
+    let mut p = chain(Some(NodeKind::Nop));
+    let o = render(&mut p, 36000 * 3 + 1, steady(120.));
+    assert_eq!(edges(&left(&o), 0.5), vec![0, 36000, 72000, 108000]);
 }
 
 #[test]

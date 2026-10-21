@@ -83,6 +83,11 @@ impl B {
         self.out(node, node)
     }
 
+    /// The gate output (second output) of a sequencer to the AudioOut, frequency on the right
+    pub fn out_mono_gate(&mut self, seq: usize) -> usize {
+        self.add(NodeKind::AudioOut, &[("left", from_out(seq, 1)), ("right", from_out(seq, 0))], &[])
+    }
+
     pub fn build(self) -> PatchGraph {
         self.g
     }

@@ -138,7 +138,8 @@ Implemented in `src/patch/` (compiler, nodes) and `src/audio/mixer.rs` (slots). 
   sample later); `Delay` reads at least 2 samples back; `max` is capped at 2 s.
 - **Gates**: sequencer clocks and `ClockDiv` use a threshold of 0.5; `ADSR` and the drum voices
   treat anything above 0.01 as a gate, and a drum's hit is scaled by the height of the gate at its
-  rising edge, so a `GateSeq` velocity is a hit velocity. Back-to-back sequencer gates leave one
+  rising edge, so a `GateSeq` velocity is a hit velocity. A sequencer gate lasts `gateT` of its
+  own step (a swung long step gets a long gate); gates that would run into the next one leave one
   sample of gap so an envelope retriggers.
 - **`Clock`**: `bar` is the position in the bar in beats (0..beats per bar, fractional), `beat` the
   phase 0..1. `master` follows the deck on air; with no deck running on a grid it runs free at the
