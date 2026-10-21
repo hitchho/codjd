@@ -366,9 +366,13 @@ fn relative_loops_and_jumps_follow_the_deck_position() {
     // aft: 512 + 8; smk starts at bar 3 = 2 + 8 = 10, +8 = 18
     assert!(items.contains(&PlanItem::Loop { deck: Out, start_beat: 520., beats: 4., at_beat_rel: 8. }));
     assert!(items.contains(&PlanItem::Loop { deck: In, start_beat: 18., beats: 2., at_beat_rel: 8. }));
-    // the jump goes 8 beats back from 18, and smk keeps counting from there: 4 beats later, 14
+    // the jump goes 8 beats back from 18 and takes the loop along: 10
     assert!(items.contains(&PlanItem::Jump { deck: In, to_beat: 10., at_beat_rel: 8. }));
-    assert!(items.contains(&PlanItem::Loop { deck: In, start_beat: 14., beats: 1., at_beat_rel: 12. }));
+    // a loop while one is on resizes it and keeps its start (as the loop button does)
+    assert!(items.contains(&PlanItem::Loop { deck: In, start_beat: 10., beats: 1., at_beat_rel: 12. }));
+    // with no loop on, the loop starts where the deck is: aft at 512 + 16
+    let c = good(&mix("  smk play from bar 3\n  bar 2 smk loop 2 beats; smk loop off\n  bar 3 smk loop 1 beats\n"));
+    assert!(c.plans[0].items.contains(&PlanItem::Loop { deck: In, start_beat: 22., beats: 1., at_beat_rel: 12. }));
 }
 
 #[test]
@@ -402,4 +406,339 @@ fn the_demo_set_loads() {
     assert_eq!(c.plans.len(), 2);
     // `grid /2`: detected as double time
     assert_eq!(c.set.track("peak").unwrap().grid.as_ref().unwrap().bpm, 66.);
+}
+
+// ---- recipes ----
+
+use super::recipes;
+
+/// like `HEAD`, with a `drop` cue on smk (bar 17: beat 2 + 64 = 66 on its grid)
+const HEAD_DROP: &str = "track aft \"Pneumatix - Aftertekno.flac\"\n  cue outro bar 129\n  cue drop bar 33\ntrack smk \"Smokin\"\n  cue intro bar 3\n  cue drop bar 17\n";
+
+fn recipe_mix(head: &str, header_rest: &str, body: &str) -> String {
+    format!("{head}mix aft -> smk at aft.outro recipe {header_rest}\n{body}")
+}
+
+fn plan_of(src: &str) -> super::MixPlan {
+    let mut c = good(src);
+    assert_eq!(c.plans.len(), 1);
+    c.plans.remove(0)
+}
+
+fn items_of(head: &str, header_rest: &str, body: &str) -> Vec<PlanItem> {
+    plan_of(&recipe_mix(head, header_rest, body)).items
+}
+
+/// smk's first downbeat: grid beat 2 (its first beat is beat 2 of the bar)
+const SMK0: f64 = 2.;
+
+fn ramp(deck: Deck, control: Control, from: Option<f32>, to: f32, s: f64, e: f64, curve: Curve) -> PlanItem {
+    PlanItem::Ramp { deck, control, from, to, start_beat_rel: s, end_beat_rel: e, curve }
+}
+
+#[test]
+fn blend_compiles_to_the_expected_plan() {
+    use Control::*;
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "blend", ""));
+    // 32 bars of 4 beats, the swap in the middle
+    assert_eq!(p.length_beats, 128.);
+    assert_eq!(
+        p.items,
+        vec![
+            PlanItem::Play { from_beat: SMK0, synced: true, at_beat_rel: 0. },
+            PlanItem::Set { deck: In, control: Low, value: -1., at_beat_rel: 0. },
+            ramp(In, Fader, Some(0.), 1., 0., 64., Curve::Linear),
+            PlanItem::Swap { band: Low, at_beat_rel: 64. },
+            ramp(Out, Filter, Some(0.), -0.6, 64., 128., Curve::Smooth),
+            ramp(Out, Control::Fader, Some(1.), 0., 64., 128., Curve::Linear),
+            PlanItem::Pause { deck: Out, at_beat_rel: 128. },
+        ]
+    );
+    // the outgoing deck stops at the very end: nothing later to re-time
+    assert!(p.in_clock.is_none());
+}
+
+#[test]
+fn bassswap_compiles_to_the_expected_plan() {
+    use Control::*;
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "bassswap", ""));
+    assert_eq!(p.length_beats, 64.);
+    assert_eq!(
+        p.items,
+        vec![
+            PlanItem::Play { from_beat: SMK0, synced: true, at_beat_rel: 0. },
+            PlanItem::Set { deck: In, control: Low, value: -1., at_beat_rel: 0. },
+            ramp(In, Fader, Some(0.), 1., 0., 8., Curve::Linear), // full volume within 2 bars
+            PlanItem::Swap { band: Low, at_beat_rel: 32. },       // bar 8 of 16
+            ramp(Out, Filter, Some(0.), -0.5, 48., 64., Curve::Smooth),
+            ramp(Out, Control::Fader, Some(1.), 0., 48., 64., Curve::Linear),
+            PlanItem::Pause { deck: Out, at_beat_rel: 64. },
+        ]
+    );
+}
+
+#[test]
+fn echo_out_loops_shrink_then_the_new_track_enters() {
+    use Control::*;
+    use Deck::*;
+    let aft0 = 512.; // the mix starts on aft bar 129
+    let tail = |enter: f64| {
+        vec![
+            PlanItem::Play { from_beat: SMK0, synced: true, at_beat_rel: 0. },
+            PlanItem::Set { deck: In, control: Control::Fader, value: 0., at_beat_rel: 0. },
+            // bar 5 of 8: loop 4 beats (it starts where the deck is, the next loops keep that start)
+            PlanItem::Loop { deck: Out, start_beat: aft0 + 20., beats: 4., at_beat_rel: 20. },
+            ramp(Out, Filter, Some(0.), 0.8, 20., 30., Curve::Exp),
+            ramp(Out, Control::Fader, Some(1.), 0., 24., 30., Curve::Linear),
+            PlanItem::Loop { deck: Out, start_beat: aft0 + 20., beats: 2., at_beat_rel: 28. },
+            PlanItem::Loop { deck: Out, start_beat: aft0 + 20., beats: 1., at_beat_rel: 30. },
+            PlanItem::LoopOff { deck: Out, at_beat_rel: 31. },
+            PlanItem::Pause { deck: Out, at_beat_rel: 32. },
+            PlanItem::Jump { deck: In, to_beat: enter, at_beat_rel: 32. },
+            PlanItem::Set { deck: In, control: Control::Fader, value: 1., at_beat_rel: 32. },
+        ]
+    };
+    // no `drop` cue on smk: back to its first downbeat (it has run silently for 32 beats)
+    let p = plan_of(&recipe_mix(HEAD, "echo-out", ""));
+    assert_eq!(p.length_beats, 32.);
+    assert_eq!(p.items, tail(SMK0));
+    // from the first loop on, the incoming deck keeps the time
+    assert_eq!(p.in_clock.as_ref().unwrap().after, 20.);
+    // with one: bar 17 is beat 2 + 64
+    let p = plan_of(&recipe_mix(HEAD_DROP, "echo-out", ""));
+    assert_eq!(p.items, tail(SMK0 + 64.));
+}
+
+#[test]
+fn cut_starts_and_stops_on_the_same_beat() {
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "cut", ""));
+    assert_eq!(p.length_beats, 4.);
+    assert_eq!(
+        p.items,
+        vec![
+            PlanItem::Play { from_beat: SMK0, synced: true, at_beat_rel: 0. },
+            PlanItem::Set { deck: In, control: Control::Fader, value: 1., at_beat_rel: 0. },
+            PlanItem::Pause { deck: Out, at_beat_rel: 0. },
+        ]
+    );
+    // the outgoing clock stops at once; the one bar of the mix is counted on the incoming deck
+    assert_eq!(p.in_clock.unwrap().after, 0.);
+}
+
+#[test]
+fn filter_blend_crosses_the_filters_and_the_faders() {
+    use Control::*;
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "filter-blend", ""));
+    assert_eq!(p.length_beats, 64.);
+    assert_eq!(
+        p.items,
+        vec![
+            PlanItem::Play { from_beat: SMK0, synced: true, at_beat_rel: 0. },
+            ramp(In, Filter, Some(0.7), 0., 0., 64., Curve::Smooth),
+            ramp(Out, Filter, Some(0.), -0.7, 0., 64., Curve::Smooth),
+            ramp(In, Fader, Some(0.), 1., 0., 64., Curve::Linear),
+            ramp(Out, Control::Fader, Some(1.), 0., 0., 64., Curve::Linear),
+            PlanItem::Pause { deck: Out, at_beat_rel: 64. },
+        ]
+    );
+}
+
+#[test]
+fn the_header_forms_and_their_errors() {
+    // the length is optional with a recipe, required without
+    assert!(run(&recipe_mix(HEAD, "blend", "")).diags.is_empty());
+    assert!(run(&recipe_mix(HEAD, "blend over 16 bars", "")).diags.is_empty());
+    let e = errors(&format!("{HEAD}mix aft -> smk at aft.outro\n"));
+    assert_eq!(e, ["9:28: expected `over <n> bars` or `recipe <name>`, found end of line"]);
+    let e = errors(&recipe_mix(HEAD, "", ""));
+    assert_eq!(e, ["9:35: expected a recipe name after `recipe`, found end of line"]);
+    let e = errors(&recipe_mix(HEAD, "blnd", ""));
+    assert_eq!(e, ["9:36: unknown recipe \"blnd\" (recipes: blend, bassswap, echo-out, cut, filter-blend)"]);
+    let e = errors(&recipe_mix(HEAD, "blend over 16", ""));
+    assert!(e[0].contains("expected `bars` after `over 16`"), "{e:?}");
+    // `at bar` works as well
+    let l = run(&format!("{HEAD}mix aft -> smk at bar 129 recipe cut\n"));
+    assert!(l.diags.is_empty(), "{:?}", l.diags);
+}
+
+#[test]
+fn a_length_override_scales_the_recipe_and_minimums_apply() {
+    use Control::*;
+    use Deck::*;
+    // blend over 16 bars: the swap at bar 8
+    let items = items_of(HEAD, "blend over 16 bars", "");
+    assert!(items.contains(&PlanItem::Swap { band: Low, at_beat_rel: 32. }));
+    assert!(items.contains(&PlanItem::Pause { deck: Out, at_beat_rel: 64. }));
+    assert!(items.contains(&ramp(In, Fader, Some(0.), 1., 0., 32., Curve::Linear)));
+    // the shortest blend is 8 bars
+    let items = items_of(HEAD, "blend over 8 bars", "");
+    assert!(items.contains(&PlanItem::Swap { band: Low, at_beat_rel: 16. }));
+    let e = errors(&recipe_mix(HEAD, "blend over 7 bars", ""));
+    assert_eq!(e, ["9:47: recipe blend needs at least 8 bars (got 7)"]);
+    for (name, min) in [("bassswap", 4), ("echo-out", 4), ("cut", 1), ("filter-blend", 8)] {
+        let ok = errors(&recipe_mix(HEAD, &format!("{name} over {min} bars"), ""));
+        assert!(ok.is_empty(), "{name} at its minimum: {ok:?}");
+        if min > 1 {
+            let bad = errors(&recipe_mix(HEAD, &format!("{name} over {} bars", min - 1), ""));
+            assert_eq!(bad.len(), 1, "{name}: {bad:?}");
+            assert!(bad[0].contains(&format!("recipe {name} needs at least {min} bars")), "{bad:?}");
+        }
+    }
+    let e = errors(&recipe_mix(HEAD, "cut over 0 bars", ""));
+    assert!(e[0].contains("above 0"), "{e:?}");
+    // the longer the mix the later the echo: echo-out over 12 bars loops from bar 9
+    let items = items_of(HEAD, "echo-out over 12 bars", "");
+    assert!(items.iter().any(|i| matches!(i, PlanItem::Loop { at_beat_rel, beats, .. } if *at_beat_rel == 36. && *beats == 4.)));
+    // every recipe's own mix stays valid at lengths that are not multiples of anything
+    for r in recipes::RECIPES {
+        for bars in [r.min_bars, r.min_bars + 1, r.default_bars + 3, 100] {
+            let e = errors(&recipe_mix(HEAD, &format!("{} over {bars} bars", r.name), ""));
+            assert!(e.is_empty(), "{} over {bars}: {e:?}", r.name);
+        }
+    }
+}
+
+#[test]
+fn a_block_line_replaces_the_recipe_items_for_its_control() {
+    use Control::*;
+    use Deck::*;
+    let base = items_of(HEAD, "blend", "");
+    // smk.fader over the first 8 bars instead: the recipe's smk fader ramp goes, nothing else
+    let items = items_of(HEAD, "blend", "  bars 0..8 smk.fader 0 -> 1\n");
+    let fader_in = |i: &PlanItem| matches!(i, PlanItem::Ramp { deck: In, control: Fader, .. });
+    assert_eq!(base.iter().filter(|i| fader_in(i)).count(), 1);
+    assert_eq!(items.iter().filter(|i| fader_in(i)).count(), 1);
+    assert!(items.contains(&ramp(In, Fader, Some(0.), 1., 0., 32., Curve::Linear)));
+    assert!(!items.contains(&ramp(In, Fader, Some(0.), 1., 0., 64., Curve::Linear)));
+    assert_eq!(items.len(), base.len());
+    for it in &base {
+        if !fader_in(it) {
+            assert!(items.contains(it), "lost {it:?}");
+        }
+    }
+    // a different time does not save the recipe's item: the control is what counts
+    let items = items_of(HEAD, "blend", "  bar 30 smk.fader = 1\n");
+    assert!(!items.iter().any(|i| matches!(i, PlanItem::Ramp { deck: In, control: Fader, .. })));
+    assert!(items.contains(&PlanItem::Set { deck: In, control: Fader, value: 1., at_beat_rel: 120. }));
+    // the swap is its own item: moving it keeps the kill of the incoming bass
+    let items = items_of(HEAD, "blend", "  bar 20 swap low\n");
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Swap { .. })).count(), 1);
+    assert!(items.contains(&PlanItem::Swap { band: Low, at_beat_rel: 80. }));
+    assert!(items.contains(&PlanItem::Set { deck: In, control: Low, value: -1., at_beat_rel: 0. }));
+    // the other band is not the recipe's swap
+    let items = items_of(HEAD, "blend", "  bar 20 swap mid\n");
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Swap { .. })).count(), 2);
+    // `stop` moves the stop; both decks' own lines stay apart
+    let items = items_of(HEAD, "blend", "  bar 30 aft stop\n");
+    let stops: Vec<_> = items.iter().filter(|i| matches!(i, PlanItem::Pause { .. })).collect();
+    assert_eq!(stops, [&PlanItem::Pause { deck: Out, at_beat_rel: 120. }]);
+    // the recipe's items come first at the same time, the block's after them
+    let items = items_of(HEAD, "blend", "  bar 0 smk.mid = -0.5\n");
+    let at0: Vec<_> = items.iter().filter(|i| i.start_beat_rel() == 0.).collect();
+    assert_eq!(at0.last().unwrap(), &&PlanItem::Set { deck: In, control: Mid, value: -0.5, at_beat_rel: 0. });
+    // a `play` line replaces the recipe's, a second one is still an error
+    let items = items_of(HEAD, "blend", "  smk play from intro unsynced\n");
+    assert_eq!(items[0], PlanItem::Play { from_beat: SMK0 + 8., synced: false, at_beat_rel: 0. });
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Play { .. })).count(), 1);
+    let e = errors(&recipe_mix(HEAD, "blend", "  smk play\n  smk play\n"));
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("a second `play`"), "{e:?}");
+    // errors in the block's lines are reported at the block's lines
+    let e = errors(&recipe_mix(HEAD, "blend", "  bar 40 aft stop\n"));
+    assert_eq!(e, ["10:7: bar 40 is outside the mix (0..32 bars)"]);
+    // the crossfader is one control
+    let items = items_of(HEAD, "filter-blend", "  bars 0..16 xfade -1 -> 1\n");
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Ramp { control: Control::Crossfader, .. })).count(), 1);
+}
+
+#[test]
+fn off_phrase_recipe_mixes_get_a_warning_not_an_error() {
+    let warn = |src: &str| {
+        let l = run(src);
+        assert!(l.diags.is_empty(), "{:?}", l.diags);
+        assert!(l.compiled.is_some());
+        l.warnings.iter().map(|d| format!("{}:{}: {}", d.line, d.col, d.msg)).collect::<Vec<_>>()
+    };
+    let mix_at = |at: &str| format!("{HEAD}mix aft -> smk at {at} recipe blend\n");
+    assert!(warn(&mix_at("bar 33")).is_empty());
+    assert!(warn(&mix_at("bar 1")).is_empty());
+    assert!(warn(&mix_at("aft.outro")).is_empty()); // bar 129
+    assert_eq!(
+        warn(&mix_at("bar 37")),
+        ["9:23: recipe blend starts at bar 37: mixes usually start on a phrase (bar 33 or 41)"]
+    );
+    assert_eq!(
+        warn(&mix_at("bar 33 beat 3")),
+        ["9:23: recipe blend starts at bar 33 beat 3: mixes usually start on a phrase (bar 33 or 41)"]
+    );
+    // a cue off the grid warns at the track name of `at`
+    let src = format!("track aft \"Pneumatix - Aftertekno.flac\"\n  cue x bar 22\ntrack smk \"Smokin\"\nmix aft -> smk at aft.x recipe cut\n");
+    assert_eq!(warn(&src), ["4:19: recipe cut starts at bar 22: mixes usually start on a phrase (bar 17 or 25)"]);
+    // only recipes are held to it, and the warning does not touch the errors
+    assert!(warn(&format!("{HEAD}mix aft -> smk at bar 37 over 8 bars\n")).is_empty());
+    assert!(warn(&mix_at("bar 37")).len() == 1 && run(&mix_at("bar 37")).diags.is_empty());
+}
+
+#[test]
+fn the_expanded_text_compiles_back_to_the_same_plan() {
+    for r in recipes::RECIPES {
+        for (head, drop) in [(HEAD, false), (HEAD_DROP, true)] {
+            for bars in [0, r.min_bars, r.default_bars + 5] {
+                let ctx = recipes::Ctx { a: "aft", b: "smk", b_has_drop: drop, beats_per_bar: 4. };
+                let text = recipes::expand(r.name, "aft", "smk", bars, &ctx).unwrap();
+                let n = if bars == 0 { r.default_bars } else { bars };
+                // the text starts at bar 1; the recipe form is put at the same place
+                let want = plan_of(&format!("{head}mix aft -> smk at bar 1 recipe {} over {n} bars\n", r.name));
+                let got = plan_of(&format!("{head}{text}"));
+                assert_eq!(got, want, "{} over {n} (drop {drop})\n{text}", r.name);
+                // it is a block the editor can show: a header comment, one comment per group
+                assert!(text.starts_with(&format!("# {}: {}\n", r.name, r.explain)), "{text}");
+                assert!(text.contains("\n  # "), "{text}");
+                assert!(text.lines().all(|l| l.is_empty() || l.starts_with('#') || l.starts_with("mix ") || l.starts_with("  ")));
+            }
+        }
+    }
+    let ctx = recipes::Ctx { a: "a", b: "b", b_has_drop: false, beats_per_bar: 4. };
+    assert!(recipes::expand("nope", "a", "b", 0, &ctx).unwrap_err().contains("unknown recipe"));
+    assert_eq!(recipes::expand("blend", "a", "b", 4, &ctx).unwrap_err(), "recipe blend needs at least 8 bars (got 4)");
+    // a drop cue is used when the incoming track has one
+    let with = recipes::expand("echo-out", "a", "b", 8, &recipes::Ctx { b_has_drop: true, ..ctx }).unwrap();
+    assert!(with.contains("b jump drop") && !with.contains("jump -"), "{with}");
+    let without = recipes::expand("echo-out", "a", "b", 8, &ctx).unwrap();
+    assert!(without.contains("b jump -32 beats"), "{without}");
+}
+
+#[test]
+fn recipes_are_described_for_a_beginner() {
+    assert_eq!(recipes::RECIPES.map(|r| (r.name, r.default_bars)), [
+        ("blend", 32),
+        ("bassswap", 16),
+        ("echo-out", 8),
+        ("cut", 1),
+        ("filter-blend", 16),
+    ]);
+    for r in recipes::RECIPES {
+        assert!(!r.explain.contains('\n') && r.explain.ends_with('.'), "{}", r.name);
+        assert!(r.min_bars >= 1 && r.min_bars <= r.default_bars);
+    }
+    assert_eq!(recipes::find("blend").unwrap().explain, "A long, smooth overlap: never two basslines at once.");
+    assert!(recipes::find("cut").unwrap().explain.starts_with("Hard cut"));
+}
+
+#[test]
+fn the_recipes_example_loads_without_warnings() {
+    let mut env = FakeEnv { root: "/music".into(), ..Default::default() };
+    env.add("Pneumatix", "Aftertekno", "pn/aftertekno.flac", Some(grid(124., 0.1, 0)));
+    env.add("Aasi & Swooh", "Smokin", "smokin.flac", Some(grid(126., 0.2, 1)));
+    env.add("Kaiku", "Noita", "noita.flac", Some(grid(132., 0.3, 0)));
+    env.add("Sirkka", "Pakkanen", "pakkanen.flac", Some(grid(128., 0.1, 0)));
+    env.add("Tuuli", "Myrsky", "myrsky.flac", Some(grid(130., 0.1, 0)));
+    let l = load(Path::new("recipes.codj"), include_str!("../../examples/sets/recipes.codj"), &env);
+    assert!(l.diags.is_empty(), "{:#?}", l.diags);
+    assert!(l.warnings.is_empty(), "{:#?}", l.warnings);
+    assert_eq!(l.compiled.unwrap().plans.len(), 5);
 }

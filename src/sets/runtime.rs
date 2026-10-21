@@ -623,12 +623,15 @@ impl Runtime {
         }
         let Some(mb) = Self::mix_beat(h, a) else { return };
         let (len, was_started) = (a.plan.length_beats, a.started);
-        if !was_started && mb >= 0. && out.playing {
+        // a mix whose outgoing deck stops early (a cut) can be over before the first look at it:
+        // then the incoming deck, playing, shows it has started
+        let going = out.playing || (a.plan.in_clock.is_some() && inn.playing);
+        if !was_started && mb >= 0. && going {
             if let Some(a) = &mut self.armed {
                 a.started = true;
             }
         }
-        let started = was_started || (mb >= 0. && out.playing);
+        let started = was_started || (mb >= 0. && going);
         if started && mb >= len {
             self.finished(h);
         }

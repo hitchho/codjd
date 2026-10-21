@@ -11,6 +11,7 @@ pub mod edit;
 pub mod lexer;
 pub mod model;
 pub mod parser;
+pub mod recipes;
 pub mod record;
 pub mod resolve;
 pub mod live;
@@ -42,6 +43,9 @@ pub struct Loaded {
     /// None if there are any errors
     pub compiled: Option<Compiled>,
     pub diags: Vec<Diag>,
+    /// things that work but are probably not what was meant (a recipe off the phrase grid);
+    /// empty when the syntax has errors, they are only looked for in a file that parses
+    pub warnings: Vec<Diag>,
 }
 
 /// Parse, resolve and compile `src`, the text of `file`
@@ -55,17 +59,19 @@ pub fn load(file: &Path, src: &str, env: &dyn Env) -> Loaded {
     // names and ranges are only checked once the syntax is right, so a half-typed line doesn't
     // bring a pile of follow-up errors
     if !diags.is_empty() {
-        return Loaded { name: declared.unwrap_or(stem), compiled: None, diags };
+        return Loaded { name: declared.unwrap_or(stem), compiled: None, diags, warnings: vec![] };
     }
-    let (set, more) = resolve::resolve(file, &ast, env);
+    let (set, more, mut warnings) = resolve::resolve(file, &ast, env);
     diags.extend(more);
     diags.sort_by_key(|d| (d.line, d.col));
     let name = declared.unwrap_or(stem);
     if !diags.is_empty() {
-        return Loaded { name, compiled: None, diags };
+        warnings.sort_by_key(|d| (d.line, d.col));
+        return Loaded { name, compiled: None, diags, warnings };
     }
     let plans = compile(&set);
-    Loaded { name, compiled: Some(Compiled { set, plans }), diags }
+    warnings.sort_by_key(|d| (d.line, d.col));
+    Loaded { name, compiled: Some(Compiled { set, plans }), diags, warnings }
 }
 
 #[cfg(test)]

@@ -1,0 +1,47 @@
+# one of each transition recipe, in a chain of five tracks
+# A recipe is a ready-made transition: `mix a -> b at <where> recipe <name>`. The lines under it
+# (optional) are applied on top: a line that touches a control replaces the recipe's items for
+# that control, everything else of the recipe stays. Mixes should start on a phrase: bar 1, 9,
+# 17, 25 ... (every 8 bars); codjd warns if they don't (SetWarnings).
+# To see what a recipe does, expand it into a commented mix block you can edit: SetRecipeText.
+set "recipes: five ways to change tracks"
+
+track warm "Pneumatix - Aftertekno"
+  cue outro bar 113
+
+track mid "Aasi & Swooh - Smokin"
+  cue drop  bar 17
+  cue outro bar 97
+
+track peak "Kaiku - Noita"
+  cue drop  bar 9
+  cue outro bar 81
+
+track lull "Sirkka - Pakkanen"
+  cue drop  bar 9
+  cue outro bar 65
+
+track last "Tuuli - Myrsky"
+  cue outro bar 33
+
+# blend (32 bars): a long, smooth overlap, never two basslines at once.
+# The new track comes in with its bass out, the bass swaps in the middle, the old track fades away.
+mix warm -> mid at warm.outro recipe blend
+
+# bassswap (16 bars): a shorter overlap, the bass changes hands on one beat in the middle.
+# The two lines below are ours: the new track starts from its drop, and the old one is muffled
+# harder than the recipe does it (our filter line replaces the recipe's filter on `mid`).
+mix mid -> peak at mid.outro recipe bassswap
+  peak play from drop
+  bars 12..16 mid.filter 0 -> -0.9 smooth
+
+# echo-out (8 bars): the old track loops its last beats, 4 then 2 then 1, getting thinner, and
+# the new one hits on its drop. (There is no echo effect yet: this is a loop, a high-pass sweep
+# and a fade.) `over 12 bars` makes the build-up longer.
+mix peak -> lull at peak.outro recipe echo-out over 12 bars
+
+# filter-blend (16 bars): the old track gets muffled while the new one opens up from thin to full.
+mix lull -> last at lull.outro recipe filter-blend over 8 bars
+
+# cut (1 bar): a hard cut, works when the new track starts with a big drop.
+mix last -> warm at last.outro recipe cut

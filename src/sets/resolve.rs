@@ -8,6 +8,7 @@ use crate::{analysis::Grid, gridfix};
 use super::{
     lexer::Diag,
     model::*,
+    recipes,
     parser::{self, fmt_num, CtlOp, File, ItemKind, MixAt, MixLine, PlayFrom, PosAst, Sp, Stmt, TrackLine, XfadeOp},
 };
 
@@ -43,8 +44,9 @@ const SCALE: (f64, f64) = (0.2, 5.);
 
 /// Never fails: the set is built from whatever was valid and the caller discards it if `Diag`s
 /// came back
-pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>) {
+pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>, Vec<Diag>) {
     let mut diags = Vec::new();
+    let mut warnings = Vec::new();
     let mut name: Option<String> = None;
     let mut tracks: Vec<Track> = Vec::new();
     let mut mixes = Vec::new();
@@ -71,7 +73,7 @@ pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>) {
     // mixes after all tracks, so they may be written anywhere
     for stmt in &ast.stmts {
         if let Stmt::Mix(m) = stmt {
-            if let Some(mix) = resolve_mix(m, &tracks, &mut diags) {
+            if let Some(mix) = resolve_mix(m, &tracks, &mut diags, &mut warnings) {
                 mixes.push(mix);
             }
         }
@@ -79,7 +81,7 @@ pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>) {
     let name = name.unwrap_or_else(|| {
         path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     });
-    (Set { name, file: path.to_path_buf(), tracks, mixes }, diags)
+    (Set { name, file: path.to_path_buf(), tracks, mixes }, diags, warnings)
 }
 
 // ---- tracks ----
@@ -336,7 +338,7 @@ fn list(names: impl Iterator<Item = String>) -> String {
     }
 }
 
-fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>) -> Option<Mix> {
+fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>, warnings: &mut Vec<Diag>) -> Option<Mix> {
     let ids = || list(tracks.iter().map(|t| t.id.clone()));
     let find = |id: &Sp<String>, diags: &mut Vec<Diag>| {
         let r = tracks.iter().find(|t| t.id == id.v);
@@ -365,11 +367,34 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>) -> O
     if missing {
         return None;
     }
-    if m.over.v <= 0. {
-        diags.push(m.over.diag("a mix needs a length above 0 bars"));
-        return None;
-    }
-    let length = m.over.v;
+    let recipe = match &m.recipe {
+        None => None,
+        Some(name) => match recipes::find(&name.v) {
+            Some(r) => Some(r),
+            None => {
+                diags.push(name.diag(format!("unknown recipe \"{}\" (recipes: {})", name.v, recipes::names())));
+                return None;
+            }
+        },
+    };
+    let length = match (&m.over, recipe) {
+        (Some(over), _) if over.v <= 0. => {
+            diags.push(over.diag("a mix needs a length above 0 bars"));
+            return None;
+        }
+        (Some(over), Some(r)) if over.v < r.min_bars as f64 => {
+            diags.push(over.diag(format!(
+                "recipe {} needs at least {} bars (got {})",
+                r.name,
+                r.min_bars,
+                fmt_num(over.v)
+            )));
+            return None;
+        }
+        (Some(over), _) => over.v,
+        (None, Some(r)) => r.default_bars as f64,
+        (None, None) => return None, // the parser asks for one of the two
+    };
 
     let check_pos = |t: &Track, p: &PosAst, diags: &mut Vec<Diag>| -> Option<f64> {
         let pos = pos_of(p);
@@ -420,11 +445,34 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>) -> O
         MixAt::Pos(p) => (MixStart::Pos(pos_of(p)), check_pos(a, p, diags)),
     };
 
-    // the incoming track
-    let mut play_from = b.beat_of(&Pos { bar: 1, beat: 1. });
+    // a recipe's lines come first, then the block's own (see `merge`)
+    let recipe_lines = match recipe {
+        None => vec![],
+        Some(r) => {
+            let ctx = recipes::Ctx {
+                a: &a.id,
+                b: &b.id,
+                b_has_drop: b.cue("drop").is_some(),
+                beats_per_bar: a.beats_per_bar().unwrap_or(4.),
+            };
+            let (lines, bad) = parser::parse_mix_lines(&recipes::lines(r, &ctx, length).join("\n"));
+            if let Some(d) = bad.first() {
+                // the recipe text is ours: this is a bug, not the user's mistake
+                diags.push(m.recipe.as_ref().unwrap().diag(format!("recipe {} can't be expanded: {}", r.name, d.msg)));
+                return None;
+            }
+            lines
+        }
+    };
+
+    // the incoming track: the block's `play` line replaces the recipe's
+    let default_from = b.beat_of(&Pos { bar: 1, beat: 1. });
+    let mut play_from = default_from;
     let mut synced = true;
+    let block_plays = m.lines.iter().any(|l| matches!(l, MixLine::Play(_)));
     let mut seen_play = false;
-    for line in &m.lines {
+    let plays = recipe_lines.iter().filter(|_| !block_plays).chain(m.lines.iter());
+    for line in plays {
         let MixLine::Play(p) = line else { continue };
         if seen_play {
             diags.push(p.track.diag("a second `play` line in this mix"));
@@ -454,25 +502,38 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>) -> O
     }
 
     // timeline
-    let mut items = Vec::new();
-    for line in &m.lines {
-        let MixLine::Timed(t) = line else { continue };
-        if !(0. ..=length).contains(&t.at.v) {
-            diags.push(t.at.diag(format!("bar {} is outside the mix (0..{} bars)", fmt_num(t.at.v), fmt_num(length))));
-            continue;
-        }
-        if let Some(e) = &t.end {
-            if e.v > length {
-                diags.push(e.diag(format!("bar {} is after the end of the mix ({} bars)", fmt_num(e.v), fmt_num(length))));
+    let timeline = |lines: &[MixLine], diags: &mut Vec<Diag>| {
+        let mut items = Vec::new();
+        for line in lines {
+            let MixLine::Timed(t) = line else { continue };
+            if !(0. ..=length).contains(&t.at.v) {
+                diags.push(t.at.diag(format!("bar {} is outside the mix (0..{} bars)", fmt_num(t.at.v), fmt_num(length))));
                 continue;
             }
-        }
-        for item in &t.items {
-            // a rejected item has pushed its diagnostic
-            if let Some((action, is_ramp)) = resolve_item(item, t, (a, b), diags) {
-                let end_bar = if is_ramp { t.end.as_ref().map(|e| e.v) } else { None };
-                items.push(MixItem { at_bar: t.at.v, end_bar, action });
+            if let Some(e) = &t.end {
+                if e.v > length {
+                    diags.push(e.diag(format!("bar {} is after the end of the mix ({} bars)", fmt_num(e.v), fmt_num(length))));
+                    continue;
+                }
             }
+            for item in &t.items {
+                // a rejected item has pushed its diagnostic
+                if let Some((action, is_ramp)) = resolve_item(item, t, (a, b), diags) {
+                    let end_bar = if is_ramp { t.end.as_ref().map(|e| e.v) } else { None };
+                    items.push(MixItem { at_bar: t.at.v, end_bar, action });
+                }
+            }
+        }
+        items
+    };
+    let from_recipe = timeline(&recipe_lines, &mut Vec::new());
+    let own = timeline(&m.lines, diags);
+    let items = merge(from_recipe, own);
+
+    // a recipe mix should start where a phrase starts
+    if let (Some(r), Some(start)) = (recipe, start_beat) {
+        if let Some(w) = phrase_warning(a, start, &m.at, r.name) {
+            warnings.push(w);
         }
     }
     let (start_beat, play_from) = (start_beat?, play_from?);
@@ -486,6 +547,65 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>) -> O
         synced,
         items,
     })
+}
+
+/// What an item changes, for the merge rule: a control of a deck, a band swap, or a kind of
+/// transport action (`stop`, loops, jumps) of a deck
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Touches {
+    Control(Deck, Control),
+    Swap(Control),
+    Stop(Deck),
+    Loop(Deck),
+    Jump(Deck),
+}
+
+fn touches(a: &Action) -> Touches {
+    match *a {
+        Action::Ramp { deck, control, .. } | Action::Set { deck, control, .. } => Touches::Control(deck, control),
+        Action::Swap { band } => Touches::Swap(band),
+        Action::Stop { deck } => Touches::Stop(deck),
+        Action::Loop { deck, .. } | Action::LoopHere { deck, .. } | Action::LoopOff { deck } => Touches::Loop(deck),
+        Action::JumpTo { deck, .. } | Action::JumpBy { deck, .. } => Touches::Jump(deck),
+    }
+}
+
+/// The merge rule of `mix ... recipe <name>` blocks: the recipe's items first, then the block's
+/// own; an own item removes every recipe item that touches the same thing (see [`Touches`]).
+/// Everything else of the recipe stays.
+pub fn merge(recipe: Vec<MixItem>, own: Vec<MixItem>) -> Vec<MixItem> {
+    let taken: Vec<Touches> = own.iter().map(|i| touches(&i.action)).collect();
+    let mut items: Vec<MixItem> = recipe.into_iter().filter(|i| !taken.contains(&touches(&i.action))).collect();
+    items.extend(own);
+    items
+}
+
+/// Phrases are 8 bars from bar 1 (bar 1, 9, 17, ...) and a mix should start on one, on the
+/// first beat. None if it does
+fn phrase_warning(a: &Track, start_beat: f64, at: &MixAt, recipe: &str) -> Option<Diag> {
+    let g = a.grid.as_ref()?;
+    let bpb = g.beats_per_bar as f64;
+    // bars after bar 1 beat 1
+    let bars = (start_beat - g.downbeat_offset as f64) / bpb;
+    if (bars / 8. - (bars / 8.).round()).abs() < 1e-6 {
+        return None;
+    }
+    let p = super::model::pos_of_beat(g, start_beat)?;
+    let (line, col) = match at {
+        MixAt::Pos(p) => (p.bar.line, p.bar.col),
+        MixAt::Cue { track, .. } => (track.line, track.col),
+    };
+    let lo = 1. + 8. * (bars / 8.).floor();
+    let shown = if (p.beat - 1.).abs() < 1e-6 { format!("bar {}", p.bar) } else { format!("bar {} beat {}", p.bar, fmt_num(p.beat)) };
+    Some(Diag::new(
+        line,
+        col,
+        format!(
+            "recipe {recipe} starts at {shown}: mixes usually start on a phrase (bar {} or {})",
+            fmt_num(lo),
+            fmt_num(lo + 8.)
+        ),
+    ))
 }
 
 /// the action and whether it is a ramp (takes the line's end bar)

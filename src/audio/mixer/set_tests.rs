@@ -236,3 +236,60 @@ fn items_after_the_outgoing_deck_loops_run_on_the_incoming_clock() {
     assert!(h.r.d(0).loop_.is_none());
     assert!(finished, "the mix never finished");
 }
+
+#[test]
+fn every_recipe_runs_to_its_end_through_the_mixer() {
+    // each recipe at its shortest length, rendered frame by frame: the old track ends up stopped
+    // (and out of any loop), the new one playing at full volume, and the mix is over
+    for (recipe, bars) in [("blend", 8), ("bassswap", 4), ("echo-out", 4), ("cut", 1), ("filter-blend", 8)] {
+        let mut env = FakeEnv { root: "/m".into(), ..Default::default() };
+        let (a, b) = (env.add("A", "a", "a.flac", Some(grid(120., 0.1, 0))), env.add("B", "b", "b.flac", Some(grid(126., 0.3, 0))));
+        let src = format!(
+            "track a \"a.flac\"\n  cue x bar 2\ntrack b \"b.flac\"\n  cue drop bar 5\nmix a -> b at a.x recipe {recipe} over {bars} bars\n"
+        );
+        let loaded = crate::sets::load(Path::new("/sets/r.codj"), &src, &env);
+        assert!(loaded.diags.is_empty(), "{recipe}: {:?}", loaded.diags);
+        let compiled = Arc::new(loaded.compiled.unwrap());
+        let ga = compiled.set.track("a").unwrap().grid.clone().unwrap();
+        let start = compiled.plans[0].start_beat;
+
+        let mut h = RigHost {
+            r: Rig::new(SR),
+            tracks: HashMap::from([(a.clone(), silence(TR, 60.)), (b.clone(), silence(TR, 60.))]),
+            paths: [None, None],
+            grids: [None, None],
+        };
+        let mut rt = Runtime::default();
+        rt.activate("/sets/r.codj".into(), compiled);
+        h.load(0, &a, ga.first_beat_s + (start - 2.) * 0.5, Some(&ga), None).unwrap();
+        h.play(0).unwrap();
+        rt.arm(&mut h, 0).unwrap();
+        let mut finished = false;
+        for n in 0..400_000 {
+            h.r.m.next();
+            if n % 800 == 0 {
+                rt.tick(&mut h);
+                if n > 0 && h.r.d(1).running() && rt.state(&mut h).armed == -1 {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        assert!(finished, "{recipe}: the mix never finished");
+        // let the last items land
+        for _ in 0..4000 {
+            h.r.m.next();
+        }
+        if recipe == "echo-out" {
+            // the drop (bar 5 = grid beat 16) lands as the echo ends: b is just past it
+            let d = h.r.d(1);
+            let at = d.grid.unwrap().beats_at(d.last_pos);
+            assert!((16. ..19.).contains(&at), "echo-out: the new track is at beat {at}, not on its drop");
+        }
+        assert!(!h.r.d(0).running(), "{recipe}: the old track is still playing");
+        assert!(h.r.d(0).loop_.is_none(), "{recipe}: the old track is stuck in a loop");
+        assert!(h.r.d(1).running(), "{recipe}: the new track stopped");
+        assert_eq!(h.r.m.control_value(1, Control::Fader), 1., "{recipe}: the new track is not at full volume");
+        assert_eq!(h.r.m.control_value(1, Control::Low), 0., "{recipe}: the new bass is still out");
+    }
+}

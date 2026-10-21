@@ -101,7 +101,10 @@ pub struct MixAst {
     pub from: Sp<String>,
     pub to: Sp<String>,
     pub at: MixAt,
-    pub over: Sp<f64>,
+    /// `recipe <name>`: lines from the recipe come before the block's own
+    pub recipe: Option<Sp<String>>,
+    /// `over <n> bars`; only a recipe mix may leave it out (the recipe's default)
+    pub over: Option<Sp<f64>>,
     pub lines: Vec<MixLine>,
 }
 
@@ -568,14 +571,37 @@ fn mix_header(c: &mut Cur) -> Result<MixAst, Diag> {
             )))
         }
     };
-    if !c.eat_ident("over") {
-        return Err(c.err_here(format!("expected `over <n> bars`, found {}", c.describe())));
+    let recipe = if c.eat_ident("recipe") {
+        Some(c.ident("a recipe name after `recipe`")?)
+    } else {
+        None
+    };
+    let over = if c.eat_ident("over") {
+        let over = c.number("the mix length in bars")?;
+        if !(c.eat_ident("bars") || c.eat_ident("bar")) {
+            return Err(c.err_here(format!("expected `bars` after `over {}`, found {}", fmt_num(over.v), c.describe())));
+        }
+        Some(over)
+    } else if recipe.is_some() {
+        None
+    } else {
+        return Err(c.err_here(format!("expected `over <n> bars` or `recipe <name>`, found {}", c.describe())));
+    };
+    Ok(MixAst { from, to, at, recipe, over, lines: vec![] })
+}
+
+/// The lines of a mix block written as text (a recipe's), parsed like the lines of a file
+pub fn parse_mix_lines(src: &str) -> (Vec<MixLine>, Vec<Diag>) {
+    let (lines, mut diags) = lex(src);
+    let mut out = Vec::new();
+    for line in lines.iter().filter(|l| !l.bad && !l.toks.is_empty()) {
+        let mut c = Cur { line, pos: 0 };
+        match mix_line(&mut c, &mut diags) {
+            Ok(l) => out.push(l),
+            Err(d) => diags.push(d),
+        }
     }
-    let over = c.number("the mix length in bars")?;
-    if !(c.eat_ident("bars") || c.eat_ident("bar")) {
-        return Err(c.err_here(format!("expected `bars` after `over {}`, found {}", fmt_num(over.v), c.describe())));
-    }
-    Ok(MixAst { from, to, at, over, lines: vec![] })
+    (out, diags)
 }
 
 /// item errors of a timed line go to `diags`; the line keeps the items that parsed
@@ -825,7 +851,7 @@ mix aft -> smk at aft.outro over 32 bars
         assert_eq!(g.v.first_beat_s.as_ref().unwrap().v, 0.012);
         assert_eq!(g.v.beat1.as_ref().unwrap().v, 1.);
         let Stmt::Mix(m) = &f.stmts[3] else { panic!() };
-        assert_eq!((m.from.v.as_str(), m.to.v.as_str(), m.over.v), ("aft", "smk", 32.));
+        assert_eq!((m.from.v.as_str(), m.to.v.as_str(), m.over.as_ref().unwrap().v), ("aft", "smk", 32.));
         assert!(matches!(&m.at, MixAt::Cue { track, name } if track.v == "aft" && name.v == "outro"));
         assert_eq!(m.lines.len(), 5);
         let MixLine::Timed(t) = &m.lines[4] else { panic!() };
