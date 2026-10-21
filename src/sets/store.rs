@@ -26,6 +26,8 @@ struct Entry {
     good: Option<Arc<Compiled>>,
     /// `file:line:col: message` of the latest version; empty if it loaded
     errors: Vec<String>,
+    /// `file:line:col: message` of the latest version; things that work but look unintended
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,15 +97,16 @@ impl Store {
         };
         let fname = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let env = Arc::clone(&self.env.read().unwrap());
-        let (name, compiled, errors) = match src {
+        let (name, compiled, errors, warnings) = match src {
             Ok(src) => {
                 let l = load(file, &src, &*env);
                 let errors = l.diags.iter().map(|d| d.format(&fname)).collect();
-                (l.name, l.compiled.map(Arc::new), errors)
+                let warnings = l.warnings.iter().map(|d| d.format(&fname)).collect();
+                (l.name, l.compiled.map(Arc::new), errors, warnings)
             }
             Err(e) => {
                 let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                (stem, None, vec![format!("{fname}:1:1: can't read the file: {e}")])
+                (stem, None, vec![format!("{fname}:1:1: can't read the file: {e}")], vec![])
             }
         };
         let mut sets = self.sets.lock().unwrap();
@@ -119,7 +122,7 @@ impl Store {
             (Some(g), false) => g.set.name.clone(),
             _ => name,
         };
-        sets.insert(file.to_path_buf(), Entry { name, good, errors });
+        sets.insert(file.to_path_buf(), Entry { name, good, errors, warnings });
     }
 
     /// The errors `text` would have as the contents of `file` (`file:line:col: message`, the
@@ -185,6 +188,12 @@ impl Store {
         Self::find(&sets, name).map(|(_, e)| e.errors.clone()).unwrap_or_default()
     }
 
+    /// The warnings of the latest version of a set's file (empty if none, or no such set)
+    pub fn warnings(&self, name: &str) -> Vec<String> {
+        let sets = self.sets.lock().unwrap();
+        Self::find(&sets, name).map(|(_, e)| e.warnings.clone()).unwrap_or_default()
+    }
+
     /// JSON: the file, the errors, and the active model with its compiled plans
     pub fn show(&self, name: &str) -> String {
         let sets = self.sets.lock().unwrap();
@@ -194,6 +203,7 @@ impl Store {
                 "name": e.name,
                 "file": file,
                 "errors": e.errors,
+                "warnings": e.warnings,
                 "active": e.good.as_deref(),
             }),
         };

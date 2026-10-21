@@ -496,6 +496,33 @@ impl Bus {
         self.sets.errors(&name)
     }
 
+    /// `file:line:col: message` for each warning of the latest save of a set: it works, but it
+    /// looks unintended (a recipe mix that starts off the phrase grid). Errors stay in `SetErrors`
+    async fn set_warnings(&self, name: String) -> Vec<String> {
+        self.sets.warnings(&name)
+    }
+
+    /// the transition recipes: (name, one-line explanation for a beginner, default bars)
+    async fn set_recipes(&self) -> Vec<(String, String, u32)> {
+        crate::sets::recipes::RECIPES.iter().map(|r| (r.name.to_string(), r.explain.to_string(), r.default_bars)).collect()
+    }
+
+    /// a recipe expanded into a commented `mix from -> to at bar 1 over <bars> bars` block, to
+    /// insert and edit; `bars` 0 = the recipe's default. If `to` is a track of the active set
+    /// with a cue `drop`, echo-out lands on it
+    async fn set_recipe_text(&self, recipe: String, from: String, to: String, bars: u32) -> zbus::fdo::Result<String> {
+        let file = self.codjd.call(|e| e.set_active_file()).await.flatten();
+        let active = file.and_then(|f| self.sets.entry(&f)).and_then(|(c, _)| c);
+        let track = |id: &str| active.as_ref().and_then(|c| c.set.track(id).cloned());
+        let ctx = crate::sets::recipes::Ctx {
+            a: &from,
+            b: &to,
+            b_has_drop: track(&to).is_some_and(|t| t.cue("drop").is_some()),
+            beats_per_bar: track(&from).and_then(|t| t.beats_per_bar()).unwrap_or(4.),
+        };
+        crate::sets::recipes::expand(&recipe, &from, &to, bars, &ctx).map_err(zbus::fdo::Error::Failed)
+    }
+
     /// JSON dump of a set: file, errors, the resolved model and the compiled mix plans
     async fn set_show(&self, name: String) -> String {
         self.sets.show(&name)
@@ -895,6 +922,15 @@ mod tests {
     #[test]
     fn set_list_signature_is_pinned() {
         assert_eq!(<Vec<(String, String, u32)> as Type>::SIGNATURE.to_string(), "a(ssu)");
+    }
+
+    #[test]
+    fn recipe_and_warning_signatures_are_pinned() {
+        // SetRecipes() -> a(ssu), SetWarnings(s) -> as, SetRecipeText(s recipe, s from, s to, u bars) -> s
+        assert_eq!(<Vec<(String, String, u32)> as Type>::SIGNATURE.to_string(), "a(ssu)");
+        assert_eq!(<Vec<String> as Type>::SIGNATURE.to_string(), "as");
+        assert_eq!(<String as Type>::SIGNATURE.to_string(), "s");
+        assert_eq!(<u32 as Type>::SIGNATURE.to_string(), "u");
     }
 
     #[test]
