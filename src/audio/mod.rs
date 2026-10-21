@@ -22,11 +22,13 @@ use tracing::warn;
 #[allow(unused_imports)] // AUTO_CAP is for the tests
 pub use auto::{AutoItem, AutoKind, Control, Curve, AUTO_CAP};
 pub use beat::{sync_plan, GridSpec};
-pub use mixer::{DeckState, Mode, DECKS};
+pub use mixer::{DeckState, Mode, SlotRtState, CHANNELS, DECKS};
 pub(crate) use mixer::{Drive, Smooth};
-use mixer::{Cmd, Mixer, RtEvent, Shared};
+use mixer::{Cmd, Garbage, Mixer, RtEvent, Shared};
 pub use output::list_devices;
 pub use track::Track;
+
+use crate::patch::{program::Program, SLOTS};
 
 /// `[audio]` in codjd's config
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -83,7 +85,7 @@ impl Audio {
         };
         let (cmds, cmd_rx) = rtrb::RingBuffer::new(1024);
         let (event_tx, mut events) = rtrb::RingBuffer::new(256);
-        let (garbage_tx, mut garbage) = rtrb::RingBuffer::<Arc<Track>>::new(256);
+        let (garbage_tx, mut garbage) = rtrb::RingBuffer::<Garbage>::new(256);
         let shared = Arc::new(Shared::default());
         let mixer_shared = Arc::clone(&shared);
         let mode = config.mode;
@@ -104,8 +106,8 @@ impl Audio {
                         }
                     }
                 }
-                while let Ok(track) = garbage.pop() {
-                    drop(track);
+                while let Ok(junk) = garbage.pop() {
+                    drop(junk);
                 }
                 if events.is_abandoned() && garbage.is_abandoned() {
                     return;
@@ -307,5 +309,70 @@ impl Audio {
             second_underruns: self.shared.second_underruns.load(Ordering::Relaxed),
             second_skips: self.shared.second_skips.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// The patch slots' side of [`Audio`]; the document layer drives these (they have no caller in
+/// the daemon until it lands)
+#[allow(dead_code)]
+impl Audio {
+    // ---- patch slots (docs/patches.md) ----
+
+    /// Loads a compiled program into `slot` (0..3): starts cue-only (headphones), fader 1, EQ,
+    /// filter and gain neutral; what the slot played before crossfades out over 10 ms. Knob and
+    /// pattern automation of the slot is dropped.
+    pub fn patch_load(&mut self, slot: usize, program: Program) {
+        self.send(Cmd::PatchLoad { slot, program: Box::new(program), swap: false, keep_live: false });
+    }
+
+    /// Replaces the program of `slot` after a structural edit: node state carries over for nodes
+    /// whose id and kind survived ([`Program::adopt_state`]) and the swap crossfades over 10 ms.
+    /// The slot's controls stay; with `keep_live` it also stays on the master, else it goes back
+    /// to headphones only. On an empty slot this is a fresh load.
+    pub fn patch_swap(&mut self, slot: usize, program: Program, keep_live: bool) {
+        self.send(Cmd::PatchLoad { slot, program: Box::new(program), swap: true, keep_live });
+    }
+
+    pub fn patch_unload(&mut self, slot: usize) {
+        self.send(Cmd::PatchUnload(slot));
+    }
+
+    /// Sets a knob (in the knob's own units, clamped to its range; smoothed over ~10 ms). A hand
+    /// on a knob ends the automation of it.
+    pub fn patch_knob(&mut self, slot: usize, knob: usize, value: f32) {
+        self.send(Cmd::AutoCancelControl(DECKS + slot, Control::Knob { slot, knob }));
+        self.send(Cmd::PatchKnob(slot, knob, value));
+    }
+
+    /// Edits one cell of a sequencer's pattern in place (`seq`: index in the patch's sequencer
+    /// list, `velocity` 0..1)
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_cell(&mut self, slot: usize, seq: usize, pattern: usize, step: u16, row: u8, on: bool, velocity: f32) {
+        self.send(Cmd::PatchCell { slot, seq, pattern, step, row, on, velocity });
+    }
+
+    /// Switches a sequencer to `pattern` (0..7) now, or at the next bar of its clock
+    pub fn patch_pattern(&mut self, slot: usize, seq: usize, pattern: usize, now: bool) {
+        self.send(Cmd::PatchPattern { slot, seq, pattern, now });
+    }
+
+    /// Sends the slot to the master (or the external output), or back to headphones only
+    pub fn patch_live(&mut self, slot: usize, live: bool) {
+        self.send(Cmd::PatchLive(slot, live));
+    }
+
+    /// Lets a slot that was muted for a CPU overrun run again
+    pub fn patch_unmute(&mut self, slot: usize) {
+        self.send(Cmd::PatchUnmute(slot));
+    }
+
+    /// External mode: the deck output (0 = A, 1 = B) the patch slots are summed into
+    pub fn set_patch_external_out(&mut self, deck: usize) {
+        self.send(Cmd::PatchExternal(deck));
+    }
+
+    /// What the audio thread knows of every patch slot
+    pub fn patch_slot_states(&self) -> Vec<SlotRtState> {
+        (0..SLOTS).map(|i| self.shared.slot_state(i)).collect()
     }
 }

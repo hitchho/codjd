@@ -21,8 +21,14 @@ use super::{
     eq::{band_gain, DeckFx},
     track::Track,
 };
+use crate::patch::{
+    program::{ClockFeed, DeckClock, Program, MAX_KNOBS, MAX_SEQS},
+    SLOTS,
+};
 
 pub const DECKS: usize = 2;
+/// Mixer channels with a strip (gain, EQ, filter, fader): the decks, then the patch slots
+pub const CHANNELS: usize = DECKS + SLOTS;
 
 /// Length of the crossfade at a jump or loop wrap (the contract allows up to 2 ms)
 const XFADE_SECS: f64 = 0.0015;
@@ -105,6 +111,38 @@ pub enum Cmd {
         seconds: f64,
         quantized: bool,
     },
+    // ---- patch slots ----
+    /// put a compiled program in a slot. `swap`: a structural recompile of what the slot holds
+    /// (state carries over, `keep_live` leaves the slot where it was); else a fresh load (cue-only,
+    /// controls back to neutral). Either way the old program crossfades out over 10 ms.
+    PatchLoad {
+        slot: usize,
+        program: Box<Program>,
+        swap: bool,
+        keep_live: bool,
+    },
+    PatchUnload(usize),
+    PatchKnob(usize, usize, f32),
+    PatchCell {
+        slot: usize,
+        seq: usize,
+        pattern: usize,
+        step: u16,
+        row: u8,
+        on: bool,
+        velocity: f32,
+    },
+    PatchPattern {
+        slot: usize,
+        seq: usize,
+        pattern: usize,
+        now: bool,
+    },
+    PatchLive(usize, bool),
+    /// clear a mute (a CPU overrun)
+    PatchUnmute(usize),
+    /// external mode: the deck output (0 = A, 1 = B) the patch slots are summed into
+    PatchExternal(usize),
 }
 
 impl Cmd {
@@ -131,8 +169,23 @@ impl Cmd {
             | Cmd::AutoCancelControl(d, _) => Some(*d),
             Cmd::Auto(_) | Cmd::AutoCancelGroup(_) => None,
             Cmd::Crossfader(_) | Cmd::Master(_) | Cmd::CueMix(_) | Cmd::Mode(_) | Cmd::Quantize(_) => None,
+            Cmd::PatchLoad { .. }
+            | Cmd::PatchUnload(_)
+            | Cmd::PatchKnob(..)
+            | Cmd::PatchCell { .. }
+            | Cmd::PatchPattern { .. }
+            | Cmd::PatchLive(..)
+            | Cmd::PatchUnmute(_)
+            | Cmd::PatchExternal(_) => None,
         }
     }
+}
+
+/// What the audio thread hands back to be freed elsewhere (it is only ever dropped)
+#[allow(dead_code)]
+pub enum Garbage {
+    Track(Arc<Track>),
+    Program(Box<Program>),
 }
 
 /// Something the audio thread reports
@@ -145,6 +198,7 @@ pub enum RtEvent {
 #[derive(Default)]
 pub struct Shared {
     pub decks: [DeckShared; DECKS],
+    pub patches: [PatchShared; SLOTS],
     /// sequence counter around [`Mixer::publish`]: odd while it writes, so a reader can tell
     /// when it has seen a mix of two callbacks and read again
     pub seq: AtomicU32,
@@ -198,6 +252,98 @@ impl Shared {
 
 fn bits(v: f64) -> AtomicU64 {
     AtomicU64::new(v.to_bits())
+}
+
+/// Why a patch slot is silent (published as a code)
+pub const MUTE_CPU: u32 = 1;
+
+/// One patch slot's published state. Floats are stored as bits.
+pub struct PatchShared {
+    pub loaded: AtomicBool,
+    pub live: AtomicBool,
+    pub cue: AtomicBool,
+    /// 0 = running, else a `MUTE_*` code
+    pub muted: AtomicU32,
+    /// share of the callback's time the program took, 0..1
+    pub cpu: AtomicU32,
+    /// fader, low, mid, high, filter, gain (dB) as control values
+    pub knobs: [AtomicU32; 6],
+    pub n_knobs: AtomicU32,
+    pub knob_values: [AtomicU32; MAX_KNOBS],
+    pub n_seqs: AtomicU32,
+    /// per sequencer: pattern, queued pattern (255 = none) and step packed as `pattern | queued << 8 | step << 16`
+    pub seqs: [AtomicU32; MAX_SEQS],
+}
+
+impl Default for PatchShared {
+    fn default() -> Self {
+        Self {
+            loaded: AtomicBool::new(false),
+            live: AtomicBool::new(false),
+            cue: AtomicBool::new(false),
+            muted: AtomicU32::new(0),
+            cpu: AtomicU32::new(0),
+            knobs: [1f32, 0., 0., 0., 0., 0.].map(|v| AtomicU32::new(v.to_bits())),
+            n_knobs: AtomicU32::new(0),
+            knob_values: std::array::from_fn(|_| AtomicU32::new(0)),
+            n_seqs: AtomicU32::new(0),
+            seqs: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+}
+
+/// A consistent-enough copy of a patch slot's published state
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlotRtState {
+    pub loaded: bool,
+    /// sent to the master (else headphones only)
+    pub live: bool,
+    /// share of the callback the program takes, 0..1
+    pub cpu: f32,
+    /// "" or why the slot is silent ("cpu overrun")
+    pub muted_reason: String,
+    /// current target value of every knob, in the patch's knob order
+    pub knobs: Vec<f32>,
+    /// per sequencer, in the patch's order: (pattern, queued pattern or `u32::MAX`, step)
+    pub sequencers: Vec<(u32, u32, u32)>,
+    pub fader: f32,
+    pub headphones: bool,
+    /// low, mid, high: -1..1
+    pub eq: [f32; 3],
+    pub filter: f32,
+    pub gain_db: f32,
+}
+
+impl Shared {
+    pub fn slot_state(&self, slot: usize) -> SlotRtState {
+        let Some(p) = self.patches.get(slot) else { return SlotRtState::default() };
+        let k = |i: usize| f32::from_bits(p.knobs[i].load(Ordering::Relaxed));
+        let n = (p.n_knobs.load(Ordering::Relaxed) as usize).min(MAX_KNOBS);
+        let q = (p.n_seqs.load(Ordering::Relaxed) as usize).min(MAX_SEQS);
+        SlotRtState {
+            loaded: p.loaded.load(Ordering::Relaxed),
+            live: p.live.load(Ordering::Relaxed),
+            cpu: f32::from_bits(p.cpu.load(Ordering::Relaxed)),
+            muted_reason: match p.muted.load(Ordering::Relaxed) {
+                0 => String::new(),
+                MUTE_CPU => "cpu overrun".into(),
+                _ => "muted".into(),
+            },
+            knobs: (0..n).map(|i| f32::from_bits(p.knob_values[i].load(Ordering::Relaxed))).collect(),
+            sequencers: (0..q)
+                .map(|i| {
+                    let w = p.seqs[i].load(Ordering::Relaxed);
+                    let queued = (w >> 8) & 0xff;
+                    (w & 0xff, if queued == 0xff { u32::MAX } else { queued }, w >> 16)
+                })
+                .collect(),
+            fader: k(0),
+            headphones: p.cue.load(Ordering::Relaxed),
+            eq: [k(1), k(2), k(3)],
+            filter: k(4),
+            gain_db: k(5),
+        }
+    }
 }
 
 /// One deck's published state. Floats are stored as bits.
@@ -850,6 +996,93 @@ pub struct Buses {
     pub decks: [(f32, f32); DECKS],
 }
 
+/// Frames a patch slot renders at a time: also how far ahead the decks' clocks are extrapolated
+/// (as lines, see [`ClockFeed`]) and the granularity of the time measurement
+const CHUNK: usize = 64;
+/// Crossfade from the old program to the new one after a recompile
+const PATCH_XFADE_SECS: f32 = 0.010;
+/// The slot limiter: transparent up to `LIMIT_KNEE`, a soft knee up to -1 dBFS
+const LIMIT_KNEE: f32 = 0.6;
+const LIMIT_CEIL: f32 = 0.891_25;
+/// A slot that takes more than this share of the callback's time ...
+const CPU_LIMIT: f64 = 0.25;
+/// ... this many callbacks in a row is muted
+const CPU_STRIKES: u32 = 8;
+
+#[inline]
+fn soft_limit(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.;
+    }
+    let a = x.abs();
+    if a <= LIMIT_KNEE {
+        return x;
+    }
+    let room = LIMIT_CEIL - LIMIT_KNEE;
+    let y = LIMIT_KNEE + room * ((a - LIMIT_KNEE) / room).tanh();
+    y.copysign(x)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: pretend every rendered block took this many nanoseconds
+    pub(super) static FAKE_PATCH_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A patch slot: a compiled program, rendered a block at a time, and its channel strip
+struct PatchSlot {
+    program: Option<Box<Program>>,
+    /// the previous program while it crossfades out
+    old: Option<Box<Program>>,
+    fade_pos: u32,
+    fade_len: u32,
+    buf: [(f32, f32); CHUNK],
+    old_buf: [(f32, f32); CHUNK],
+    /// next frame of `buf` to hand out; `CHUNK` = render a new block
+    pos: usize,
+    gain: Smooth,
+    fx: DeckFx,
+    fader: Smooth,
+    cue: bool,
+    /// on the master (or the external output); else headphones only
+    live: bool,
+    muted: Option<u32>,
+    /// program time per frame of the last block, and what has been used in this callback
+    per_frame_ns: f64,
+    ns_acc: f64,
+    strikes: u32,
+    cpu: f32,
+}
+
+impl PatchSlot {
+    fn new(rate: f64) -> Self {
+        Self {
+            program: None,
+            old: None,
+            fade_pos: 0,
+            fade_len: 0,
+            buf: [(0., 0.); CHUNK],
+            old_buf: [(0., 0.); CHUNK],
+            pos: CHUNK,
+            gain: Smooth::new(1.),
+            fx: DeckFx::new(rate),
+            fader: Smooth::new(1.),
+            cue: false,
+            live: false,
+            muted: None,
+            per_frame_ns: 0.,
+            ns_acc: 0.,
+            strikes: 0,
+            cpu: 0.,
+        }
+    }
+
+    #[inline]
+    fn needs_block(&self) -> bool {
+        self.program.is_some() && self.muted.is_none() && self.pos >= CHUNK
+    }
+}
+
 pub struct Mixer {
     decks: [Deck; DECKS],
     out_rate: f64,
@@ -864,13 +1097,18 @@ pub struct Mixer {
     k_quick: f32,
     cmds: rtrb::Consumer<Cmd>,
     events: rtrb::Producer<RtEvent>,
-    garbage: rtrb::Producer<Arc<Track>>,
+    garbage: rtrb::Producer<Garbage>,
     shared: Arc<Shared>,
     /// beat-timed automation
     auto: Pool,
-    /// every deck's knobs as control values (fader, low, mid, high, filter, gain dB), whoever
-    /// moved them last: the hand or automation
-    ctl: [[f32; 6]; DECKS],
+    /// every channel's knobs as control values (fader, low, mid, high, filter, gain dB), whoever
+    /// moved them last: the hand or automation. Decks first, then the patch slots.
+    ctl: [[f32; 6]; CHANNELS],
+    slots: [PatchSlot; SLOTS],
+    /// external mode: the deck output the patch slots are summed into
+    patch_ext: usize,
+    /// frames rendered since the last `publish` (one callback)
+    frames: u32,
 }
 
 /// Tolerance of a beat comparison, in beats: the position is a sum of many f64 steps
@@ -882,7 +1120,7 @@ impl Mixer {
         mode: Mode,
         cmds: rtrb::Consumer<Cmd>,
         events: rtrb::Producer<RtEvent>,
-        garbage: rtrb::Producer<Arc<Track>>,
+        garbage: rtrb::Producer<Garbage>,
         shared: Arc<Shared>,
     ) -> Self {
         let out_rate = out_rate as f64;
@@ -902,7 +1140,10 @@ impl Mixer {
             garbage,
             shared,
             auto: Pool::new(),
-            ctl: [[1., 0., 0., 0., 0., 0.]; DECKS],
+            ctl: [[1., 0., 0., 0., 0., 0.]; CHANNELS],
+            slots: std::array::from_fn(|_| PatchSlot::new(out_rate)),
+            patch_ext: 0,
+            frames: 0,
         }
     }
 
@@ -910,7 +1151,13 @@ impl Mixer {
     fn control_value(&self, deck: usize, c: Control) -> f32 {
         match c {
             Control::Crossfader => self.crossfader.target,
-            _ => self.ctl[deck][c.index()],
+            Control::Knob { slot, knob } => self
+                .slots
+                .get(slot)
+                .and_then(|s| s.program.as_deref())
+                .and_then(|p| p.knob_value(knob))
+                .unwrap_or(0.),
+            _ => self.ctl[deck.min(CHANNELS - 1)][c.index()],
         }
     }
 
@@ -920,6 +1167,16 @@ impl Mixer {
         let v = c.clamp(v);
         if c == Control::Crossfader {
             self.crossfader.drive(v, how);
+            return;
+        }
+        if let Control::Knob { slot, knob } = c {
+            if let Some(p) = self.slots.get_mut(slot).and_then(|s| s.program.as_deref_mut()) {
+                p.set_knob(knob, v, how);
+            }
+            return;
+        }
+        if deck >= DECKS {
+            self.set_strip(deck, c, v, how);
             return;
         }
         let Some(d) = self.decks.get_mut(deck) else { return };
@@ -932,7 +1189,24 @@ impl Mixer {
             }
             Control::Filter => d.fx.filter_smooth().drive(v, how),
             Control::Gain => d.gain.drive(10f32.powf(v / 20.), how),
-            Control::Crossfader => {}
+            Control::Crossfader | Control::Knob { .. } => {}
+        }
+        self.ctl[deck][c.index()] = v;
+    }
+
+    /// A patch slot's channel strip control (`deck` = `DECKS + slot`)
+    fn set_strip(&mut self, deck: usize, c: Control, v: f32, how: Drive) {
+        let Some(s) = self.slots.get_mut(deck - DECKS) else { return };
+        match c {
+            Control::Fader => s.fader.drive(v, how),
+            Control::Low | Control::Mid | Control::High => {
+                if let Some(b) = c.band().and_then(|b| s.fx.band_smooth(b)) {
+                    b.drive(band_gain(v), how);
+                }
+            }
+            Control::Filter => s.fx.filter_smooth().drive(v, how),
+            Control::Gain => s.gain.drive(10f32.powf(v / 20.), how),
+            Control::Crossfader | Control::Knob { .. } => return,
         }
         self.ctl[deck][c.index()] = v;
     }
@@ -1090,6 +1364,12 @@ impl Mixer {
                 }
             }
             AutoKind::Play { deck, from_beat, synced } => self.auto_play(clock, deck, from_beat, synced, b - it.at_beat),
+            // already timed to the beat: switch now
+            AutoKind::Pattern { slot, seq, pattern } => {
+                if let Some(p) = self.slots.get_mut(slot).and_then(|s| s.program.as_deref_mut()) {
+                    p.set_pattern(seq, pattern, true);
+                }
+            }
         }
         self.auto_free(si);
     }
@@ -1159,7 +1439,9 @@ impl Mixer {
     }
 
     fn apply(&mut self, cmd: Cmd) {
-        if cmd.deck().is_some_and(|d| d >= DECKS) {
+        if let Some(d) = cmd.deck().filter(|&d| d >= DECKS) {
+            // only the channel strip controls reach the patch slots (decks DECKS..CHANNELS)
+            self.apply_strip(cmd, d);
             return;
         }
         let ctx = self.ctx();
@@ -1291,6 +1573,14 @@ impl Mixer {
             }
             Cmd::AutoCancelGroup(group) => self.auto_remove(|it| it.group == group),
             Cmd::AutoCancelControl(deck, c) => self.auto_remove(|it| it.touches(deck, c)),
+            Cmd::PatchLoad { .. }
+            | Cmd::PatchUnload(_)
+            | Cmd::PatchKnob(..)
+            | Cmd::PatchCell { .. }
+            | Cmd::PatchPattern { .. }
+            | Cmd::PatchLive(..)
+            | Cmd::PatchUnmute(_)
+            | Cmd::PatchExternal(_) => self.apply_patch(cmd),
             Cmd::Master(v) => self.master.target = v.max(0.),
             Cmd::CueMix(v) => self.cue_mix.target = v.clamp(0., 1.),
             Cmd::Mode(mode) => self.mode = mode,
@@ -1363,6 +1653,189 @@ impl Mixer {
                     }
                 }
             }
+        }
+    }
+
+    /// A strip command for a patch slot (`deck` = `DECKS + slot`)
+    fn apply_strip(&mut self, cmd: Cmd, deck: usize) {
+        if deck >= CHANNELS {
+            return;
+        }
+        match cmd {
+            Cmd::Gain(_, gain) => {
+                let gain = if gain.is_nan() { 1. } else { gain.max(0.) };
+                self.slots[deck - DECKS].gain.target = gain;
+                self.ctl[deck][Control::Gain.index()] =
+                    (20. * gain.log10()).clamp(GAIN_MIN_DB, crate::audio::auto::GAIN_MAX_DB);
+            }
+            Cmd::Eq(_, band, v) => {
+                if let Some(c) = Control::from_band(band) {
+                    self.set_control(deck, c, v, Drive::Glide);
+                }
+            }
+            Cmd::Filter(_, v) => self.set_control(deck, Control::Filter, v, Drive::Glide),
+            Cmd::Fader(_, v) => self.set_control(deck, Control::Fader, v, Drive::Glide),
+            Cmd::Cue(_, on) => self.slots[deck - DECKS].cue = on,
+            Cmd::AutoCancelControl(_, c) => self.auto_remove(|it| it.touches(deck, c)),
+            _ => {}
+        }
+    }
+
+    fn apply_patch(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::PatchLoad { slot, program, swap, keep_live } => self.patch_load(slot, program, swap, keep_live),
+            Cmd::PatchUnload(slot) => {
+                if slot < SLOTS {
+                    self.patch_unload(slot);
+                }
+            }
+            Cmd::PatchKnob(slot, knob, v) => {
+                if let Some(p) = self.slots.get_mut(slot).and_then(|s| s.program.as_deref_mut()) {
+                    p.set_knob(knob, v, Drive::Glide);
+                }
+            }
+            Cmd::PatchCell { slot, seq, pattern, step, row, on, velocity } => {
+                if let Some(p) = self.slots.get_mut(slot).and_then(|s| s.program.as_deref_mut()) {
+                    p.set_cell(seq, pattern, step, row, on, velocity);
+                }
+            }
+            Cmd::PatchPattern { slot, seq, pattern, now } => {
+                if let Some(p) = self.slots.get_mut(slot).and_then(|s| s.program.as_deref_mut()) {
+                    p.set_pattern(seq, pattern, now);
+                }
+            }
+            Cmd::PatchLive(slot, live) => {
+                if let Some(s) = self.slots.get_mut(slot) {
+                    s.live = live;
+                }
+            }
+            Cmd::PatchUnmute(slot) => {
+                if let Some(s) = self.slots.get_mut(slot) {
+                    s.muted = None;
+                    s.strikes = 0;
+                }
+            }
+            Cmd::PatchExternal(deck) => self.patch_ext = deck.min(1),
+            _ => {}
+        }
+    }
+
+    /// Puts `program` in `slot`. A swap (structural recompile) carries the old program's state
+    /// over and keeps the slot's controls; a fresh load starts cue-only with neutral controls.
+    /// The old program crossfades out; the block that is already rendered plays on first, so
+    /// nothing jumps.
+    fn patch_load(&mut self, slot: usize, mut program: Box<Program>, swap: bool, keep_live: bool) {
+        if slot >= SLOTS {
+            self.discard(Garbage::Program(program));
+            return;
+        }
+        let fresh = !swap || self.slots[slot].program.is_none();
+        if fresh {
+            // knob and pattern automation of the old patch means nothing for the new one
+            self.auto_remove(|it| it.patch_slot() == Some(slot));
+        }
+        let rate = self.out_rate;
+        let s = &mut self.slots[slot];
+        let old = s.program.take();
+        if let (Some(o), false) = (&old, fresh) {
+            program.adopt_state(o);
+        }
+        let mut gone = None;
+        if let Some(o) = old {
+            gone = s.old.replace(o);
+            s.fade_pos = 0;
+            s.fade_len = (PATCH_XFADE_SECS * rate as f32) as u32;
+        }
+        s.program = Some(program);
+        s.muted = None;
+        s.strikes = 0;
+        if fresh {
+            s.live = false;
+            s.cue = true;
+            s.gain = Smooth::new(1.);
+            s.fader = Smooth::new(1.);
+            s.fx = DeckFx::new(rate);
+            self.ctl[DECKS + slot] = [1., 0., 0., 0., 0., 0.];
+        } else if !keep_live {
+            s.live = false;
+        }
+        if let Some(g) = gone {
+            self.discard(Garbage::Program(g));
+        }
+    }
+
+    fn patch_unload(&mut self, slot: usize) {
+        self.auto_remove(|it| it.patch_slot() == Some(slot));
+        let s = &mut self.slots[slot];
+        let (a, b) = (s.program.take(), s.old.take());
+        s.pos = CHUNK;
+        s.muted = None;
+        s.live = false;
+        s.cpu = 0.;
+        for g in [a, b].into_iter().flatten() {
+            self.discard(Garbage::Program(g));
+        }
+    }
+
+    /// The decks' beat clocks as lines over the next block, and which one is "master": the deck
+    /// on air (running, with the larger fader x crossfader share), else A
+    fn clock_feed(&self) -> ClockFeed {
+        let dc = |d: &Deck| match (&d.track, d.grid) {
+            (Some(_), Some(g)) => DeckClock {
+                playing: d.running(),
+                beat: g.beats_at(d.pos),
+                dbeat: d.step(self.out_rate) / g.beat,
+                per_bar: g.per_bar,
+                offset: g.offset,
+            },
+            _ => DeckClock::default(),
+        };
+        let (a, b) = (dc(&self.decks[0]), dc(&self.decks[1]));
+        let xf = self.crossfader.current;
+        let level = |n: usize| {
+            let side = if n == 0 { (1. - xf).min(1.) } else { (1. + xf).min(1.) };
+            self.decks[n].fader.current * side
+        };
+        let master = match (a.playing, b.playing) {
+            (true, true) if level(1) > level(0) => b,
+            (false, true) => b,
+            _ => a,
+        };
+        ClockFeed { master, a, b }
+    }
+
+    /// Renders the next block of slot `i` (and of the old program while it crossfades out),
+    /// timing it
+    fn fill_slot(&mut self, i: usize) {
+        let feed = self.clock_feed();
+        let t0 = std::time::Instant::now();
+        let s = &mut self.slots[i];
+        let Some(prog) = s.program.as_deref_mut() else { return };
+        prog.render(&mut s.buf, &feed);
+        let mut retire = None;
+        if let Some(old) = s.old.as_deref_mut() {
+            old.render(&mut s.old_buf, &feed);
+            let len = s.fade_len.max(1) as f32;
+            for j in 0..CHUNK {
+                let w = ((s.fade_pos as usize + j) as f32 / len).min(1.);
+                let (n, o) = (s.buf[j], s.old_buf[j]);
+                s.buf[j] = (o.0 + (n.0 - o.0) * w, o.1 + (n.1 - o.1) * w);
+            }
+            s.fade_pos += CHUNK as u32;
+            if s.fade_pos >= s.fade_len {
+                retire = s.old.take();
+            }
+        }
+        s.pos = 0;
+        #[allow(unused_mut)]
+        let mut ns = t0.elapsed().as_nanos() as u64;
+        #[cfg(test)]
+        if let Some(fake) = FAKE_PATCH_NS.with(|c| c.get()) {
+            ns = fake;
+        }
+        s.per_frame_ns = ns as f64 / CHUNK as f64;
+        if let Some(old) = retire {
+            self.discard(Garbage::Program(old));
         }
     }
 
@@ -1440,9 +1913,13 @@ impl Mixer {
 
     /// Hands a track back to be freed off the audio thread
     fn dispose(&mut self, track: Arc<Track>) {
-        if let Err(rtrb::PushError::Full(track)) = self.garbage.push(track) {
+        self.discard(Garbage::Track(track));
+    }
+
+    fn discard(&mut self, g: Garbage) {
+        if let Err(rtrb::PushError::Full(g)) = self.garbage.push(g) {
             // never free here; leaking is better than a dropout
-            std::mem::forget(track);
+            std::mem::forget(g);
         }
     }
 
@@ -1489,6 +1966,14 @@ impl Mixer {
     #[inline]
     pub fn next(&mut self) -> Buses {
         self.auto_tick();
+        self.frames = self.frames.saturating_add(1);
+        // patch slots that ran out of rendered audio get a block, clocked by the decks as they
+        // are now (after automation, before the decks move on)
+        for i in 0..SLOTS {
+            if self.slots[i].needs_block() {
+                self.fill_slot(i);
+            }
+        }
         let ctx = self.ctx();
         let k = self.k_param;
         let xf = self.crossfader.next(k);
@@ -1524,6 +2009,37 @@ impl Mixer {
                 out.cue.1 += r;
             }
         }
+        // patch slots: channel strip, limiter, then master (internal), the external deck output,
+        // or only the headphones until they are live
+        let (mode, ext) = (self.mode, self.patch_ext);
+        for s in &mut self.slots {
+            if s.program.is_none() || s.muted.is_some() {
+                continue;
+            }
+            let (l, r) = s.buf[s.pos];
+            s.pos += 1;
+            s.ns_acc += s.per_frame_ns;
+            let gain = s.gain.next(k);
+            let fader = s.fader.next(k);
+            let (l, r) = s.fx.process(l * gain, r * gain, k);
+            let (l, r) = (soft_limit(l), soft_limit(r));
+            if s.live {
+                match mode {
+                    Mode::Internal => {
+                        out.master.0 += l * fader;
+                        out.master.1 += r * fader;
+                    }
+                    Mode::External => {
+                        out.decks[ext].0 += l * fader;
+                        out.decks[ext].1 += r * fader;
+                    }
+                }
+            }
+            if !s.live || s.cue {
+                out.cue.0 += l;
+                out.cue.1 += r;
+            }
+        }
         out.master = (
             (out.master.0 * master).clamp(-1., 1.),
             (out.master.1 * master).clamp(-1., 1.),
@@ -1541,7 +2057,8 @@ impl Mixer {
     }
 
     /// Publishes deck state; call once per callback, after rendering
-    pub fn publish(&self) {
+    pub fn publish(&mut self) {
+        self.patch_budget();
         let seq = self.shared.seq.load(Ordering::Relaxed).wrapping_add(1);
         self.shared.seq.store(seq, Ordering::Relaxed);
         fence(Ordering::Release);
@@ -1585,7 +2102,64 @@ impl Mixer {
             }
         }
         self.shared.crossfader.store(self.crossfader.target.to_bits(), Ordering::Relaxed);
+        self.publish_patches();
         self.shared.seq.store(seq.wrapping_add(1), Ordering::Release);
+    }
+
+    /// The CPU budget, once per callback: the time each slot's program took over the time the
+    /// callback has. A slot over [`CPU_LIMIT`] for [`CPU_STRIKES`] callbacks in a row is muted.
+    fn patch_budget(&mut self) {
+        let frames = std::mem::take(&mut self.frames);
+        let budget = frames as f64 / self.out_rate * 1e9;
+        for s in &mut self.slots {
+            let used = std::mem::take(&mut s.ns_acc);
+            if frames == 0 || s.program.is_none() || s.muted.is_some() {
+                continue;
+            }
+            let share = (used / budget).min(10.);
+            s.cpu = if share > s.cpu as f64 { share as f32 } else { s.cpu * 0.9 + share as f32 * 0.1 };
+            if share > CPU_LIMIT {
+                s.strikes += 1;
+                if s.strikes >= CPU_STRIKES {
+                    s.muted = Some(MUTE_CPU);
+                    s.pos = CHUNK;
+                }
+            } else {
+                s.strikes = 0;
+            }
+        }
+    }
+
+    fn publish_patches(&self) {
+        for (i, s) in self.slots.iter().enumerate() {
+            let sh = &self.shared.patches[i];
+            sh.loaded.store(s.program.is_some(), Ordering::Relaxed);
+            sh.live.store(s.live, Ordering::Relaxed);
+            sh.cue.store(s.cue, Ordering::Relaxed);
+            sh.muted.store(s.muted.unwrap_or(0), Ordering::Relaxed);
+            sh.cpu.store(s.cpu.to_bits(), Ordering::Relaxed);
+            for (v, a) in self.ctl[DECKS + i].iter().zip(&sh.knobs) {
+                a.store(v.to_bits(), Ordering::Relaxed);
+            }
+            let (nk, nq) = match s.program.as_deref() {
+                Some(p) => {
+                    let nk = p.knob_count().min(MAX_KNOBS);
+                    for k in 0..nk {
+                        sh.knob_values[k].store(p.knob_value(k).unwrap_or(0.).to_bits(), Ordering::Relaxed);
+                    }
+                    let nq = p.seq_count().min(MAX_SEQS);
+                    for q in 0..nq {
+                        let (pat, queued, step) = p.seq_state(q).unwrap_or((0, u32::MAX, 0));
+                        let queued = if queued == u32::MAX { 0xff } else { queued & 0xff };
+                        sh.seqs[q].store((pat & 0xff) | queued << 8 | step.min(0xffff) << 16, Ordering::Relaxed);
+                    }
+                    (nk, nq)
+                }
+                None => (0, 0),
+            };
+            sh.n_knobs.store(nk as u32, Ordering::Relaxed);
+            sh.n_seqs.store(nq as u32, Ordering::Relaxed);
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -1597,6 +2171,8 @@ impl Mixer {
 mod auto_tests;
 #[cfg(test)]
 mod dj_tests;
+#[cfg(test)]
+mod patch_tests;
 #[cfg(test)]
 mod set_tests;
 

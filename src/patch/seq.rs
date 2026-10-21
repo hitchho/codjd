@@ -121,7 +121,6 @@ pub struct SeqState {
     /// of those dividers
     pub clock: Option<usize>,
     pub div: i64,
-    pub rows: u8,
     pub cur: u8,
     pub queued: u8,
     pub pos: u16,
@@ -147,7 +146,6 @@ impl SeqState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mono: bool,
-        rows: u8,
         cur: u8,
         root: i32,
         scale: &'static [u8],
@@ -158,7 +156,6 @@ impl SeqState {
             mono,
             clock: None,
             div: 1,
-            rows,
             cur,
             queued: NONE,
             pos: 0,

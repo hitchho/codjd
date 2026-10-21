@@ -165,6 +165,10 @@ impl Engine {
     /// A control set by hand (`DjSet`, keys, MCP)
     pub(super) fn rec_knob(&mut self, control: &str, deck: usize, value: f64) {
         let Some(r) = &mut self.recorder else { return };
+        if deck >= crate::audio::DECKS {
+            // patch slots are not part of a recorded mix (yet)
+            return;
+        }
         if control == "rate" && deck != r.out {
             // a hand on the incoming deck's pitch ends its sync
             r.in_synced = false;

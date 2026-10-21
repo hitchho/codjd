@@ -21,6 +21,9 @@ pub struct Config {
     /// where the set files (`*.codj`) live
     #[serde(default)]
     pub sets: SetsConfig,
+    /// patch decks (`[patches]`)
+    #[serde(default)]
+    pub patches: crate::patch::PatchesConfig,
 }
 
 /// `[sets]`: the set folder, `$XDG_DATA_HOME/codj/sets` unless `dir` is given
@@ -53,6 +56,7 @@ impl Default for Config {
             audio: Default::default(),
             net: None,
             sets: SetsConfig::default(),
+            patches: Default::default(),
         }
     }
 }

@@ -15,6 +15,23 @@ pub mod seq;
 /// Patch slots P1..P4
 pub const SLOTS: usize = 4;
 
+/// `[patches]` in codjd's config
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct PatchesConfig {
+    /// external mode: the deck output the patch slots are summed into
+    pub external_out: ExternalOut,
+}
+
+/// `external_out = "a"|"b"`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalOut {
+    #[default]
+    A,
+    B,
+}
+
 #[cfg(test)]
 pub mod testkit;
 #[cfg(test)]

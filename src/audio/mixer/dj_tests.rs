@@ -87,7 +87,7 @@ pub(super) struct Rig {
     pub(super) m: Mixer,
     pub(super) tx: rtrb::Producer<Cmd>,
     _ev: rtrb::Consumer<RtEvent>,
-    _gb: rtrb::Consumer<Arc<Track>>,
+    _gb: rtrb::Consumer<Garbage>,
 }
 
 impl Rig {

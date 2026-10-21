@@ -23,11 +23,12 @@ use tracing::{error, info, warn};
 
 use crate::{
     analysis::{Analyzer, Grid},
-    audio::{sync_plan, Audio, AudioEvent, AutoItem, AutoKind, Control, GridSpec, Mode},
+    audio::{sync_plan, Audio, AudioEvent, AutoItem, AutoKind, Control, GridSpec, Mode, SlotRtState, CHANNELS},
     config::Config,
     dj::{DeckInfo, MixerInfo},
     hotcues::{HotcueStore, Slots, SLOTS},
     library::{Playlist, PlaylistStore},
+    patch::{program::Program, SLOTS as PATCH_SLOTS},
     types::{
         format_allowed, FileFormat, Lyrics, Metadata, Music, PlayerStatus, PlayingStatus,
         PlaylistOpperation, Repeat, Sort,
@@ -162,6 +163,15 @@ struct DeckKnobs {
     headphones: bool,
 }
 
+/// What the engine knows of a patch slot's program, to check requests before they reach the audio
+/// thread
+#[derive(Clone, Copy, Default)]
+struct PatchMeta {
+    loaded: bool,
+    knobs: usize,
+    seqs: usize,
+}
+
 struct MixerKnobs {
     master: f64,
     cue_mix: f64,
@@ -173,6 +183,7 @@ pub struct Engine {
     analyzer: Option<Arc<Analyzer>>,
     meta: [DeckMeta; crate::audio::DECKS],
     knobs: [DeckKnobs; crate::audio::DECKS],
+    patches: [PatchMeta; PATCH_SLOTS],
     mixer: MixerKnobs,
     hotcues: HotcueStore,
     /// hand corrections of detected tempos (half/double/triplet mistakes)
@@ -215,11 +226,16 @@ impl Engine {
         let volume = config.volume.clamp(0., 1.);
         apply_volume(&mut audio, volume);
         let master = if audio.mode() == Mode::Internal { volume as f64 } else { 1. };
+        audio.set_patch_external_out(match config.patches.external_out {
+            crate::patch::ExternalOut::A => 0,
+            crate::patch::ExternalOut::B => 1,
+        });
         Ok(Self {
             audio,
             analyzer: None,
             meta: Default::default(),
             knobs: Default::default(),
+            patches: Default::default(),
             mixer: MixerKnobs { master, cue_mix: 0., quantize: true },
             hotcues: HotcueStore::open_default(),
             gridfix: crate::gridfix::GridFixes::open_default(),
@@ -638,6 +654,19 @@ impl Engine {
         self.gridded(item.clock)
             .map_err(|e| format!("clock deck {}: {e}", names[item.clock]))?;
         match item.kind {
+            AutoKind::Ramp { control: Control::Knob { slot, knob }, .. }
+            | AutoKind::Set { control: Control::Knob { slot, knob }, .. } => {
+                self.patch_knob_ok(slot, knob)?;
+            }
+            AutoKind::Ramp { deck, .. } | AutoKind::Set { deck, .. } if deck >= crate::audio::DECKS => {
+                self.patch_loaded(deck - crate::audio::DECKS)?;
+            }
+            AutoKind::Pattern { slot, seq, .. } => {
+                self.patch_loaded(slot)?;
+                if seq >= self.patches[slot].seqs {
+                    return Err(format!("P{} has no sequencer {seq}", slot + 1));
+                }
+            }
             AutoKind::Ramp { deck, .. } | AutoKind::Set { deck, .. } | AutoKind::Pause { deck } | AutoKind::LoopOff { deck } => {
                 self.loaded(deck)?;
             }
@@ -849,11 +878,14 @@ impl Engine {
     /// Sets a mixer control: rate, gain, fader, cue (0/1) per deck; crossfader (-1..1), master,
     /// cue_mix (0 = cue only .. 1 = master only) for the mixer
     pub fn deck_set(&mut self, control: &str, deck: usize, value: f64) -> Result<(), String> {
-        check_deck(deck)?;
+        check_channel(control, deck)?;
         if !value.is_finite() {
             return Err("bad value".into());
         }
         let v = value as f32;
+        if deck >= crate::audio::DECKS {
+            return self.slot_set(control, deck - crate::audio::DECKS, v);
+        }
         // manual wins: a hand on a control ends the automation of it
         if let Some(c) = auto_control(control) {
             self.audio.cancel_control(deck, c);
@@ -1223,6 +1255,145 @@ impl Engine {
     }
 }
 
+/// Patch slots: the document layer drives these (no caller in the daemon until it lands)
+#[allow(dead_code)]
+impl Engine {
+    /// A channel strip control of a patch slot (`deck_set` with deck 2 + slot): fader, low, mid,
+    /// high, filter, gain (linear, as for decks) and cue (0/1)
+    fn slot_set(&mut self, control: &str, slot: usize, v: f32) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        let deck = crate::audio::DECKS + slot;
+        if let Some(c) = auto_control(control) {
+            self.audio.cancel_control(deck, c);
+        }
+        match control {
+            "gain" => self.audio.set_gain(deck, v),
+            "low" | "mid" | "high" => {
+                let band = ["low", "mid", "high"].iter().position(|b| *b == control).unwrap_or(0);
+                self.audio.set_eq(deck, band, v);
+            }
+            "filter" => self.audio.set_filter(deck, v),
+            "fader" => self.audio.set_fader(deck, v),
+            "cue" => self.audio.set_cue(deck, v != 0.),
+            other => return Err(format!("{other} is not a patch slot control")),
+        }
+        Ok(())
+    }
+
+    fn patch_loaded(&self, slot: usize) -> Result<(), String> {
+        match self.patches.get(slot) {
+            None => Err(format!("no patch slot {slot} (P1..P{PATCH_SLOTS} are 0..{})", PATCH_SLOTS - 1)),
+            Some(p) if !p.loaded => Err(format!("nothing loaded in P{}", slot + 1)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    fn patch_knob_ok(&self, slot: usize, knob: usize) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        if knob >= self.patches[slot].knobs {
+            return Err(format!("P{} has no knob {knob}", slot + 1));
+        }
+        Ok(())
+    }
+
+    /// Compiles nothing: puts a compiled `program` (see `patch::program::compile`) in `slot`,
+    /// cue-only with the strip back to neutral; the previous program crossfades out
+    pub fn patch_load(&mut self, slot: usize, program: Program) -> Result<(), String> {
+        if slot >= PATCH_SLOTS {
+            return Err(format!("no patch slot {slot}"));
+        }
+        self.patches[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
+        self.audio.patch_load(slot, program);
+        Ok(())
+    }
+
+    /// A structural edit: like `patch_load`, but the state of the nodes that survived carries over
+    /// and the controls stay; with `keep_live` the slot stays on the master (the contract's live
+    /// safety says it goes back to the headphones: pass `false` for that)
+    pub fn patch_swap(&mut self, slot: usize, program: Program, keep_live: bool) -> Result<(), String> {
+        if slot >= PATCH_SLOTS {
+            return Err(format!("no patch slot {slot}"));
+        }
+        self.patches[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
+        self.audio.patch_swap(slot, program, keep_live);
+        Ok(())
+    }
+
+    pub fn patch_unload(&mut self, slot: usize) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        self.patches[slot] = PatchMeta::default();
+        self.audio.patch_unload(slot);
+        Ok(())
+    }
+
+    /// Sets a knob in its own units; a hand on it ends its automation
+    pub fn patch_knob(&mut self, slot: usize, knob: usize, value: f64) -> Result<(), String> {
+        self.patch_knob_ok(slot, knob)?;
+        if !value.is_finite() {
+            return Err("bad value".into());
+        }
+        self.audio.patch_knob(slot, knob, value as f32);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_cell(
+        &mut self,
+        slot: usize,
+        seq: usize,
+        pattern: usize,
+        step: u16,
+        row: u8,
+        on: bool,
+        velocity: f64,
+    ) -> Result<(), String> {
+        self.patch_seq_ok(slot, seq, pattern)?;
+        if step as usize >= crate::patch::seq::MAX_STEPS {
+            return Err(format!("step {step} out of range (0..{})", crate::patch::seq::MAX_STEPS - 1));
+        }
+        self.audio.patch_cell(slot, seq, pattern, step, row, on, velocity as f32);
+        Ok(())
+    }
+
+    /// Switches a sequencer's pattern (0..7) now, or at the next bar of its clock
+    pub fn patch_pattern(&mut self, slot: usize, seq: usize, pattern: usize, now: bool) -> Result<(), String> {
+        self.patch_seq_ok(slot, seq, pattern)?;
+        self.audio.patch_pattern(slot, seq, pattern, now);
+        Ok(())
+    }
+
+    fn patch_seq_ok(&self, slot: usize, seq: usize, pattern: usize) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        if seq >= self.patches[slot].seqs {
+            return Err(format!("P{} has no sequencer {seq}", slot + 1));
+        }
+        if pattern >= crate::patch::seq::MAX_PATTERNS {
+            return Err(format!("pattern {pattern} out of range (0..{})", crate::patch::seq::MAX_PATTERNS - 1));
+        }
+        Ok(())
+    }
+
+    /// Sends the slot to the master (or the external output), or back to the headphones only
+    pub fn patch_live(&mut self, slot: usize, live: bool) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        self.audio.patch_live(slot, live);
+        Ok(())
+    }
+
+    /// Lets a slot that was muted for a CPU overrun run again
+    pub fn patch_unmute(&mut self, slot: usize) -> Result<(), String> {
+        self.patch_loaded(slot)?;
+        self.audio.patch_unmute(slot);
+        Ok(())
+    }
+
+    /// What the audio thread knows of every patch slot: load state, cpu share, mute reason, knob
+    /// values, sequencer pattern/queued/step, fader, headphones, live (see `SlotRtState`)
+    pub fn patch_slot_states(&self) -> Vec<SlotRtState> {
+        self.audio.patch_slot_states()
+    }
+}
+
 impl crate::sets::runtime::Host for Engine {
     fn deck(&mut self, deck: usize) -> crate::sets::runtime::DeckView {
         if deck >= crate::audio::DECKS {
@@ -1324,6 +1495,19 @@ fn auto_control(name: &str) -> Option<Control> {
     })
 }
 
+/// A channel strip control may also address a patch slot (deck 2 + slot); `rate`, `sync_range`
+/// and the like only exist for the decks
+fn check_channel(control: &str, deck: usize) -> Result<(), String> {
+    let strip = matches!(control, "fader" | "low" | "mid" | "high" | "filter" | "gain" | "cue");
+    if deck < crate::audio::DECKS || (strip && deck < CHANNELS) {
+        Ok(())
+    } else if deck < CHANNELS {
+        Err(format!("{control} is not a patch slot control"))
+    } else {
+        Err(format!("no deck {deck}"))
+    }
+}
+
 fn check_deck(deck: usize) -> Result<(), String> {
     if deck < crate::audio::DECKS {
         Ok(())
@@ -1363,5 +1547,17 @@ mod tests {
     fn only_the_two_decks_exist() {
         assert!(check_deck(1).is_ok());
         assert_eq!(check_deck(2), Err("no deck 2".to_string()));
+    }
+
+    #[test]
+    fn patch_slots_are_channels_two_to_five_for_the_strip_controls_only() {
+        for c in ["fader", "low", "mid", "high", "filter", "gain", "cue"] {
+            assert!(check_channel(c, 0).is_ok() && check_channel(c, 1).is_ok(), "{c}");
+            assert!(check_channel(c, 2).is_ok() && check_channel(c, 5).is_ok(), "{c}");
+            assert_eq!(check_channel(c, 6), Err("no deck 6".to_string()), "{c}");
+        }
+        assert!(check_channel("rate", 1).is_ok());
+        assert_eq!(check_channel("rate", 2), Err("rate is not a patch slot control".to_string()));
+        assert_eq!(check_channel("rate", 9), Err("no deck 9".to_string()));
     }
 }

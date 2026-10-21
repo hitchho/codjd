@@ -21,10 +21,9 @@ pub type Ins = [u32; NIN];
 #[derive(Clone, Copy, Default)]
 pub struct ClockInfo {
     pub valid: bool,
-    /// step relative to the bar grid (a bar starts at a multiple of `bar_steps`), swing applied
+    /// step relative to the bar grid (steps count from a bar start), swing applied
     pub step: i64,
     pub bar: i64,
-    pub bar_steps: i64,
 }
 
 /// Per-sample context shared by all nodes
@@ -386,12 +385,10 @@ impl Clock {
         let b = 0.5 * (1. + self.swing);
         let (odd, local) = if f < b { (0, f / b) } else { (1, (f - b) / (1. - b)) };
         let step = 2 * pair as i64 + odd;
-        let bar_steps = ((self.spb * per_bar as f64).round() as i64).max(1);
         env.clocks[node] = ClockInfo {
             valid: true,
             step,
             bar: (rel / per_bar as f64).floor() as i64,
-            bar_steps,
         };
         out[0] = if local < 0.5 { 1. } else { 0. };
         out[1] = (rel - rel.floor()) as f32;
@@ -838,7 +835,6 @@ fn build_seq(s: &NodeSpec, sr: f32) -> Result<SeqState, String> {
     if !mono && !(1. ..=MAX_ROWS_GATE as f64).contains(&rows) {
         return Err(format!("{}: a GateSeq has at most {MAX_ROWS_GATE} rows", s.id));
     }
-    let rows = rows.clamp(1., 254.) as u8;
     let pats = s.patterns();
     if pats.len() > MAX_PATTERNS {
         return Err(format!("{}: at most {MAX_PATTERNS} patterns", s.id));
@@ -862,7 +858,7 @@ fn build_seq(s: &NodeSpec, sr: f32) -> Result<SeqState, String> {
     } else {
         (48, &[0u8][..])
     };
-    let mut st = SeqState::new(mono, rows, cur as u8, root, scale, bank, sr);
+    let mut st = SeqState::new(mono, cur as u8, root, scale, bank, sr);
     for (p, pat) in pats.iter().enumerate() {
         for c in &pat.cells {
             if c.step as usize >= MAX_STEPS {

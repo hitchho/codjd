@@ -9,7 +9,9 @@
 /// A mixer control that automation can move. `Low`/`Mid`/`High` are EQ bands (-1 kill .. 0 unity
 /// .. +1 = +6 dB), `Filter` is the one-knob filter (-1 low-pass .. 1 high-pass), `Gain` is in dB
 /// relative to the deck's auto-gain (on top of it, -60..+12), `Crossfader` is mixer-wide (-1 A
-/// .. 1 B; the deck of an item that moves it does not matter).
+/// .. 1 B; the deck of an item that moves it does not matter). `Knob` is a patch knob (`slot` 0..3,
+/// `knob` its index in the patch's knob list), in the knob's own units; the deck of an item that
+/// moves it is `2 + slot` by convention but the control carries the slot itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Fader,
@@ -19,10 +21,12 @@ pub enum Control {
     Filter,
     Gain,
     Crossfader,
+    #[allow(dead_code)] // moved by the patch layer's sets
+    Knob { slot: usize, knob: usize },
 }
 
 impl Control {
-    /// Index into a deck's six values (not for the crossfader)
+    /// Index into a deck's six values (not for the crossfader or a knob)
     pub(super) fn index(self) -> usize {
         match self {
             Control::Fader => 0,
@@ -30,7 +34,7 @@ impl Control {
             Control::Mid => 2,
             Control::High => 3,
             Control::Filter => 4,
-            Control::Gain | Control::Crossfader => 5,
+            Control::Gain | Control::Crossfader | Control::Knob { .. } => 5,
         }
     }
 
@@ -61,6 +65,8 @@ impl Control {
         match self {
             Control::Fader => (0., 1.),
             Control::Gain => (GAIN_MIN_DB, GAIN_MAX_DB),
+            // the program clamps a knob to its own range
+            Control::Knob { .. } => (f32::MIN, f32::MAX),
             _ => (-1., 1.),
         }
     }
@@ -135,12 +141,18 @@ pub enum AutoKind {
     LoopOff { deck: usize },
     /// quantized, keeps the beat phase: lands on `to_beat` of `deck`'s grid at a beat
     Jump { deck: usize, to_beat: f64 },
+    /// switch a patch sequencer (`seq` = its index in the patch's sequencer list) to `pattern`
+    /// 0..7 at `at_beat`
+    #[allow(dead_code)] // scheduled by the patch layer's sets
+    Pattern { slot: usize, seq: usize, pattern: usize },
 }
 
 impl AutoItem {
     /// Whether the item (still) moves `control` of `deck`
     pub(super) fn touches(&self, deck: usize, control: Control) -> bool {
-        let same = |d: usize, c: Control| c == control && (c == Control::Crossfader || d == deck);
+        let same = |d: usize, c: Control| {
+            c == control && (matches!(c, Control::Crossfader | Control::Knob { .. }) || d == deck)
+        };
         match self.kind {
             AutoKind::Ramp { deck: d, control: c, .. } | AutoKind::Set { deck: d, control: c, .. } => same(d, c),
             // a swap moves the band on both decks
@@ -149,22 +161,42 @@ impl AutoItem {
         }
     }
 
-    /// Every number finite and every deck in range: what the audio thread requires to take it
+    /// Every number finite and every deck in range: what the audio thread requires to take it.
+    /// `decks` is the number of real decks; a ramp or set may also move the controls of the
+    /// patch slots (deck `decks + slot`) and their knobs.
     pub fn is_sane(&self, decks: usize) -> bool {
         let beats = |v: f64| v.is_finite() && v.abs() < 1e7;
         let deck_ok = |d: usize| d < decks;
+        let strip_ok = |d: usize, c: Control| match c {
+            Control::Knob { slot, .. } => slot < crate::patch::SLOTS,
+            Control::Crossfader => d < decks,
+            _ => d < decks + crate::patch::SLOTS,
+        };
         let kind_ok = match self.kind {
-            AutoKind::Ramp { deck, from, to, end_beat, .. } => {
-                deck_ok(deck) && from.is_none_or(f32::is_finite) && to.is_finite() && beats(end_beat)
+            AutoKind::Ramp { deck, control, from, to, end_beat, .. } => {
+                strip_ok(deck, control) && from.is_none_or(f32::is_finite) && to.is_finite() && beats(end_beat)
             }
-            AutoKind::Set { deck, value, .. } => deck_ok(deck) && value.is_finite(),
+            AutoKind::Set { deck, control, value } => strip_ok(deck, control) && value.is_finite(),
             AutoKind::Swap { band } => band.band().is_some(),
             AutoKind::Play { deck, from_beat, .. } => deck_ok(deck) && deck != self.clock && beats(from_beat),
             AutoKind::Pause { deck } | AutoKind::LoopOff { deck } => deck_ok(deck),
             AutoKind::Loop { deck, start_beat, beats: n } => deck_ok(deck) && beats(start_beat) && n.is_finite() && n > 0.,
             AutoKind::Jump { deck, to_beat } => deck_ok(deck) && beats(to_beat),
+            AutoKind::Pattern { slot, seq, pattern } => {
+                slot < crate::patch::SLOTS && seq < crate::patch::program::MAX_SEQS && pattern < crate::patch::seq::MAX_PATTERNS
+            }
         };
         kind_ok && deck_ok(self.clock) && beats(self.at_beat)
+    }
+
+    /// The patch slot whose knobs or patterns this item moves, if any
+    pub(super) fn patch_slot(&self) -> Option<usize> {
+        match self.kind {
+            AutoKind::Ramp { control: Control::Knob { slot, .. }, .. }
+            | AutoKind::Set { control: Control::Knob { slot, .. }, .. }
+            | AutoKind::Pattern { slot, .. } => Some(slot),
+            _ => None,
+        }
     }
 }
 
@@ -380,5 +412,21 @@ mod tests {
         assert!(!play.is_sane(2), "a deck cannot start on its own clock");
         let swap = AutoItem { kind: AutoKind::Swap { band: Control::Fader }, ..ok };
         assert!(!swap.is_sane(2));
+        // patch slots are channels after the decks; transport stays on the decks
+        let strip = |deck, control| AutoItem { kind: AutoKind::Set { deck, control, value: 0.5 }, ..ok };
+        assert!(strip(2, Control::Fader).is_sane(2) && strip(5, Control::Low).is_sane(2));
+        assert!(!strip(6, Control::Fader).is_sane(2));
+        assert!(!strip(2, Control::Crossfader).is_sane(2));
+        assert!(strip(0, Control::Knob { slot: 3, knob: 9 }).is_sane(2));
+        assert!(!strip(0, Control::Knob { slot: 4, knob: 0 }).is_sane(2));
+        let pause = AutoItem { kind: AutoKind::Pause { deck: 2 }, ..ok };
+        assert!(!pause.is_sane(2));
+        let pat = |slot, seq, pattern| AutoItem { kind: AutoKind::Pattern { slot, seq, pattern }, ..ok };
+        assert!(pat(0, 0, 7).is_sane(2) && !pat(4, 0, 0).is_sane(2) && !pat(0, 0, 8).is_sane(2));
+        // knobs of different patches are different controls
+        let a = strip(2, Control::Knob { slot: 0, knob: 1 });
+        assert!(a.touches(0, Control::Knob { slot: 0, knob: 1 }) && !a.touches(0, Control::Knob { slot: 1, knob: 1 }));
+        assert_eq!(a.patch_slot(), Some(0));
+        assert_eq!(pat(2, 0, 1).patch_slot(), Some(2));
     }
 }

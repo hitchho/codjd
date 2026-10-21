@@ -34,6 +34,7 @@ pub struct DeckClock {
     pub offset: u32,
 }
 
+#[allow(dead_code)] // for tests and tools
 impl DeckClock {
     /// A steady clock at `bpm` from beat 0 at frame 0 (4 beats to the bar), for tests and tools
     pub fn steady(bpm: f64, sample_rate: f64) -> Self {
@@ -58,6 +59,7 @@ pub struct ClockFeed {
     pub b: DeckClock,
 }
 
+#[allow(dead_code)] // for tests and tools
 impl ClockFeed {
     pub fn all(c: DeckClock) -> Self {
         ClockFeed { master: c, a: c, b: c }
@@ -102,8 +104,7 @@ pub struct Program {
     order: Vec<Step>,
     v: Vec<f32>,
     knobs: Vec<KnobRt>,
-    /// node index of each knob / sequencer, in the order of the graph's lists
-    knob_nodes: Vec<usize>,
+    /// node index of each sequencer, in the order of the graph's list
     seq_nodes: Vec<usize>,
     clocks: Vec<ClockInfo>,
     out_l: u32,
@@ -116,6 +117,8 @@ fn bad(id: &str, msg: impl std::fmt::Display) -> String {
 }
 
 /// Compiles a validated graph for `sample_rate`. Errors name the node (`<id>: message`).
+// called by the document layer, which lands separately
+#[allow(dead_code)]
 pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> {
     if sample_rate < 8000 {
         return Err("sample rate too low".into());
@@ -391,7 +394,6 @@ pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> 
         order,
         v,
         knobs,
-        knob_nodes: graph.knobs.iter().map(|(_, n)| *n).collect(),
         seq_nodes: graph.sequencers.iter().map(|(_, n)| *n).collect(),
         clocks: vec![ClockInfo::default(); n],
         out_l: slot_of(0),
@@ -418,6 +420,7 @@ fn knob_range(s: &super::graph::NodeSpec) -> (f32, f32) {
     }
 }
 
+#[allow(dead_code)] // part of the API the document layer uses
 impl Program {
     pub fn sample_rate(&self) -> u32 {
         self.sr as u32
@@ -445,7 +448,15 @@ impl Program {
     pub fn set_knob(&mut self, knob: usize, value: f32, how: Drive) {
         if let (Some(k), true) = (self.knobs.get_mut(knob), value.is_finite()) {
             let v = value.clamp(k.min, k.max);
-            k.smooth.drive(v, how);
+            if how == Drive::Slew {
+                // a jump to a ramp that moves by itself is limited to 1 % of the range per sample
+                let lim = 0.01 * (k.max - k.min);
+                let d = v - k.smooth.current;
+                k.smooth.target = v;
+                k.smooth.current = if d.abs() <= lim { v } else { k.smooth.current + lim * d.signum() };
+            } else {
+                k.smooth.drive(v, how);
+            }
         }
     }
 
