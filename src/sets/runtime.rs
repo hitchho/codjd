@@ -160,6 +160,11 @@ fn control(c: model::Control) -> crate::audio::Control {
     }
 }
 
+/// The mixer deck of a patch slot: decks 0 and 1 are A and B, patch slots are 2..5
+fn slot_deck(slot: u8) -> usize {
+    2 + slot as usize
+}
+
 fn curve(c: model::Curve) -> crate::audio::Curve {
     match c {
         model::Curve::Linear => crate::audio::Curve::Linear,
@@ -196,6 +201,24 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
             None => (out, Box::new(at) as Box<dyn Fn(f64) -> f64>),
         };
         let (at_beat, kind) = match *it {
+            // patch knobs, patterns and live/cue are not automation items of this engine yet
+            PlanItem::KnobRamp { .. } | PlanItem::KnobSet { .. } | PlanItem::Pattern { .. } | PlanItem::Live { .. } => {
+                continue;
+            }
+            PlanItem::SlotRamp { slot, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
+                bt(start_beat_rel),
+                AutoKind::Ramp {
+                    deck: slot_deck(slot),
+                    control: control(c),
+                    from,
+                    to,
+                    end_beat: bt(end_beat_rel),
+                    curve: curve(cv),
+                },
+            ),
+            PlanItem::SlotSet { slot, control: c, value, at_beat_rel } => {
+                (bt(at_beat_rel), AutoKind::Set { deck: slot_deck(slot), control: control(c), value })
+            }
             PlanItem::Ramp { deck: d, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
                 bt(start_beat_rel),
                 AutoKind::Ramp {
@@ -288,6 +311,22 @@ fn item_text(it: &PlanItem, out: usize) -> String {
         PlanItem::Loop { deck, beats, .. } => format!("{} loop {} beats", who(*deck, out), num(*beats)),
         PlanItem::LoopOff { deck, .. } => format!("{} loop off", who(*deck, out)),
         PlanItem::Jump { deck, to_beat, .. } => format!("{} jump to beat {}", who(*deck, out), num(*to_beat)),
+        PlanItem::SlotRamp { slot, control, from, to, .. } => {
+            let from = from.map_or("_".to_string(), |f| num(f as f64));
+            format!("P{} {} {from} → {}", slot + 1, control_name(*control), num(*to as f64))
+        }
+        PlanItem::SlotSet { slot, control, value, .. } => {
+            format!("P{} {} = {}", slot + 1, control_name(*control), num(*value as f64))
+        }
+        PlanItem::KnobRamp { slot, name, from, to, .. } => {
+            let from = from.map_or("_".to_string(), |f| num(f as f64));
+            format!("P{} {name} {from} → {}", slot + 1, num(*to as f64))
+        }
+        PlanItem::KnobSet { slot, name, value, .. } => format!("P{} {name} = {}", slot + 1, num(*value as f64)),
+        PlanItem::Pattern { slot, name, pattern, .. } => {
+            format!("P{} {name} pattern {}", slot + 1, (b'A' + pattern) as char)
+        }
+        PlanItem::Live { slot, live, .. } => format!("P{} {}", slot + 1, if *live { "live" } else { "cue" }),
     }
 }
 

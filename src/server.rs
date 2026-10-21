@@ -59,8 +59,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
     let sets = crate::sets::store::Store::new(
-        sets_dir,
-        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await),
+        sets_dir.clone(),
+        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await.with_sets_dir(sets_dir)),
     );
     if let Err(e) = crate::sets::store::spawn_watcher(Arc::clone(&sets)) {
         eprintln!("can't watch the set folder: {e}");

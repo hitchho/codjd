@@ -75,6 +75,21 @@ impl PatchStore {
         Ok((text, h))
     }
 
+    /// What a set can address in patch `name`: its knobs (name, min, max) and sequencers, in the
+    /// order of the compiled graph. The error is the reason the patch can't be used.
+    pub fn info(&self, name: &str) -> Result<crate::sets::PatchInfo, String> {
+        let (text, _) = self.source(name)?;
+        let (_, g) = doc::load(&text).map_err(|e| e.join("; "))?;
+        Ok(crate::sets::PatchInfo {
+            knobs: g
+                .knobs
+                .iter()
+                .map(|(n, i)| (n.clone(), g.nodes[*i].num("min").unwrap_or(0.), g.nodes[*i].num("max").unwrap_or(1.)))
+                .collect(),
+            sequencers: g.sequencers.iter().map(|(n, _)| n.clone()).collect(),
+        })
+    }
+
     /// `PatchCheck`
     pub fn check(&self, json: &str) -> Vec<String> {
         doc::check(json)

@@ -26,7 +26,7 @@ use std::path::Path;
 pub use compile::{compile, MixPlan};
 pub use lexer::Diag;
 pub use model::Set;
-pub use resolve::{Env, LibTrack};
+pub use resolve::{Env, LibTrack, PatchInfo};
 
 /// A set that parsed, resolved and compiled cleanly
 #[derive(Debug, Clone, serde::Serialize)]
@@ -87,6 +87,10 @@ pub mod testenv {
         pub tracks: Vec<LibTrack>,
         pub grids: HashMap<PathBuf, Grid>,
         pub factors: HashMap<PathBuf, f64>,
+        /// the patch files: name -> what mix items can address
+        pub patches: HashMap<String, PatchInfo>,
+        /// `patch_info` is `None` (no patch folder) when false
+        pub has_patch_dir: bool,
     }
 
     pub fn grid(bpm: f64, first: f64, offset: u8) -> Grid {
@@ -128,12 +132,33 @@ pub mod testenv {
         fn grid_factor(&self, p: &Path) -> f64 {
             self.factors.get(p).copied().unwrap_or(1.)
         }
+        fn patch_info(&self, name: &str) -> Option<Result<PatchInfo, String>> {
+            self.has_patch_dir.then(|| {
+                self.patches.get(name).cloned().ok_or_else(|| {
+                    let mut names: Vec<&str> = self.patches.keys().map(String::as_str).collect();
+                    names.sort();
+                    format!("no patch \"{name}\" (patches: {})", if names.is_empty() { "none".into() } else { names.join(", ") })
+                })
+            })
+        }
     }
 
     /// the spec's example library: aft at 112 BPM (downbeat on beat 0), smk at 126 with its
     /// first downbeat on grid beat 2
     pub fn spec_env() -> FakeEnv {
-        let mut e = FakeEnv { root: "/music".into(), ..Default::default() };
+        let mut e = FakeEnv { root: "/music".into(), has_patch_dir: true, ..Default::default() };
+        e.patches.insert(
+            "acid".into(),
+            PatchInfo {
+                knobs: vec![("cutoff".into(), 0., 1.), ("reso".into(), 0., 0.95)],
+                sequencers: vec!["seq".into()],
+            },
+        );
+        e.patches.insert(
+            "drums".into(),
+            PatchInfo { knobs: vec![("swing".into(), 0., 0.75)], sequencers: vec!["kit".into(), "hats".into()] },
+        );
+        e.patches.insert("pad".into(), PatchInfo { knobs: vec![("mix".into(), 0., 1.)], sequencers: vec![] });
         e.add("Pneumatix", "Aftertekno", "Pneumatix - Aftertekno.flac", Some(grid(112., 0.5, 0)));
         e.add("Aasi & Swooh", "Smokin", "Aasi & Swooh - Smokin.flac", Some(grid(126., 0.1, 2)));
         e

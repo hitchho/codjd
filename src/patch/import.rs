@@ -212,6 +212,9 @@ fn word(name: &str, fallback: &str, taken: &mut HashSet<String>) -> String {
     if w.is_empty() || !w.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
         w = fallback.to_string();
     }
+    if MIXER_NAMES.contains(&w.as_str()) {
+        w.push_str("_knob");
+    }
     let base = w.clone();
     let mut n = 2;
     while !taken.insert(w.clone()) {

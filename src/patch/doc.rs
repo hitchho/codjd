@@ -287,6 +287,9 @@ pub fn is_word(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
+/// Names a set uses for the mixer of a patch deck (`acid.fader`): a knob can't have them
+pub const MIXER_NAMES: [&str; 6] = ["fader", "low", "mid", "high", "filter", "gain"];
+
 /// How a node is called in messages: `node 6 (lp)`
 pub fn label(id: &str, n: &NodeDoc) -> String {
     match &n.name {
@@ -396,6 +399,9 @@ pub fn to_graph(doc: &PatchDoc) -> Result<PatchGraph, Vec<String>> {
                 None | Some("") => errs.push(format!("{who}: a Knob needs a `name` (sets and clients address it by name)")),
                 Some(name) if !is_word(name) => errs.push(format!(
                     "{who}: knob name `{name}` can't be written in a set: letters, digits, `_` and `-`, starting with a letter"
+                )),
+                Some(name) if MIXER_NAMES.contains(&name) => errs.push(format!(
+                    "{who}: knob name `{name}` is a mixer control name (fader, low, mid, high, filter, gain): sets address the mixer as `<patch>.{name}`"
                 )),
                 Some(name) => {
                     if graph.knobs.iter().any(|(k, _)| k == name) {
@@ -789,6 +795,8 @@ pub(crate) mod tests {
             .replace("\"7\": {", "\"9\": { \"type\": \"Knob\", \"name\": \"lp\" }, \"7\": {"));
         assert_eq!(e, vec!["node 9 (lp): knob name `lp` used twice"]);
 
+        let e = errs(&tweak("\"name\": \"cutoff\"", "\"name\": \"filter\""));
+        assert!(e[0].contains("`filter` is a mixer control name"), "{e:?}");
         let e = errs(&tweak("\"name\": \"cutoff\", ", ""));
         assert!(e[0].starts_with("node 5: a Knob needs a `name`"), "{e:?}");
         let e = errs(&tweak("\"name\": \"cutoff\"", "\"name\": \"cut off\""));

@@ -20,6 +20,14 @@ pub struct LibTrack {
     pub path: PathBuf,
 }
 
+/// What a mix item needs to know of a patch file: its knobs (name, min, max) and sequencers, in
+/// the order of the compiled graph
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PatchInfo {
+    pub knobs: Vec<(String, f64, f64)>,
+    pub sequencers: Vec<String>,
+}
+
 /// What resolving needs from the outside world: the library and the analysis. The daemon
 /// implements it over the engine; tests with a fake.
 pub trait Env: Send + Sync {
@@ -35,6 +43,14 @@ pub trait Env: Send + Sync {
     fn grid_factor(&self, _path: &Path) -> f64 {
         1.
     }
+    /// The knobs and sequencers of patch file `name` (`patches/<name>.json`): `None` if this
+    /// environment has no patch folder, `Some(Err(why))` if there is no such patch or it is
+    /// invalid.
+    // MERGE(patch-engine): once `patch::program::compile` is merged, run it here too, so a set
+    // refuses a patch the engine would refuse to load (a cycle without a Delay or Hold)
+    fn patch_info(&self, _name: &str) -> Option<Result<PatchInfo, String>> {
+        None
+    }
 }
 
 /// Bounds of the values the engine accepts
@@ -49,6 +65,8 @@ pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>, Vec<D
     let mut warnings = Vec::new();
     let mut name: Option<String> = None;
     let mut tracks: Vec<Track> = Vec::new();
+    let mut patches: Vec<PatchDecl> = Vec::new();
+    let mut broken: Vec<String> = Vec::new();
     let mut mixes = Vec::new();
 
     for stmt in &ast.stmts {
@@ -67,13 +85,23 @@ pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>, Vec<D
                 }
                 tracks.push(resolve_track(t, env, &mut diags));
             }
-            Stmt::Mix(_) => {}
+            Stmt::Patch(_) | Stmt::Mix(_) => {}
+        }
+    }
+    // patches after the tracks, so an id can be checked against them
+    for stmt in &ast.stmts {
+        if let Stmt::Patch(p) = stmt {
+            match resolve_patch(p, &tracks, &patches, env, &mut diags, &mut warnings) {
+                Some(decl) => patches.push(decl),
+                // its items are skipped without more errors
+                None => broken.push(p.id.v.clone()),
+            }
         }
     }
     // mixes after all tracks, so they may be written anywhere
     for stmt in &ast.stmts {
         if let Stmt::Mix(m) = stmt {
-            if let Some(mix) = resolve_mix(m, &tracks, &mut diags, &mut warnings) {
+            if let Some(mix) = resolve_mix(m, &tracks, (&patches, &broken), &mut diags, &mut warnings) {
                 mixes.push(mix);
             }
         }
@@ -81,7 +109,7 @@ pub fn resolve(path: &Path, ast: &File, env: &dyn Env) -> (Set, Vec<Diag>, Vec<D
     let name = name.unwrap_or_else(|| {
         path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     });
-    (Set { name, file: path.to_path_buf(), tracks, mixes }, diags, warnings)
+    (Set { name, file: path.to_path_buf(), tracks, patches, mixes }, diags, warnings)
 }
 
 // ---- tracks ----
@@ -291,6 +319,198 @@ pub fn find_file(env: &dyn Env, name: &str) -> Result<PathBuf, String> {
     }
 }
 
+// ---- patches ----
+
+/// The slots a set can use: P1..P4 in the file, engine slots 0..3
+const SLOTS: u8 = 4;
+
+fn resolve_patch(
+    p: &parser::PatchAst,
+    tracks: &[Track],
+    patches: &[PatchDecl],
+    env: &dyn Env,
+    diags: &mut Vec<Diag>,
+    warnings: &mut Vec<Diag>,
+) -> Option<PatchDecl> {
+    let mut ok = true;
+    if tracks.iter().any(|t| t.id == p.id.v) || patches.iter().any(|x| x.id == p.id.v) {
+        diags.push(p.id.diag(format!("\"{}\" is already a track or a patch id", p.id.v)));
+        ok = false;
+    }
+    let slot = if p.slot.v.fract() == 0. && (1. ..=SLOTS as f64).contains(&p.slot.v) {
+        Some(p.slot.v as u8 - 1)
+    } else {
+        diags.push(p.slot.diag(format!("slots are 1..{SLOTS} (P1..P{SLOTS}), got {}", fmt_num(p.slot.v))));
+        None
+    };
+    if let Some(s) = slot {
+        if let Some(other) = patches.iter().find(|x| x.slot == s) {
+            diags.push(p.slot.diag(format!("slot {} is taken by patch {}", s + 1, other.id)));
+            ok = false;
+        }
+    }
+    let info = match env.patch_info(&p.name.v) {
+        None => {
+            diags.push(p.name.diag("patches are not available here (no patch folder)"));
+            return None;
+        }
+        Some(Err(e)) => {
+            diags.push(p.name.diag(format!("patch \"{}\": {e}", p.name.v)));
+            return None;
+        }
+        Some(Ok(i)) => i,
+    };
+    for (k, _, _) in &info.knobs {
+        if control_of(k).is_some() {
+            warnings.push(p.name.diag(format!(
+                "knob `{k}` of patch \"{}\" has the name of a mixer control: `{}.{k}` is the mixer, the knob can't be set from a set",
+                p.name.v, p.id.v
+            )));
+        }
+    }
+    ok.then_some(())?;
+    Some(PatchDecl { id: p.id.v.clone(), name: p.name.v.clone(), slot: slot?, knobs: info.knobs, sequencers: info.sequencers })
+}
+
+/// A mix item that is about a patch: `<patch>.<control or knob> ...`, `<patch> pattern <A-H>`,
+/// `<patch> live|cue`. `None` = the item isn't about a patch (the caller resolves it as a track
+/// item); `Some(None)` = it is, and was refused (diagnostic pushed).
+fn resolve_patch_item(
+    item: &parser::ItemAst,
+    line: &parser::TimedAst,
+    (patches, broken): (&[PatchDecl], &[String]),
+    diags: &mut Vec<Diag>,
+) -> Option<Option<(Vec<Action>, bool)>> {
+    let item_id = match &item.kind {
+        ItemKind::Ctl { track, .. } | ItemKind::Stop(track) | ItemKind::Loop { track, .. } | ItemKind::Jump { track, .. } => Some(track),
+        ItemKind::Pattern { patch, .. } | ItemKind::Live { patch, .. } => Some(patch),
+        ItemKind::Swap(_) | ItemKind::Xfade(_) => None,
+    };
+    if item_id.is_some_and(|id| broken.contains(&id.v)) {
+        return Some(None);
+    }
+    let find = |id: &Sp<String>| patches.iter().find(|p| p.id == id.v);
+    let ramp = line.end.is_some();
+    match &item.kind {
+        ItemKind::Ctl { track, control, op } => {
+            let p = find(track)?;
+            Some((|| {
+                let mixer = control_of(&control.v);
+                // the range and the name of what is controlled
+                let (lo, hi, name) = match mixer {
+                    Some(c) => {
+                        let (lo, hi) = range_of(c);
+                        (lo, hi, control_name(c).to_string())
+                    }
+                    None => match p.knobs.iter().find(|(k, _, _)| *k == control.v) {
+                        Some((k, lo, hi)) => (*lo, *hi, k.clone()),
+                        None => {
+                            diags.push(control.diag(format!(
+                                "unknown knob \"{}\" on patch {} (knobs: {}; mixer: fader, low, mid, high, filter, gain)",
+                                control.v,
+                                p.id,
+                                list(p.knobs.iter().map(|(k, _, _)| k.clone()))
+                            )));
+                            return None;
+                        }
+                    },
+                };
+                let in_range = |v: &Sp<f64>, diags: &mut Vec<Diag>| -> Option<f32> {
+                    if (lo..=hi).contains(&v.v) {
+                        Some(v.v as f32)
+                    } else {
+                        diags.push(v.diag(format!("{}.{name} {} is outside {}..{}", p.id, fmt_num(v.v), fmt_num(lo), fmt_num(hi))));
+                        None
+                    }
+                };
+                let knob_index = p.knobs.iter().position(|(k, _, _)| *k == control.v);
+                let set = |value: f32| match (mixer, knob_index) {
+                    (Some(c), _) => Action::SlotSet { slot: p.slot, control: c, value },
+                    (None, Some(k)) => Action::KnobSet { slot: p.slot, knob: k, name: control.v.clone(), value },
+                    (None, None) => unreachable!("checked above"),
+                };
+                match op {
+                    parser::CtlOp::Kill => match mixer.filter(|c| is_band(*c)) {
+                        Some(c) => Some((vec![Action::SlotSet { slot: p.slot, control: c, value: -1. }], false)),
+                        None => {
+                            diags.push(control.diag(format!("`kill` works on low, mid and high, not {name}")));
+                            None
+                        }
+                    },
+                    parser::CtlOp::Set(v) => Some((vec![set(in_range(v, diags)?)], false)),
+                    parser::CtlOp::Ramp { from, to, curve } => {
+                        if !ramp {
+                            diags.push(item.at.diag("a ramp needs a `bars <i>..<j>` line, not `bar`"));
+                            return None;
+                        }
+                        let from = match from {
+                            Some(f) => Some(in_range(f, diags)?),
+                            None => None,
+                        };
+                        let to = in_range(to, diags)?;
+                        let default = mixer.map_or(Curve::Linear, |c| c.default_curve());
+                        let curve = match curve {
+                            None => default,
+                            Some(s) => match s.v.as_str() {
+                                "linear" => Curve::Linear,
+                                "smooth" => Curve::Smooth,
+                                "exp" => Curve::Exp,
+                                other => {
+                                    diags.push(s.diag(format!("unknown curve \"{other}\" (linear, smooth, exp)")));
+                                    return None;
+                                }
+                            },
+                        };
+                        let a = match (mixer, knob_index) {
+                            (Some(c), _) => Action::SlotRamp { slot: p.slot, control: c, from, to, curve },
+                            (None, Some(k)) => Action::KnobRamp { slot: p.slot, knob: k, name: control.v.clone(), from, to, curve },
+                            (None, None) => unreachable!("checked above"),
+                        };
+                        Some((vec![a], true))
+                    }
+                }
+            })())
+        }
+        ItemKind::Pattern { patch, pattern } => {
+            let p = find(patch)?;
+            Some((|| {
+                let letter = pattern.v.chars().next().map(|c| c.to_ascii_uppercase());
+                let idx = match letter {
+                    Some(c @ 'A'..='H') if pattern.v.chars().count() == 1 => c as u8 - b'A',
+                    _ => {
+                        diags.push(pattern.diag(format!("patterns are A to H, got \"{}\"", pattern.v)));
+                        return None;
+                    }
+                };
+                if p.sequencers.is_empty() {
+                    diags.push(patch.diag(format!("patch {} has no sequencer to switch a pattern on", p.id)));
+                    return None;
+                }
+                let actions = p
+                    .sequencers
+                    .iter()
+                    .enumerate()
+                    .map(|(seq, name)| Action::Pattern { slot: p.slot, seq, name: name.clone(), pattern: idx })
+                    .collect();
+                Some((actions, false))
+            })())
+        }
+        ItemKind::Live { patch, live } => {
+            let p = find(patch)?;
+            Some(Some((vec![Action::Live { slot: p.slot, live: *live }], false)))
+        }
+        ItemKind::Stop(t) | ItemKind::Loop { track: t, .. } | ItemKind::Jump { track: t, .. } => {
+            let p = find(t)?;
+            diags.push(t.diag(format!(
+                "`{}` is a patch: it takes `.<knob>`, `.fader`, `.low`, `.mid`, `.high`, `.filter`, `.gain`, `pattern <A-H>`, `live` and `cue`",
+                p.id
+            )));
+            Some(None)
+        }
+        ItemKind::Swap(_) | ItemKind::Xfade(_) => None,
+    }
+}
+
 // ---- mixes ----
 
 fn control_of(name: &str) -> Option<Control> {
@@ -338,7 +558,13 @@ fn list(names: impl Iterator<Item = String>) -> String {
     }
 }
 
-fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>, warnings: &mut Vec<Diag>) -> Option<Mix> {
+fn resolve_mix(
+    m: &parser::MixAst,
+    tracks: &[Track],
+    (patches, broken): (&[PatchDecl], &[String]),
+    diags: &mut Vec<Diag>,
+    warnings: &mut Vec<Diag>,
+) -> Option<Mix> {
     let ids = || list(tracks.iter().map(|t| t.id.clone()));
     let find = |id: &Sp<String>, diags: &mut Vec<Diag>| {
         let r = tracks.iter().find(|t| t.id == id.v);
@@ -518,6 +744,14 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>, warn
             }
             for item in &t.items {
                 // a rejected item has pushed its diagnostic
+                if let Some(patch_item) = resolve_patch_item(item, t, (patches, broken), diags) {
+                    for action in patch_item.iter().flat_map(|(actions, _)| actions.iter().cloned()) {
+                        let is_ramp = matches!(action, Action::SlotRamp { .. } | Action::KnobRamp { .. });
+                        let end_bar = if is_ramp { t.end.as_ref().map(|e| e.v) } else { None };
+                        items.push(MixItem { at_bar: t.at.v, end_bar, action });
+                    }
+                    continue;
+                }
                 if let Some((action, is_ramp)) = resolve_item(item, t, (a, b), diags) {
                     let end_bar = if is_ramp { t.end.as_ref().map(|e| e.v) } else { None };
                     items.push(MixItem { at_bar: t.at.v, end_bar, action });
@@ -551,17 +785,27 @@ fn resolve_mix(m: &parser::MixAst, tracks: &[Track], diags: &mut Vec<Diag>, warn
 
 /// What an item changes, for the merge rule: a control of a deck, a band swap, or a kind of
 /// transport action (`stop`, loops, jumps) of a deck
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Touches {
     Control(Deck, Control),
     Swap(Control),
     Stop(Deck),
     Loop(Deck),
     Jump(Deck),
+    /// a patch deck's mixer control
+    Slot(u8, Control),
+    /// a patch knob
+    Knob(u8, usize),
+    Pattern(u8, usize),
+    Live(u8),
 }
 
 fn touches(a: &Action) -> Touches {
     match *a {
+        Action::SlotRamp { slot, control, .. } | Action::SlotSet { slot, control, .. } => Touches::Slot(slot, control),
+        Action::KnobRamp { slot, knob, .. } | Action::KnobSet { slot, knob, .. } => Touches::Knob(slot, knob),
+        Action::Pattern { slot, seq, .. } => Touches::Pattern(slot, seq),
+        Action::Live { slot, .. } => Touches::Live(slot),
         Action::Ramp { deck, control, .. } | Action::Set { deck, control, .. } => Touches::Control(deck, control),
         Action::Swap { band } => Touches::Swap(band),
         Action::Stop { deck } => Touches::Stop(deck),
@@ -713,6 +957,10 @@ fn resolve_item(
                     Some((Action::Ramp { deck, control: c, from, to, curve }, true))
                 }
             }
+        }
+        ItemKind::Pattern { patch: id, .. } | ItemKind::Live { patch: id, .. } => {
+            diags.push(id.diag(format!("no patch \"{}\" (declare it with `patch {} \"<name>\" slot 1`)", id.v, id.v)));
+            None
         }
         ItemKind::Stop(t) => {
             let (deck, _) = side(t, diags)?;
