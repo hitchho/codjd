@@ -146,8 +146,8 @@ Implemented in `src/patch/` (compiler, nodes) and `src/audio/mixer.rs` (slots). 
   by the grid, not by counting: its step is the clock's step, so it stays on the music across beat
   jumps, loops and tempo changes (a `Clock` through `ClockDiv`s is followed; any other clock signal is
   counted edge by edge).
-- **Patterns**: a pattern of N steps restarts every ceil(N / steps per bar) bars of its clock; a
-  queued pattern (`now = false`) is applied at the next bar start. `MonoSeq` plays one note per
+- **Patterns**: a pattern of N steps plays step `clock step mod N`, counted from a bar start (a
+  16-step pattern restarts every bar, a 32-step one every 2 bars); a queued pattern (`now = false`) is applied at the next bar start. `MonoSeq` plays one note per
   step (a later cell on a step replaces the earlier one); its `freq` holds after the gate ends.
   `scale` may start with a note name (`"D dorian"`); that sets the pitch class of the root, `root`
   keeps the octave (nearest note).
