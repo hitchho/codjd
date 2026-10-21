@@ -249,7 +249,8 @@ impl SeqState {
         let high = clock > 0.5;
         let rising = high && !self.prev_clock;
         self.prev_clock = high;
-        let gap = if rising { self.on_edge(gate_t.clamp(0.01, 1.), env) } else { 0 };
+        let gate_t = if gate_t.is_finite() { gate_t.clamp(0.01, 1.) } else { 0.5 };
+        let gap = if rising { self.on_edge(gate_t, env) } else { 0 };
         let n = if self.mono { 1 } else { MAX_ROWS_GATE };
         let mut gates = [0f32; MAX_ROWS_GATE];
         for r in 0..n {

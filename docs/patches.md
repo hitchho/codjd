@@ -125,6 +125,44 @@ Live edits: a knob, cell or pattern change never recompiles. A structural edit (
 added/removed) recompiles and swaps; node state (oscillator phases, envelope levels, sequencer
 positions) carries over for nodes whose id survived, and the swap crossfades old → new over 10 ms.
 
+### Engine behavior (clarifications, not contract changes)
+
+Implemented in `src/patch/` (compiler, nodes) and `src/audio/mixer.rs` (slots). Additions only.
+
+- **Compile errors** read `<node id>: message` (global ones have no prefix): no or several `AudioOut`,
+  an input wired to a node/output that does not exist, a loop that does not pass through a `Delay`
+  or `Hold` (`feedback loop through n1, n2: ...`; a loop through a `Delay`'s `time` input is still a
+  loop), unknown `scale`/`mode`/`source`, more than 8 patterns, 64 steps, 8 `GateSeq` rows, 64 knobs
+  or 8 sequencers.
+- **`Hold`** outputs the value held as of the start of the sample (its trigger takes effect one
+  sample later); `Delay` reads at least 2 samples back; `max` is capped at 2 s.
+- **Gates**: sequencer clocks and `ClockDiv` use a threshold of 0.5; `ADSR` and the drum voices
+  treat anything above 0.01 as a gate, and a drum's hit is scaled by the height of the gate at its
+  rising edge, so a `GateSeq` velocity is a hit velocity. Back-to-back sequencer gates leave one
+  sample of gap so an envelope retriggers.
+- **`Clock`**: `bar` is the position in the bar in beats (0..beats per bar, fractional), `beat` the
+  phase 0..1. `master` follows the deck on air; with no deck running on a grid it runs free at the
+  node's own `bpm`. `a`/`b` hold while that deck is stopped or has no grid. A sequencer is clocked
+  by the grid, not by counting: its step is the clock's step, so it stays on the music across beat
+  jumps, loops and tempo changes (a `Clock` through `ClockDiv`s is followed; any other clock signal is
+  counted edge by edge).
+- **Patterns**: a pattern of N steps restarts every ceil(N / steps per bar) bars of its clock; a
+  queued pattern (`now = false`) is applied at the next bar start. `MonoSeq` plays one note per
+  step (a later cell on a step replaces the earlier one); its `freq` holds after the gate ends.
+  `scale` may start with a note name (`"D dorian"`); that sets the pitch class of the root, `root`
+  keeps the octave (nearest note).
+- **Knobs** are set and automated in the knob's own units (clamped to its min..max), glide ~10 ms.
+- **Strip and live**: a slot's strip (gain, EQ, filter, fader, headphones cue) is the deck strip;
+  the 1 dBFS limiter sits after the strip and before the fader. A slot that is not live is heard in
+  the headphones whatever the cue button says. `Audio::patch_load` starts cue-only with the strip
+  neutral and drops the slot's knob/pattern automation; **`Audio::patch_swap(slot, program,
+  keep_live)`** (new) is the structural-edit path: state carries over (`Program::adopt_state`),
+  the strip stays and `keep_live = false` gives the contract's "cue-only after a structural edit".
+  `patch_unmute` (new) clears a `cpu overrun` mute; `Audio::set_patch_external_out(0|1)` and
+  `[patches] external_out` pick the external-mode deck output.
+- **CPU budget**: program time is measured per 64-frame block and amortized over the frames it
+  covers; the share is compared per audio callback.
+
 ## D-Bus (`net.rotko.Codj.Player`)
 
 | method | args | does |

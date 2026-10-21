@@ -146,7 +146,7 @@ impl Drum {
             DrumKind::Snare => (0.16, 0.012),
             DrumKind::Clap => (0.10, 0.0),
             DrumKind::HatClosed => (0.045, 0.0),
-            DrumKind::HatOpen => (0.32, 0.0),
+            DrumKind::HatOpen => (0.22, 0.0),
             DrumKind::Rim => (0.012, 0.0),
             DrumKind::Tom => (0.24, 0.06),
         };
@@ -189,7 +189,7 @@ impl Drum {
                 let body = (self.ph[0] * TAU).sin() as f32;
                 // a few milliseconds of click
                 let click = self.noise() * (-t * 900.).exp() * 0.35;
-                ((body * amp * 1.3).tanh() * 0.92) + click
+                (body * amp * 1.3).tanh() + click
             }
             DrumKind::Snare => {
                 let drop = 1. + 0.4 * self.pitch as f64;
@@ -199,7 +199,7 @@ impl Drum {
                 let n = self.noise();
                 let (_, bp, hp) = self.f1.run(n as f64);
                 let noise = (hp as f32 * 0.7 + bp as f32 * 0.3) * amp;
-                (tone * 0.5 + noise * 0.75).clamp(-1.5, 1.5)
+                (tone * 0.4 + noise * 0.6).clamp(-1.5, 1.5)
             }
             DrumKind::Clap => {
                 let n = self.noise();
@@ -210,7 +210,7 @@ impl Drum {
                 } else {
                     (-(t - 0.033) / (0.085 * self.decay)).exp()
                 };
-                bp as f32 * e * 2.6
+                bp as f32 * e * 3.6
             }
             DrumKind::HatClosed | DrumKind::HatOpen => {
                 let mut s = 0.;
@@ -225,20 +225,20 @@ impl Drum {
                 let (_, _, hp) = self.f1.run(s / 6.);
                 let (_, bp, _) = self.f2.run(hp);
                 let attack = (t * 4000.).min(1.);
-                (bp as f32 * 1.4 + hp as f32 * 0.35) * amp * attack
+                (bp as f32 * 3.6 + hp as f32 * 0.9) * amp * attack
             }
             DrumKind::Rim => {
                 self.ph[0] = (self.ph[0] + 1700. * tn * dt).fract();
                 self.ph[1] = (self.ph[1] + 480. * tn * dt).fract();
                 let n = self.noise() * 0.25;
-                ((self.ph[0] * TAU).sin() as f32 * 0.6 + (self.ph[1] * TAU).sin() as f32 * 0.5 + n) * amp * 1.2
+                ((self.ph[0] * TAU).sin() as f32 * 0.6 + (self.ph[1] * TAU).sin() as f32 * 0.5 + n) * amp * 0.9
             }
             DrumKind::Tom => {
                 let f = (95. + 70. * self.pitch as f64) * tn;
                 self.ph[0] = (self.ph[0] + f * dt).fract();
                 let body = (self.ph[0] * TAU).sin() as f32;
                 let click = self.noise() * (-t * 700.).exp() * 0.2;
-                (body * amp * 1.1).tanh() * 0.9 + click
+                (body * amp * 1.1).tanh() + click
             }
         };
         self.t += 1. / sr;
