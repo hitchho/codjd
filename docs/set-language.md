@@ -231,3 +231,18 @@ Sets are edited by people (vim, codj) and by AI agents (MCP) through the same ru
 - **Live safety**: writing a set never changes what is playing. A running mix keeps its plan; the
   edit applies to the next arm (see the runtime rules). Only arming/previewing changes the audio,
   and over MCP that needs `codj mcp --live`.
+
+## Inside codj: editor pane and prompt box
+
+- **Editor pane** (DJ mode, `:e` or `F10`): the active set's source in a vim-style editor
+  (normal/insert/visual, motions, `u`/`Ctrl-r`, `/` search), with the set's errors shown inline
+  and checked as you type (`SetCheck`, debounced). `:w` saves through `SetWrite` (author `human`,
+  with the base hash; on a conflict it shows the newer version and the diff). `:edit` still hands
+  the file to `$EDITOR` for full vim.
+- **Prompt box** (DJ mode, `:ai <text>` or `F11`): codj runs the agent configured in
+  `[agent] command` (default `claude -p`), with codj's MCP server attached (`codj mcp`, not live
+  unless `[agent] live = true`) and a context preamble: active set name and file, its tracks and
+  mixes, both decks' tracks/BPM/key/position, and the rule to edit only through the set tools.
+  The agent's output streams into a pane; when it finishes, codj shows the diff of every set file
+  it changed (from git, or `.bak`), with keep (`y`) or undo (`n`, reverts its commits). codj holds
+  no AI keys: the agent command brings its own. Any CLI agent works the same way.
