@@ -78,6 +78,22 @@ pub trait Host {
     fn play(&mut self, deck: usize) -> Result<(), String>;
     /// seconds decoded and whether decoding has finished
     fn decoded(&mut self, deck: usize) -> (f64, bool);
+
+    /// What patch deck `slot` (0..3) holds: (patch file name, has unsaved edits)
+    fn patch_in_slot(&mut self, _slot: usize) -> Option<(String, bool)> {
+        None
+    }
+    /// Loads patch file `name` into `slot` (cue-only), as `PatchLoad`
+    fn load_patch(&mut self, _slot: usize, _name: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// The knob and sequencer names of what `slot` holds now, in the engine's order (`None`: nothing
+    /// there, or this host doesn't know)
+    fn patch_names(&mut self, _slot: usize) -> Option<(Vec<String>, Vec<String>)> {
+        None
+    }
+    /// `<patch> live` / `<patch> cue` of a running mix: to the master, or headphones only
+    fn patch_live(&mut self, _slot: usize, _live: bool) {}
 }
 
 /// `SetState`, signature `(ssua(sss)a(ssdd)ibidba(ds))`
@@ -124,6 +140,10 @@ struct Armed {
     started: bool,
     /// whole beats the incoming deck's start was moved on by a late arm
     late: f64,
+    /// `<patch> live|cue` items of the plan by mix beat: the engine has no automation item for
+    /// them, the runtime fires them from its tick (up to a tick late)
+    live_items: Vec<(f64, usize, bool)>,
+    live_next: usize,
 }
 
 /// A preview waits for the decoder before it starts the outgoing deck
@@ -158,6 +178,11 @@ fn control(c: model::Control) -> crate::audio::Control {
         model::Control::Gain => A::Gain,
         model::Control::Crossfader => A::Crossfader,
     }
+}
+
+/// The mixer deck of a patch slot: decks 0 and 1 are A and B, patch slots are 2..5
+fn slot_deck(slot: u8) -> usize {
+    2 + slot as usize
 }
 
 fn curve(c: model::Curve) -> crate::audio::Curve {
@@ -196,6 +221,45 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
             None => (out, Box::new(at) as Box<dyn Fn(f64) -> f64>),
         };
         let (at_beat, kind) = match *it {
+            // `Live` is not an automation item: the runtime fires it from `follow` through
+            // `Host::patch_live`
+            PlanItem::Live { .. } => continue,
+            PlanItem::KnobRamp { slot, knob, from, to, start_beat_rel, end_beat_rel, curve: cv, .. } => (
+                bt(start_beat_rel),
+                AutoKind::Ramp {
+                    deck: slot_deck(slot),
+                    control: crate::audio::Control::Knob { slot: slot as usize, knob },
+                    from,
+                    to,
+                    end_beat: bt(end_beat_rel),
+                    curve: curve(cv),
+                },
+            ),
+            PlanItem::KnobSet { slot, knob, value, at_beat_rel, .. } => (
+                bt(at_beat_rel),
+                AutoKind::Set {
+                    deck: slot_deck(slot),
+                    control: crate::audio::Control::Knob { slot: slot as usize, knob },
+                    value,
+                },
+            ),
+            PlanItem::Pattern { slot, seq, pattern, at_beat_rel, .. } => {
+                (bt(at_beat_rel), AutoKind::Pattern { slot: slot as usize, seq, pattern: pattern as usize })
+            }
+            PlanItem::SlotRamp { slot, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
+                bt(start_beat_rel),
+                AutoKind::Ramp {
+                    deck: slot_deck(slot),
+                    control: control(c),
+                    from,
+                    to,
+                    end_beat: bt(end_beat_rel),
+                    curve: curve(cv),
+                },
+            ),
+            PlanItem::SlotSet { slot, control: c, value, at_beat_rel } => {
+                (bt(at_beat_rel), AutoKind::Set { deck: slot_deck(slot), control: control(c), value })
+            }
             PlanItem::Ramp { deck: d, control: c, from, to, start_beat_rel, end_beat_rel, curve: cv } => (
                 bt(start_beat_rel),
                 AutoKind::Ramp {
@@ -288,6 +352,22 @@ fn item_text(it: &PlanItem, out: usize) -> String {
         PlanItem::Loop { deck, beats, .. } => format!("{} loop {} beats", who(*deck, out), num(*beats)),
         PlanItem::LoopOff { deck, .. } => format!("{} loop off", who(*deck, out)),
         PlanItem::Jump { deck, to_beat, .. } => format!("{} jump to beat {}", who(*deck, out), num(*to_beat)),
+        PlanItem::SlotRamp { slot, control, from, to, .. } => {
+            let from = from.map_or("_".to_string(), |f| num(f as f64));
+            format!("P{} {} {from} → {}", slot + 1, control_name(*control), num(*to as f64))
+        }
+        PlanItem::SlotSet { slot, control, value, .. } => {
+            format!("P{} {} = {}", slot + 1, control_name(*control), num(*value as f64))
+        }
+        PlanItem::KnobRamp { slot, name, from, to, .. } => {
+            let from = from.map_or("_".to_string(), |f| num(f as f64));
+            format!("P{} {name} {from} → {}", slot + 1, num(*to as f64))
+        }
+        PlanItem::KnobSet { slot, name, value, .. } => format!("P{} {name} = {}", slot + 1, num(*value as f64)),
+        PlanItem::Pattern { slot, name, pattern, .. } => {
+            format!("P{} {name} pattern {}", slot + 1, (b'A' + pattern) as char)
+        }
+        PlanItem::Live { slot, live, .. } => format!("P{} {}", slot + 1, if *live { "live" } else { "cue" }),
     }
 }
 
@@ -406,11 +486,44 @@ impl Runtime {
         let Some(compiled) = good else {
             return Err(format!("set \"{name}\" has {errors} error(s) and no good version"));
         };
+        // a patch deck with somebody's unsaved edits is not ours to replace: refuse before changing anything
+        Self::check_patch_slots(h, &compiled)?;
         if self.active.as_ref().is_none_or(|a| a.file != file) {
             self.disarm(h);
         }
+        Self::load_set_patches(h, &compiled);
         self.activate(file, compiled);
         Ok(())
+    }
+
+    /// The set's `patch` lines against the patch decks: a slot holding another patch with unsaved
+    /// edits refuses (PatchSave or PatchUnload it first)
+    fn check_patch_slots(h: &mut dyn Host, c: &Compiled) -> Result<(), String> {
+        for p in &c.set.patches {
+            if let Some((name, true)) = h.patch_in_slot(p.slot as usize).filter(|(n, _)| *n != p.name) {
+                return Err(format!(
+                    "P{} holds patch \"{name}\" with unsaved edits: PatchSave or PatchUnload it before using this set",
+                    p.slot + 1
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads the set's patches into their slots (cue-only); a slot that already holds the patch
+    /// is left alone, with its live edits. A patch that fails to load is logged and skipped, the
+    /// set stays usable.
+    fn load_set_patches(h: &mut dyn Host, c: &Compiled) {
+        for p in &c.set.patches {
+            let slot = p.slot as usize;
+            if h.patch_in_slot(slot).is_some_and(|(n, _)| n == p.name) {
+                continue;
+            }
+            match h.load_patch(slot, &p.name) {
+                Ok(()) => info!(patch = %p.name, slot, "set patch loaded"),
+                Err(e) => warn!(patch = %p.name, slot, error = %e, "can't load the set's patch"),
+            }
+        }
     }
 
     /// `SetArm`
@@ -563,6 +676,11 @@ impl Runtime {
         }
         info!(file = %act.file.display(), "set reloaded");
         act.compiled = Arc::clone(&good);
+        if let Err(e) = Self::check_patch_slots(h, &good) {
+            warn!(error = %e, "the reloaded set's patches were not loaded");
+        } else {
+            Self::load_set_patches(h, &good);
+        }
         let Some(a) = &self.armed else { return };
         let Some(idx) = locate(&good, &a.plan.from_track, &a.plan.to_track, a.mix) else {
             if !a.started {
@@ -632,6 +750,17 @@ impl Runtime {
             }
         }
         let started = was_started || (mb >= 0. && going);
+        if started {
+            if let Some(a) = &mut self.armed {
+                while let Some(&(at, slot, live)) = a.live_items.get(a.live_next) {
+                    if at > mb + 1e-9 {
+                        break;
+                    }
+                    a.live_next += 1;
+                    h.patch_live(slot, live);
+                }
+            }
+        }
         if started && mb >= len {
             self.finished(h);
         }
@@ -678,6 +807,10 @@ impl Runtime {
     fn arm_inner(&mut self, h: &mut dyn Host, mix: usize, out_hint: Option<usize>, guard: bool) -> Result<(), String> {
         let compiled = Arc::clone(&self.active()?.compiled);
         let (plan, from, to) = plan_of(&compiled, mix)?;
+        // the patch in a slot may have been edited since the set was resolved: knobs and
+        // sequencers are found again by name
+        let resolved = reindex_patch_items(plan, h)?;
+        let plan = &resolved;
         let (og, ig) = Self::grids(from, to)?;
         let out = match out_hint {
             Some(d) => d,
@@ -742,9 +875,46 @@ impl Runtime {
             in_path,
             started: false,
             late,
+            live_items: plan
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    PlanItem::Live { slot, live, at_beat_rel } => Some((*at_beat_rel, *slot as usize, *live)),
+                    _ => None,
+                })
+                .collect(),
+            live_next: 0,
         });
         Ok(())
     }
+}
+
+/// `plan` with the knob and sequencer indices of its patch items looked up by name in what the
+/// slots hold now. A name that is gone is an error naming the ones there are.
+fn reindex_patch_items(plan: &MixPlan, h: &mut dyn Host) -> Result<MixPlan, String> {
+    let mut plan = plan.clone();
+    for it in &mut plan.items {
+        let (slot, name) = match it {
+            PlanItem::KnobRamp { slot, name, .. } | PlanItem::KnobSet { slot, name, .. } | PlanItem::Pattern { slot, name, .. } => {
+                (*slot as usize, name.clone())
+            }
+            _ => continue,
+        };
+        // nothing known of the slot: keep the indices, the engine refuses what is not there
+        let Some((knobs, seqs)) = h.patch_names(slot) else { continue };
+        let is_pattern = matches!(it, PlanItem::Pattern { .. });
+        let (what, names) = if is_pattern { ("sequencer", &seqs) } else { ("knob", &knobs) };
+        let Some(i) = names.iter().position(|n| *n == name) else {
+            let have = if names.is_empty() { "none".to_string() } else { names.join(", ") };
+            return Err(format!("P{} has no {what} '{name}' (it has: {have})", slot + 1));
+        };
+        match it {
+            PlanItem::KnobRamp { knob, .. } | PlanItem::KnobSet { knob, .. } => *knob = i,
+            PlanItem::Pattern { seq, .. } => *seq = i,
+            _ => {}
+        }
+    }
+    Ok(plan)
 }
 
 /// Where the incoming track starts, a beat of its own grid
@@ -790,7 +960,12 @@ mix smk -> xyz at bar 9 over 4 bars
 "#;
 
     fn env() -> FakeEnv {
-        let mut e = FakeEnv { root: "/music".into(), ..Default::default() };
+        let mut e = FakeEnv { root: "/music".into(), has_patch_dir: true, ..Default::default() };
+        e.patches.insert(
+            "acid".into(),
+            crate::sets::PatchInfo { knobs: vec![("cutoff".into(), 0., 1.)], sequencers: vec!["seq".into()] },
+        );
+        e.patches.insert("pad".into(), crate::sets::PatchInfo { knobs: vec![("mix".into(), 0., 1.)], sequencers: vec![] });
         e.add("P", "Aftertekno", "Aftertekno.flac", Some(grid(112., 0.5, 0)));
         e.add("A", "Smokin", "Smokin.flac", Some(grid(126., 0.1, 2)));
         e.add("X", "Xyz", "Xyz.flac", Some(grid(120., 0., 0)));
@@ -818,9 +993,32 @@ mix smk -> xyz at bar 9 over 4 bars
         sync_err: Option<String>,
         sched_fail_at: Option<usize>,
         decoded: [(f64, bool); 2],
+        /// slot -> (patch, dirty)
+        patch_slots: std::collections::HashMap<usize, (String, bool)>,
+        patch_loads: Vec<(usize, String)>,
+        patch_lives: Vec<(usize, bool)>,
+        patch_load_err: Option<String>,
+        patch_names: std::collections::HashMap<usize, (Vec<String>, Vec<String>)>,
     }
 
     impl Host for Fake {
+        fn patch_in_slot(&mut self, slot: usize) -> Option<(String, bool)> {
+            self.patch_slots.get(&slot).cloned()
+        }
+        fn patch_names(&mut self, slot: usize) -> Option<(Vec<String>, Vec<String>)> {
+            self.patch_names.get(&slot).cloned()
+        }
+        fn load_patch(&mut self, slot: usize, name: &str) -> Result<(), String> {
+            if let Some(e) = &self.patch_load_err {
+                return Err(e.clone());
+            }
+            self.patch_loads.push((slot, name.to_string()));
+            self.patch_slots.insert(slot, (name.to_string(), false));
+            Ok(())
+        }
+        fn patch_live(&mut self, slot: usize, live: bool) {
+            self.patch_lives.push((slot, live));
+        }
         fn deck(&mut self, d: usize) -> DeckView {
             self.decks[d].clone()
         }
@@ -1305,5 +1503,165 @@ mix smk -> xyz at bar 9 over 4 bars
         fn set_load_for_test(&mut self, h: &mut Fake, t: usize) {
             self.load_track(h, t).unwrap();
         }
+    }
+
+    const PATCH_SRC: &str = r#"
+patch acid "acid" slot 1
+patch pad "pad" slot 3
+track aft "Aftertekno.flac"
+  grid 112 @ 0.012s
+  cue outro bar 5
+track smk "Smokin.flac"
+
+mix aft -> smk at aft.outro over 8 bars
+  smk play
+  bars 0..4 acid.fader 0 -> 0.7; acid.cutoff 0.2 -> 0.8; pad.mix 0 -> 1
+  bar 1 acid pattern B; acid live; pad.high kill
+  bar 3 acid cue
+  bar 4 aft stop
+"#;
+
+    #[test]
+    fn patch_items_map_to_the_mixer_decks_knobs_and_patterns() {
+        let c = compiled(PATCH_SRC);
+        let plan = &c.plans[0];
+        let items = map_plan(plan, 0, 1, 3);
+        // only live/cue are not automation (the runtime fires them from the tick)
+        let live = plan.items.iter().filter(|i| matches!(i, PlanItem::Live { .. })).count();
+        assert_eq!(live, 2);
+        assert_eq!(items.len(), plan.items.len() - live);
+        let s = plan.start_beat;
+        // a patch deck's mixer is deck 2 + slot, P1 -> 2, P3 -> 4, on the outgoing deck's clock
+        assert!(items.contains(&AutoItem {
+            group: 3,
+            clock: 0,
+            at_beat: s,
+            kind: AutoKind::Ramp { deck: 2, control: AC::Fader, from: Some(0.), to: 0.7, end_beat: s + 16., curve: ACurve::Linear }
+        }));
+        assert!(items.contains(&AutoItem { group: 3, clock: 0, at_beat: s + 4., kind: AutoKind::Set { deck: 4, control: AC::High, value: -1. } }));
+        // the engine checks items against its 2 decks: the strip controls of channels 2..5 and the
+        // knobs and patterns of the patch slots pass
+        assert!(items.iter().all(|i| i.is_sane(crate::audio::DECKS)), "{items:?}");
+        assert!(items.iter().any(|i| matches!(
+            i.kind,
+            AutoKind::Ramp { control: crate::audio::Control::Knob { slot: 0, knob: 0 }, from: Some(f), to, .. } if f == 0.2 && to == 0.8
+        )));
+        assert!(items.iter().any(|i| matches!(i.kind, AutoKind::Pattern { slot: 0, seq: 0, pattern: 1 })));
+        // the text of the upcoming items
+        let texts: Vec<String> = next_items(plan, -1., 0).into_iter().map(|(_, t)| t).collect();
+        assert!(texts.contains(&"P1 cutoff 0.2 → 0.8".to_string()), "{texts:?}");
+        assert!(texts.contains(&"P1 fader 0 → 0.7".to_string()), "{texts:?}");
+        assert!(texts.contains(&"P1 seq pattern B".to_string()), "{texts:?}");
+        assert!(texts.contains(&"P1 live".to_string()) && texts.contains(&"P1 cue".to_string()), "{texts:?}");
+        assert!(texts.contains(&"P3 high = -1".to_string()), "{texts:?}");
+    }
+
+    fn armed_with_names(names: &[(usize, &[&str], &[&str])]) -> (Result<(), String>, Fake) {
+        let c = compiled(PATCH_SRC);
+        let mut rt = Runtime::default();
+        rt.activate("/sets/t.codj".into(), Arc::clone(&c));
+        let mut h = Fake::default();
+        h.decoded = [(1e6, true); 2];
+        h.decks[0] = DeckView { path: Some(p("Aftertekno.flac")), grid: Some(grid(112., 0.012, 0)), ..Default::default() };
+        for (slot, k, s) in names {
+            h.patch_names.insert(*slot, (k.iter().map(|x| x.to_string()).collect(), s.iter().map(|x| x.to_string()).collect()));
+        }
+        let r = rt.arm(&mut h, 0);
+        (r, h)
+    }
+
+    #[test]
+    fn arming_finds_knobs_and_sequencers_again_by_name() {
+        // the patch in P1 was edited since the set was resolved: `cutoff` is knob 2 now, `seq` is sequencer 1
+        let (r, h) = armed_with_names(&[(0, &["gain", "res", "cutoff"], &["drums", "seq"]), (2, &["mix"], &[])]);
+        r.unwrap();
+        assert!(h.scheduled.iter().any(|i| matches!(
+            i.kind,
+            AutoKind::Ramp { control: crate::audio::Control::Knob { slot: 0, knob: 2 }, .. }
+        )));
+        assert!(h.scheduled.iter().any(|i| matches!(i.kind, AutoKind::Pattern { slot: 0, seq: 1, pattern: 1 })));
+    }
+
+    #[test]
+    fn arming_refuses_a_knob_the_patch_no_longer_has() {
+        let (r, h) = armed_with_names(&[(0, &["gain", "res"], &["seq"]), (2, &["mix"], &[])]);
+        let e = r.unwrap_err();
+        assert!(e.contains("P1 has no knob 'cutoff'") && e.contains("gain, res"), "{e}");
+        assert!(h.scheduled.is_empty());
+    }
+
+    #[test]
+    fn live_and_cue_fire_from_the_tick_at_their_bar() {
+        let c = compiled(PATCH_SRC);
+        let mut rt = Runtime::default();
+        rt.activate("/sets/t.codj".into(), Arc::clone(&c));
+        let mut h = Fake::default();
+        h.decoded = [(1e6, true); 2];
+        h.decks[0] = DeckView { path: Some(p("Aftertekno.flac")), grid: c.set.track("aft").unwrap().grid.clone(), playing: true, fader: 1., ..Default::default() };
+        rt.arm(&mut h, 0).unwrap();
+        // nothing before the mix starts
+        put(&mut h, 0, &c, -2.);
+        rt.tick(&mut h);
+        assert!(h.patch_lives.is_empty());
+        // bar 1 is mix beat 4
+        put(&mut h, 0, &c, 3.9);
+        rt.tick(&mut h);
+        assert!(h.patch_lives.is_empty());
+        put(&mut h, 0, &c, 4.1);
+        rt.tick(&mut h);
+        assert_eq!(h.patch_lives, [(0, true)]);
+        // fired once
+        rt.tick(&mut h);
+        assert_eq!(h.patch_lives, [(0, true)]);
+        put(&mut h, 0, &c, 12.5);
+        rt.tick(&mut h);
+        assert_eq!(h.patch_lives, [(0, true), (0, false)]);
+    }
+
+    #[test]
+    fn set_use_loads_the_patches_and_protects_unsaved_edits() {
+        let (store, file, dir) = store_with(PATCH_SRC);
+        let mut rt = Runtime::default();
+        rt.set_store(Arc::clone(&store));
+        let mut h = Fake::default();
+        rt.use_set(&mut h, "t").unwrap();
+        assert_eq!(h.patch_loads, [(0, "acid".to_string()), (2, "pad".to_string())]);
+        // again: the slots hold them already (live edits survive)
+        h.patch_slots.get_mut(&0).unwrap().1 = true;
+        rt.use_set(&mut h, "t").unwrap();
+        assert_eq!(h.patch_loads.len(), 2);
+
+        // another patch with unsaved edits in a slot the set needs: refused, nothing changes
+        let mut h2 = Fake::default();
+        h2.patch_slots.insert(2, ("drums".to_string(), true));
+        let mut rt2 = Runtime::default();
+        rt2.set_store(Arc::clone(&store));
+        let e = rt2.use_set(&mut h2, "t").unwrap_err();
+        assert_eq!(e, "P3 holds patch \"drums\" with unsaved edits: PatchSave or PatchUnload it before using this set");
+        assert!(h2.patch_loads.is_empty() && rt2.active_file().is_none());
+        // a clean one is replaced
+        h2.patch_slots.insert(2, ("drums".to_string(), false));
+        rt2.use_set(&mut h2, "t").unwrap();
+        assert_eq!(h2.patch_loads, [(0, "acid".to_string()), (2, "pad".to_string())]);
+
+        // a patch that won't load doesn't make the set unusable
+        let mut h3 = Fake::default();
+        h3.patch_load_err = Some("cannot compile".into());
+        let mut rt3 = Runtime::default();
+        rt3.set_store(Arc::clone(&store));
+        rt3.use_set(&mut h3, "t").unwrap();
+        assert!(rt3.active_file().is_some());
+
+        // hot reload loads a patch the new version adds
+        let mut h4 = Fake::default();
+        let mut rt4 = Runtime::default();
+        rt4.set_store(Arc::clone(&store));
+        rt4.use_set(&mut h4, "t").unwrap();
+        h4.patch_loads.clear();
+        std::fs::write(&file, PATCH_SRC.replace("patch pad \"pad\" slot 3", "patch pad \"pad\" slot 4")).unwrap();
+        store.reload_file(&file);
+        rt4.tick(&mut h4);
+        assert_eq!(h4.patch_loads, [(3, "pad".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,7 +33,7 @@ pub fn hash(bytes: &[u8]) -> String {
 }
 
 /// The prefix of the commit message for `author`: `codj` or `codj (agent: name)`
-fn commit_prefix(author: &str) -> Result<String, String> {
+pub(crate) fn commit_prefix(author: &str) -> Result<String, String> {
     if author == "human" {
         return Ok("codj".into());
     }
@@ -51,22 +51,27 @@ fn commit_prefix(author: &str) -> Result<String, String> {
     }
 }
 
-/// A file stem for a new set from what the caller called it; no paths, no `..`
-fn new_stem(name: &str) -> Result<String, String> {
+/// A file stem for a new file of kind `what` ("set", "patch") from what the caller called it;
+/// no paths, no `..`; a trailing `ext` (`.codj`) is not doubled
+pub(crate) fn stem_for(what: &str, ext: &str, name: &str) -> Result<String, String> {
     if name.contains(['/', '\\', '\0']) || name.contains("..") {
-        return Err("a set name is a file name: no paths and no `..`".into());
+        return Err(format!("a {what} name is a file name: no paths and no `..`"));
     }
     let name = name.trim();
-    let name = name.strip_suffix(".codj").unwrap_or(name);
+    let name = name.strip_suffix(ext).unwrap_or(name);
     let stem: String = name
         .chars()
         .map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | ' ' | '.') { c } else { '_' })
         .collect();
     let stem = stem.trim().to_string();
     if stem.is_empty() || stem.starts_with('.') {
-        return Err(format!("\"{name}\" can't be a set file name"));
+        return Err(format!("\"{name}\" can't be a {what} file name"));
     }
     Ok(stem)
+}
+
+fn new_stem(name: &str) -> Result<String, String> {
+    stem_for("set", ".codj", name)
 }
 
 /// What a modification makes of the current text: the new text and a tail for the `ok` reply
@@ -180,29 +185,43 @@ impl Editor {
 
     /// Versions the old file, replaces it atomically, loads the new one. Under the lock.
     fn save(&self, file: &Path, text: &str, prefix: &str, what: &str, existed: bool) -> Result<String, String> {
-        let dir = file.parent().ok_or("no folder")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
-        let git = in_git_work_tree(dir);
-        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if existed {
-            if git {
-                // hand edits that were never committed are history too
-                snapshot_hand_edits(dir, &name, what);
-            } else if let Err(e) = std::fs::copy(file, backup_path(file)) {
-                warn!(file = %file.display(), error = %e, "can't keep the previous version as .bak");
-            }
-        }
-        atomic_write(file, text.as_bytes()).map_err(|e| format!("can't write {}: {e}", file.display()))?;
-        if git {
-            commit(dir, &name, &format!("{prefix}: {what}"));
-        }
+        let hash = versioned_save(file, text.as_bytes(), prefix, what, existed)?;
         self.store.reload_file(file);
         info!(file = %file.display(), what, "set written");
-        Ok(hash(text.as_bytes()))
+        Ok(hash)
     }
 }
 
-fn refusal(errors: &[String]) -> String {
+/// Serializes the git work of every writer (sets and patches share a repository, and git
+/// refuses to run two commands on one index at once)
+static GIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// The versioning half of a write, shared by sets and patches: the previous version is kept (a
+/// git commit of hand edits, or `<file>.bak` without git), `bytes` replace the file atomically,
+/// and in a git work tree the file is committed as `<prefix>: <what>`. The caller has checked
+/// the content and the base version, and holds its own lock. Returns the hash of `bytes`.
+pub(crate) fn versioned_save(file: &Path, bytes: &[u8], prefix: &str, what: &str, existed: bool) -> Result<String, String> {
+    let _git = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = file.parent().ok_or("no folder")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    let git = in_git_work_tree(dir);
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if existed {
+        if git {
+            // hand edits that were never committed are history too
+            snapshot_hand_edits(dir, &name, what);
+        } else if let Err(e) = std::fs::copy(file, backup_path(file)) {
+            warn!(file = %file.display(), error = %e, "can't keep the previous version as .bak");
+        }
+    }
+    atomic_write(file, bytes).map_err(|e| format!("can't write {}: {e}", file.display()))?;
+    if git {
+        commit(dir, &name, &format!("{prefix}: {what}"));
+    }
+    Ok(hash(bytes))
+}
+
+pub(crate) fn refusal(errors: &[String]) -> String {
     format!("the text has {} error(s):\n{}", errors.len(), errors.join("\n"))
 }
 
@@ -242,7 +261,7 @@ pub fn atomic_write(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
 // ---- git, inside the set folder only ----
 
 /// Runs `git -C dir args`, killing it after [`GIT_TIMEOUT`]. Ok(stdout) on exit 0.
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     // whatever the environment says, work on the repository of this folder

@@ -1,0 +1,39 @@
+{
+  "codj_patch": 1,
+  "title": "four on the floor",
+  "nodes": {
+    "1": { "type": "Clock", "name": "clock", "x": 20, "y": 20,
+           "params": { "source": "master", "steps_per_beat": 4 } },
+    "2": { "type": "GateSeq", "name": "kit", "x": 150, "y": 20, "ins": { "clock": ["1", "out"] },
+           "params": {
+             "steps": 16, "rows": 4, "pattern": 0,
+             "row_names": ["kick", "clap", "hat", "open hat"],
+             "patterns": [
+               { "steps": 16, "cells": [
+                   [0, 0], [4, 0], [8, 0], [12, 0],
+                   [4, 1], [12, 1],
+                   [2, 2], [6, 2], [10, 2], [14, 2],
+                   [15, 3] ] },
+               { "steps": 16, "cells": [
+                   [0, 0], [4, 0], [8, 0], [12, 0], [14, 0],
+                   [4, 1], [12, 1], [15, 1],
+                   [0, 2, 0.6], [1, 2, 0.4], [2, 2], [3, 2, 0.4], [4, 2, 0.6], [5, 2, 0.4], [6, 2], [7, 2, 0.4],
+                   [8, 2, 0.6], [9, 2, 0.4], [10, 2], [11, 2, 0.4], [12, 2, 0.6], [13, 2, 0.4], [14, 2], [15, 2, 0.4],
+                   [6, 3], [14, 3] ] }
+             ]
+           } },
+    "3": { "type": "Knob", "name": "kick_level", "x": 350, "y": 20, "params": { "min": 0.0, "max": 1.0, "value": 1.0 } },
+    "4": { "type": "Knob", "name": "clap_level", "x": 350, "y": 100, "params": { "min": 0.0, "max": 1.0, "value": 0.7 } },
+    "5": { "type": "Knob", "name": "hat_level", "x": 350, "y": 180, "params": { "min": 0.0, "max": 1.0, "value": 0.5 } },
+    "6": { "type": "Knob", "name": "kick_decay", "x": 350, "y": 260, "params": { "min": -0.5, "max": 0.5, "value": 0.0 } },
+    "7": { "type": "Kick", "name": "bd", "x": 500, "y": 20,
+           "ins": { "trig": ["2", "gate0"], "level": ["3", "out"], "decay": ["6", "out"] } },
+    "8": { "type": "Clap", "name": "cp", "x": 500, "y": 100, "ins": { "trig": ["2", "gate1"], "level": ["4", "out"] } },
+    "9": { "type": "HatClosed", "name": "ch", "x": 500, "y": 180, "ins": { "trig": ["2", "gate2"], "level": ["5", "out"] } },
+    "10": { "type": "HatOpen", "name": "oh", "x": 500, "y": 260, "ins": { "trig": ["2", "gate3"], "level": ["5", "out"] } },
+    "11": { "type": "Mix4", "name": "kit mix", "x": 700, "y": 120,
+            "ins": { "in0": ["7", "out"], "in1": ["8", "out"], "in2": ["9", "out"], "in3": ["10", "out"], "g0": 1, "g1": 0.9, "g2": 0.8, "g3": 0.7 } },
+    "12": { "type": "Mul", "name": "trim", "x": 850, "y": 120, "ins": { "in0": ["11", "out"], "in1": 0.8 } },
+    "13": { "type": "AudioOut", "x": 1000, "y": 120, "ins": { "left": ["12", "out"], "right": ["12", "out"] } }
+  }
+}

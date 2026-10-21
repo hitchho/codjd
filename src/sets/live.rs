@@ -16,6 +16,8 @@ pub struct LiveEnv {
     root: PathBuf,
     library: Vec<LibTrack>,
     analyzer: Arc<Analyzer>,
+    /// the set folder, whose `patches` folder holds the patch files
+    sets_dir: Option<PathBuf>,
 }
 
 impl LiveEnv {
@@ -36,13 +38,21 @@ impl LiveEnv {
             })
             .await
             .unwrap_or_default();
-        Self { root, library, analyzer: Arc::clone(analyzer) }
+        Self { root, library, analyzer: Arc::clone(analyzer), sets_dir: None }
+    }
+}
+
+impl LiveEnv {
+    /// Patch files are read from `<sets_dir>/patches`
+    pub fn with_sets_dir(mut self, sets_dir: PathBuf) -> Self {
+        self.sets_dir = Some(sets_dir);
+        self
     }
 }
 
 /// Takes a new snapshot into `store` and tries the sets that had errors again
 pub async fn refresh(store: &Arc<Store>, codjd: &Codjd, analyzer: &Arc<Analyzer>) {
-    store.set_env(Arc::new(LiveEnv::snapshot(codjd, analyzer).await));
+    store.set_env(Arc::new(LiveEnv::snapshot(codjd, analyzer).await.with_sets_dir(store.dir().to_path_buf())));
     store.retry_errors();
 }
 
@@ -57,6 +67,11 @@ impl Env for LiveEnv {
 
     fn analysis_grid(&self, path: &std::path::Path) -> Option<Grid> {
         self.analyzer.features(path).and_then(|f| f.grid().cloned())
+    }
+
+    fn patch_info(&self, name: &str) -> Option<Result<super::PatchInfo, String>> {
+        let dir = self.sets_dir.as_ref()?;
+        Some(crate::patch::store::PatchStore::new(dir).info(name))
     }
 
     fn grid_factor(&self, path: &std::path::Path) -> f64 {

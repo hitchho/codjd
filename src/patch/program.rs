@@ -34,14 +34,15 @@ pub struct DeckClock {
     pub offset: u32,
 }
 
-#[allow(dead_code)] // for tests and tools
 impl DeckClock {
     /// A steady clock at `bpm` from beat 0 at frame 0 (4 beats to the bar), for tests and tools
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn steady(bpm: f64, sample_rate: f64) -> Self {
         DeckClock { playing: true, beat: 0., dbeat: bpm / 60. / sample_rate, per_bar: 4, offset: 0 }
     }
 
     /// The same clock `frames` frames later
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn advanced(mut self, frames: usize) -> Self {
         self.beat += frames as f64 * self.dbeat;
         self
@@ -59,12 +60,13 @@ pub struct ClockFeed {
     pub b: DeckClock,
 }
 
-#[allow(dead_code)] // for tests and tools
 impl ClockFeed {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn all(c: DeckClock) -> Self {
         ClockFeed { master: c, a: c, b: c }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn advanced(self, frames: usize) -> Self {
         ClockFeed { master: self.master.advanced(frames), a: self.a.advanced(frames), b: self.b.advanced(frames) }
     }
@@ -118,7 +120,6 @@ fn bad(id: &str, msg: impl std::fmt::Display) -> String {
 
 /// Compiles a validated graph for `sample_rate`. Errors name the node (`<id>: message`).
 // called by the document layer, which lands separately
-#[allow(dead_code)]
 pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> {
     if sample_rate < 8000 {
         return Err("sample rate too low".into());
@@ -420,12 +421,7 @@ fn knob_range(s: &super::graph::NodeSpec) -> (f32, f32) {
     }
 }
 
-#[allow(dead_code)] // part of the API the document layer uses
 impl Program {
-    pub fn sample_rate(&self) -> u32 {
-        self.sr as u32
-    }
-
     pub fn knob_count(&self) -> usize {
         self.knobs.len()
     }
@@ -437,10 +433,6 @@ impl Program {
     /// The value a knob is gliding to
     pub fn knob_value(&self, knob: usize) -> Option<f32> {
         self.knobs.get(knob).map(|k| k.smooth.target)
-    }
-
-    pub fn knob_range(&self, knob: usize) -> Option<(f32, f32)> {
-        self.knobs.get(knob).map(|k| (k.min, k.max))
     }
 
     /// Moves a knob (clamped to its range); `Glide` is a hand on it, `Slew` and `Snap` what

@@ -29,6 +29,8 @@ pub struct Bus {
     pub sets: Arc<crate::sets::store::Store>,
     /// every write to a set file goes through it (validated, hashed, versioned)
     pub editor: Arc<crate::sets::write::Editor>,
+    /// the patch files (`<sets dir>/patches`), written through the same versioned path
+    pub patches: Arc<crate::patch::store::PatchStore>,
 }
 
 impl Bus {
@@ -625,6 +627,130 @@ impl Bus {
         }
     }
 
+    // ---- patch decks (docs/patches.md) ----
+
+    /// (name, title) of every patch file
+    async fn patch_list(&self) -> Vec<(String, String)> {
+        let store = Arc::clone(&self.patches);
+        tokio::task::spawn_blocking(move || store.list()).await.unwrap_or_default()
+    }
+
+    /// the patch file as on disk and its sha-256
+    async fn patch_source(&self, name: String) -> zbus::fdo::Result<(String, String)> {
+        self.patches.source(&name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// the errors of `json` as a patch file (`node 6 (lp): ...`), empty = valid
+    async fn patch_check(&self, json: String) -> Vec<String> {
+        crate::patch::doc::check(&json)
+    }
+
+    /// save `json` as patch `name` after checking it; `base_hash` is the hash it was based on
+    /// ("" for a new patch). Replies `ok <new hash>` or the reason
+    async fn patch_write(&self, name: String, json: String, base_hash: String, author: String) -> String {
+        let store = Arc::clone(&self.patches);
+        let sets = Arc::clone(&self.sets);
+        let done = tokio::task::spawn_blocking(move || {
+            let r = store.write(&name, &json, &base_hash, &author);
+            if r.is_ok() {
+                // a set that was waiting for this patch
+                sets.retry_errors();
+            }
+            r
+        })
+        .await;
+        match done {
+            Ok(Ok(hash)) => format!("ok {hash}"),
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
+    }
+
+    /// import the NoiseCraft file at `ncft_path` as patch `name`; replies `ok <hash> (<notes>)`
+    async fn patch_import(&self, ncft_path: String, name: String, author: String) -> String {
+        let store = Arc::clone(&self.patches);
+        let sets = Arc::clone(&self.sets);
+        let done = tokio::task::spawn_blocking(move || {
+            let r = store.import(&ncft_path, &name, &author);
+            if r.is_ok() {
+                sets.retry_errors();
+            }
+            r
+        })
+        .await;
+        match done {
+            Ok(Ok((hash, notes))) => format!("ok {hash} ({})", notes.join("; ")),
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
+    }
+
+    /// compile patch `name` and load it into `slot` 0..3, cue-only
+    async fn patch_load(&self, slot: u32, name: String) -> String {
+        let store = Arc::clone(&self.patches);
+        let n = name.clone();
+        let text = tokio::task::spawn_blocking(move || store.source(&n)).await;
+        let json = match text {
+            Ok(Ok((json, _))) => json,
+            Ok(Err(e)) => return e,
+            Err(e) => return format!("internal error: {e}"),
+        };
+        reply(self.codjd.call(move |e| e.patch_load(slot, &name, &json)).await)
+    }
+
+    async fn patch_unload(&self, slot: u32) -> String {
+        reply(self.codjd.call(move |e| e.patch_unload(slot)).await)
+    }
+
+    /// edit the slot's patch live: a JSON action (`{"op": "knob", ...}`); `ok` or the reason
+    async fn patch_action(&self, slot: u32, action_json: String) -> String {
+        reply(self.codjd.call(move |e| e.patch_action(slot, &action_json)).await)
+    }
+
+    async fn patch_undo(&self, slot: u32) -> String {
+        reply(self.codjd.call(move |e| e.patch_undo(slot)).await)
+    }
+
+    async fn patch_redo(&self, slot: u32) -> String {
+        reply(self.codjd.call(move |e| e.patch_redo(slot)).await)
+    }
+
+    /// write the slot's patch, with its live edits, as patch `name`; replies `ok <new hash>`
+    async fn patch_save(&self, slot: u32, name: String, author: String) -> String {
+        let job = match self.codjd.call(move |e| e.patch_save_job(slot)).await {
+            None => return "engine not running".to_string(),
+            Some(Err(e)) => return e,
+            Some(Ok(job)) => job,
+        };
+        // saving over the file it came from is based on the version it was read as; under
+        // another name it is a new patch (or refused if that exists)
+        let stem = |n: &str| n.strip_suffix(".json").unwrap_or(n).to_string();
+        let base = if stem(&name) == stem(&job.from) { job.base_hash.clone() } else { String::new() };
+        let store = Arc::clone(&self.patches);
+        let (n, json) = (name.clone(), job.json.clone());
+        let done = tokio::task::spawn_blocking(move || store.write(&n, &json, &base, &author)).await;
+        match done {
+            Ok(Ok(hash)) => {
+                let (n, h, j) = (stem(&name), hash.clone(), job.json);
+                self.codjd.tell(move |e| e.patch_saved(slot, &n, &h, &j));
+                format!("ok {hash}")
+            }
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
+    }
+
+    /// to the master (`live`), or back to the headphones only
+    async fn patch_live(&self, slot: u32, live: bool) -> String {
+        reply(self.codjd.call(move |e| e.patch_set_live(slot, live)).await)
+    }
+
+    /// the four slots: (loaded, name, title, dirty, live, cpu, muted reason, knobs, sequencers,
+    /// fader, headphones)
+    async fn patch_state(&self) -> Vec<crate::patch::slots::PatchSlot> {
+        self.ask(|e| e.patch_state()).await
+    }
+
     /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases
     async fn dj_nudge(&self, deck: u32, amount: f64) -> String {
         reply(self.codjd.call(move |e| e.deck_nudge(deck as usize, amount)).await)
@@ -916,6 +1042,22 @@ mod tests {
         assert_eq!(
             <crate::sets::runtime::SetState as Type>::SIGNATURE.to_string(),
             "(ssua(sss)a(ssdd)ibidba(ds))"
+        );
+    }
+
+    #[test]
+    fn patch_signatures_are_pinned() {
+        // PatchList() -> a(ss), PatchSource(s) -> (ss) as two out-arguments, PatchCheck(s) -> as,
+        // PatchState() -> a(bssbbdsa(sddd)a(suuu)db)
+        assert_eq!(<Vec<(String, String)> as Type>::SIGNATURE.to_string(), "a(ss)");
+        assert_eq!(<(String, String) as Type>::SIGNATURE.to_string(), "(ss)");
+        assert_eq!(
+            <crate::patch::slots::PatchSlot as Type>::SIGNATURE.to_string(),
+            "(bssbbdsa(sddd)a(suuu)db)"
+        );
+        assert_eq!(
+            <Vec<crate::patch::slots::PatchSlot> as Type>::SIGNATURE.to_string(),
+            "a(bssbbdsa(sddd)a(suuu)db)"
         );
     }
 

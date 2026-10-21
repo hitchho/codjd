@@ -21,7 +21,6 @@ pub enum Control {
     Filter,
     Gain,
     Crossfader,
-    #[allow(dead_code)] // moved by the patch layer's sets
     Knob { slot: usize, knob: usize },
 }
 
@@ -143,7 +142,6 @@ pub enum AutoKind {
     Jump { deck: usize, to_beat: f64 },
     /// switch a patch sequencer (`seq` = its index in the patch's sequencer list) to `pattern`
     /// 0..7 at `at_beat`
-    #[allow(dead_code)] // scheduled by the patch layer's sets
     Pattern { slot: usize, seq: usize, pattern: usize },
 }
 

@@ -13,10 +13,32 @@ pub struct Set {
     /// the `.codj` file it came from
     pub file: PathBuf,
     pub tracks: Vec<Track>,
+    /// `patch` lines
+    pub patches: Vec<PatchDecl>,
     pub mixes: Vec<Mix>,
 }
 
+/// `patch <id> "<name>" slot <n>`: a patch file the set plays on a patch deck, with what the
+/// file offers to mix items (read from the patch file when the set is resolved)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PatchDecl {
+    pub id: String,
+    /// the patch file: `<sets dir>/patches/<name>.json`
+    pub name: String,
+    /// engine slot 0..3 (the file says `slot 1..4`, P1..P4); the mixer deck is `2 + slot`
+    pub slot: u8,
+    /// (name, min, max) in the patch's knob order
+    pub knobs: Vec<(String, f64, f64)>,
+    /// sequencer names in the patch's order
+    pub sequencers: Vec<String>,
+}
+
 impl Set {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn patch(&self, id: &str) -> Option<&PatchDecl> {
+        self.patches.iter().find(|p| p.id == id)
+    }
+
     pub fn track(&self, id: &str) -> Option<&Track> {
         self.tracks.iter().find(|t| t.id == id)
     }
@@ -199,4 +221,14 @@ pub enum Action {
     JumpTo { deck: Deck, to_beat: f64 },
     /// `jump <±k> beats`
     JumpBy { deck: Deck, beats: f64 },
+    /// `<patch>.<fader|low|mid|high|filter|gain>`: the patch deck's mixer (deck `2 + slot`)
+    SlotRamp { slot: u8, control: Control, from: Option<f32>, to: f32, curve: Curve },
+    SlotSet { slot: u8, control: Control, value: f32 },
+    /// `<patch>.<knob>`: `knob` is the index in the patch's knob order, `name` for messages
+    KnobRamp { slot: u8, knob: usize, name: String, from: Option<f32>, to: f32, curve: Curve },
+    KnobSet { slot: u8, knob: usize, name: String, value: f32 },
+    /// `<patch> pattern <A-H>`, one per sequencer of the patch
+    Pattern { slot: u8, seq: usize, name: String, pattern: u8 },
+    /// `<patch> live` / `<patch> cue`
+    Live { slot: u8, live: bool },
 }

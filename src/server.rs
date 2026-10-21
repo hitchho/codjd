@@ -59,8 +59,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
     let sets = crate::sets::store::Store::new(
-        sets_dir,
-        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await),
+        sets_dir.clone(),
+        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await.with_sets_dir(sets_dir)),
     );
     if let Err(e) = crate::sets::store::spawn_watcher(Arc::clone(&sets)) {
         eprintln!("can't watch the set folder: {e}");
@@ -82,12 +82,18 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let editor = crate::sets::write::Editor::new(Arc::clone(&sets));
+    let patches = Arc::new(crate::patch::store::PatchStore::new(sets.dir()));
+    {
+        let patches = Arc::clone(&patches);
+        codjd.tell(move |e| e.set_patch_store(patches));
+    }
     let bus = Bus {
         codjd: codjd.clone(),
         slsk,
         analysis: Arc::clone(&analysis),
         sets: Arc::clone(&sets),
         editor,
+        patches,
     };
     let connection = connection::Builder::session()?
         .name(BUS_NAME)?

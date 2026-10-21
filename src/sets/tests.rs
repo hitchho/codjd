@@ -742,3 +742,187 @@ fn the_recipes_example_loads_without_warnings() {
     assert!(l.warnings.is_empty(), "{:#?}", l.warnings);
     assert_eq!(l.compiled.unwrap().plans.len(), 5);
 }
+
+// ---- patch decks ----
+
+const PATCHED: &str = r#"
+patch acid "acid" slot 1
+patch kit "drums" slot 3
+patch pad "pad" slot 4
+
+track aft "Pneumatix - Aftertekno.flac"
+  cue outro bar 129
+track smk "Smokin"
+
+mix aft -> smk at aft.outro over 32 bars
+  bars 0..16   acid.cutoff 0.2 -> 0.8 smooth; acid.fader 0 -> 0.7; kit.swing = 0.5
+  bar 8        acid pattern B; kit.low kill
+  bar 16       acid live; kit.gain = -3
+  bar 24       acid cue; pad.mix = 1
+  bars 16..32  acid.reso 0 -> 0.9
+"#;
+
+#[test]
+fn patch_lines_and_items_compile_to_plan_items() {
+    let c = good(&PATCHED);
+    assert_eq!(c.set.patches.len(), 3);
+    let acid = c.set.patch("acid").unwrap();
+    // `slot 1` is P1, engine slot 0
+    assert_eq!((acid.name.as_str(), acid.slot), ("acid", 0));
+    assert_eq!(acid.knobs, vec![("cutoff".to_string(), 0., 1.), ("reso".to_string(), 0., 0.95)]);
+    assert_eq!(acid.sequencers, vec!["seq".to_string()]);
+    assert_eq!(c.set.patch("kit").unwrap().slot, 2);
+    assert_eq!(c.set.patch("pad").unwrap().slot, 3);
+
+    let items = &c.plans[0].items;
+    let has = |i: PlanItem| assert!(items.contains(&i), "{i:?} not in {items:#?}");
+    // bars 0..16 is 64 beats (4 beats per bar), ramps over the range; the default curve of a knob is linear
+    has(PlanItem::KnobRamp { slot: 0, knob: 0, name: "cutoff".into(), from: Some(0.2), to: 0.8, start_beat_rel: 0., end_beat_rel: 64., curve: Curve::Smooth });
+    // the mixer of a patch deck: fader, with the control's own default curve
+    has(PlanItem::SlotRamp { slot: 0, control: Control::Fader, from: Some(0.), to: 0.7, start_beat_rel: 0., end_beat_rel: 64., curve: Curve::Linear });
+    has(PlanItem::KnobSet { slot: 2, knob: 0, name: "swing".into(), value: 0.5, at_beat_rel: 0. });
+    // a pattern switch goes to every sequencer of the patch
+    has(PlanItem::Pattern { slot: 0, seq: 0, name: "seq".into(), pattern: 1, at_beat_rel: 32. });
+    // kill is a mixer band
+    has(PlanItem::SlotSet { slot: 2, control: Control::Low, value: -1., at_beat_rel: 32. });
+    has(PlanItem::Live { slot: 0, live: true, at_beat_rel: 64. });
+    has(PlanItem::SlotSet { slot: 2, control: Control::Gain, value: -3., at_beat_rel: 64. });
+    has(PlanItem::Live { slot: 0, live: false, at_beat_rel: 96. });
+    has(PlanItem::KnobSet { slot: 3, knob: 0, name: "mix".into(), value: 1., at_beat_rel: 96. });
+    // the plan stays sorted by time
+    let starts: Vec<f64> = items.iter().map(|i| i.start_beat_rel()).collect();
+    assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+
+    // a patch with several sequencers: one item each
+    let c = good(&PATCHED.replace("acid pattern B", "kit pattern c"));
+    let p: Vec<_> = c.plans[0].items.iter().filter(|i| matches!(i, PlanItem::Pattern { .. })).collect();
+    assert_eq!(p.len(), 2);
+    assert!(matches!(p[0], PlanItem::Pattern { slot: 2, seq: 0, pattern: 2, .. }));
+    assert!(matches!(p[1], PlanItem::Pattern { slot: 2, seq: 1, pattern: 2, .. }));
+}
+
+#[test]
+fn unknown_knobs_name_the_choices() {
+    let e = errors(&PATCHED.replace("acid.cutoff 0.2", "acid.cutof 0.2"));
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(
+        e[0].contains("unknown knob \"cutof\" on patch acid (knobs: cutoff, reso; mixer: fader, low, mid, high, filter, gain)"),
+        "{e:?}"
+    );
+    // a patch without knobs says none
+    let e = errors(&PATCHED.replace("pad.mix = 1", "pad.nope = 1"));
+    assert!(e[0].contains("on patch pad (knobs: mix;"), "{e:?}");
+}
+
+#[test]
+fn patch_item_errors() {
+    let e = |from: &str, to: &str| errors(&PATCHED.replace(from, to));
+    let one = |v: Vec<String>, msg: &str| {
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains(msg), "{v:?}");
+    };
+    // ranges come from the patch file (reso 0..0.95) and the mixer control
+    one(e("kit.swing = 0.5", "acid.reso = 1"), "acid.reso 1 is outside 0..0.95");
+    one(e("acid.fader 0 -> 0.7", "acid.fader 0 -> 2"), "acid.fader 2 is outside 0..1");
+    one(e("kit.gain = -3", "kit.gain = -60"), "outside -48..12");
+    one(e("kit.low kill", "kit.swing kill"), "`kill` works on low, mid and high, not swing");
+    // a ramp needs a range line; a bad curve
+    one(e("bar 8        acid pattern B", "bar 8        acid.cutoff 0 -> 1"), "a ramp needs a `bars <i>..<j>` line");
+    one(e("0.2 -> 0.8 smooth", "0.2 -> 0.8 wavy"), "unknown curve \"wavy\"");
+    // patterns are A-H; the patch needs a sequencer
+    one(e("acid pattern B", "acid pattern J"), "patterns are A to H");
+    one(e("acid pattern B", "acid pattern AB"), "patterns are A to H");
+    one(e("acid pattern B", "pad pattern A"), "patch pad has no sequencer");
+    // track-only actions
+    one(e("acid live", "acid stop"), "`acid` is a patch: it takes");
+    one(e("acid live", "acid loop 4 beats"), "`acid` is a patch");
+    // an undeclared patch
+    one(e("acid live", "lead live"), "no patch \"lead\" (declare it with `patch lead");
+    one(e("acid pattern B", "lead pattern B"), "no patch \"lead\"");
+    // ids and slots
+    one(errors(&PATCHED.replace("patch kit \"drums\" slot 3", "patch kit \"drums\" slot 5")), "slots are 1..4 (P1..P4), got 5");
+    let both = errors(&PATCHED.replace("patch kit \"drums\" slot 3", "patch kit \"drums\" slot 1"));
+    assert!(both.iter().any(|m| m.contains("slot 1 is taken by patch acid")), "{both:?}");
+    let dup = errors(&PATCHED.replace("patch kit \"drums\"", "patch aft \"drums\""));
+    assert!(dup.iter().any(|m| m.contains("\"aft\" is already a track or a patch id")), "{dup:?}");
+    let dup = errors(&PATCHED.replace("patch kit \"drums\"", "patch acid \"drums\""));
+    assert!(dup.iter().any(|m| m.contains("\"acid\" is already a track or a patch id")), "{dup:?}");
+    // a refused declaration doesn't bring an error for every item that uses it
+    let bad = errors(&PATCHED.replace("slot 3", "slot 9"));
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    // no such patch file
+    let m = errors(&PATCHED.replace("\"drums\"", "\"drumz\""));
+    assert!(m.iter().any(|x| x.contains("patch \"drumz\": no patch \"drumz\" (patches: acid, drums, pad)")), "{m:?}");
+}
+
+#[test]
+fn patches_need_a_patch_folder_and_warn_about_shadowed_knobs() {
+    let mut env = spec_env();
+    env.has_patch_dir = false;
+    let l = load(Path::new("/sets/x.codj"), PATCHED, &env);
+    assert!(l.diags.iter().any(|d| d.msg.contains("patches are not available here")), "{:?}", l.diags);
+
+    // a knob named like a mixer control (possible in files from before the rule): a warning
+    let mut env = spec_env();
+    env.patches.insert("acid".into(), super::PatchInfo { knobs: vec![("gain".into(), 0., 1.)], sequencers: vec![] });
+    let l = load(Path::new("/sets/x.codj"), "patch acid \"acid\" slot 1\n", &env);
+    assert!(l.diags.is_empty());
+    assert!(l.warnings[0].msg.contains("knob `gain` of patch \"acid\" has the name of a mixer control"), "{:?}", l.warnings);
+}
+
+#[test]
+fn patch_items_merge_with_a_recipe_like_track_items() {
+    use super::resolve::merge;
+    use super::model::{Action, MixItem};
+    let item = |action| MixItem { at_bar: 0., end_bar: None, action };
+    let recipe = vec![
+        item(Action::KnobSet { slot: 0, knob: 0, name: "cutoff".into(), value: 0.1 }),
+        item(Action::KnobSet { slot: 0, knob: 1, name: "reso".into(), value: 0.1 }),
+        item(Action::Live { slot: 0, live: true }),
+        item(Action::SlotSet { slot: 0, control: Control::Fader, value: 1. }),
+    ];
+    let own = vec![item(Action::KnobRamp { slot: 0, knob: 0, name: "cutoff".into(), from: None, to: 1., curve: Curve::Linear }), item(Action::Live { slot: 0, live: false })];
+    let m = merge(recipe, own);
+    // the recipe's cutoff and live are replaced, the others stay
+    assert_eq!(m.len(), 4);
+    assert!(matches!(m[0].action, Action::KnobSet { knob: 1, .. }));
+    assert!(matches!(m[1].action, Action::SlotSet { .. }));
+    assert!(matches!(m[2].action, Action::KnobRamp { .. }));
+    assert!(matches!(m[3].action, Action::Live { live: false, .. }));
+}
+
+#[test]
+fn the_patch_examples_are_valid_and_the_example_set_loads() {
+    use crate::patch::{doc, store::info_of};
+    let files = [
+        ("acid", include_str!("../../examples/patches/acid.json")),
+        ("drums", include_str!("../../examples/patches/drums.json")),
+        ("pad", include_str!("../../examples/patches/pad.json")),
+    ];
+    let mut env = FakeEnv { root: "/music".into(), has_patch_dir: true, ..Default::default() };
+    for (name, text) in files {
+        let errors = doc::check(text);
+        assert!(errors.is_empty(), "{name}: {errors:#?}");
+        // formatted like our own writer would (two-space indent is a convention, not a rule)
+        assert!(doc::parse(text).unwrap().to_json().contains("\"codj_patch\": 1"));
+        env.patches.insert(name.to_string(), info_of(text).unwrap());
+    }
+    // what the example set addresses
+    let acid = &env.patches["acid"];
+    assert_eq!(acid.knobs.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["decay", "cutoff", "reso", "envmod"]);
+    assert_eq!(acid.sequencers, ["seq"]);
+    assert_eq!(env.patches["drums"].sequencers, ["kit"]);
+    assert!(env.patches["pad"].sequencers.is_empty());
+
+    env.add("Pneumatix", "Aftertekno", "aftertekno.flac", Some(grid(124., 0.1, 0)));
+    env.add("Aasi & Swooh", "Smokin", "smokin.flac", Some(grid(126., 0.2, 1)));
+    let l = load(Path::new("patches.codj"), include_str!("../../examples/sets/patches.codj"), &env);
+    assert!(l.diags.is_empty(), "{:#?}", l.diags);
+    assert!(l.warnings.is_empty(), "{:#?}", l.warnings);
+    let c = l.compiled.unwrap();
+    assert_eq!(c.set.patches.iter().map(|p| (p.id.as_str(), p.slot)).collect::<Vec<_>>(), [("kit", 0), ("acid", 1), ("pad", 2)]);
+    let items = &c.plans[0].items;
+    // pattern B on the kit's one sequencer and the acid's
+    assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Pattern { pattern: 1, .. })).count(), 2);
+    assert!(items.iter().any(|i| matches!(i, PlanItem::Live { slot: 1, live: true, .. })));
+}

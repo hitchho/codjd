@@ -1,16 +1,29 @@
 //! Patch decks: synths, drum machines and sequencers as node graphs. See docs/patches.md.
 //!
-//! `graph` is the shared shape between the document layer and the engine; `program` compiles it
-//! into a flat real-time program built from the node DSP in `nodes`, `drums` and `seq`.
+//! Document layer:
+//! - `graph`: the shared shape between the document layer and the engine
+//! - `doc`: the file format and its validation into a graph
+//! - `actions`: live edits of a loaded patch, with undo
+//! - `import`: NoiseCraft files
+//! - `host`: what the document layer needs from the engine
+//! - `slots`: the four slots: loaded documents, edit history, `PatchState`
+//! - `store`: the patch files on disk (list, read, versioned write, import)
+//!
+//! Engine: `program` compiles a graph into a flat real-time program built from the node DSP in
+//! `nodes`, `drums` and `seq`; `engine_host` implements `host::PatchHost` for the `Engine`.
 
-// graph.rs is the shared contract; the document layer (files, actions, import) uses parts of it
-// that the engine does not
-#[allow(dead_code)]
-pub mod graph;
+pub mod actions;
+pub mod doc;
 pub mod drums;
+pub mod engine_host;
+pub mod graph;
+pub mod host;
+pub mod import;
 pub mod nodes;
 pub mod program;
 pub mod seq;
+pub mod slots;
+pub mod store;
 
 /// Patch slots P1..P4
 pub const SLOTS: usize = 4;

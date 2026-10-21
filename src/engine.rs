@@ -183,7 +183,8 @@ pub struct Engine {
     analyzer: Option<Arc<Analyzer>>,
     meta: [DeckMeta; crate::audio::DECKS],
     knobs: [DeckKnobs; crate::audio::DECKS],
-    patches: [PatchMeta; PATCH_SLOTS],
+    /// what the audio thread has in each patch slot (`rt_patch_*`)
+    patch_rt: [PatchMeta; PATCH_SLOTS],
     mixer: MixerKnobs,
     hotcues: HotcueStore,
     /// hand corrections of detected tempos (half/double/triplet mistakes)
@@ -208,6 +209,10 @@ pub struct Engine {
     resume_after_queue: Option<u32>,
     /// the set runtime (`SetUse`, `SetArm`...), see `sets::runtime`
     setrt: crate::sets::runtime::Runtime,
+    /// the patch decks' slots (`PatchLoad`, `PatchAction`...), see `patch::slots`
+    patch_docs: crate::patch::slots::Slots,
+    /// the patch files, for the set runtime's `load_patch`
+    patch_store: Option<Arc<crate::patch::store::PatchStore>>,
     /// a mix being recorded (`SetRecord`), see `edits`
     recorder: Option<crate::sets::record::Recorder>,
     handle: Codjd,
@@ -235,7 +240,7 @@ impl Engine {
             analyzer: None,
             meta: Default::default(),
             knobs: Default::default(),
-            patches: Default::default(),
+            patch_rt: Default::default(),
             mixer: MixerKnobs { master, cue_mix: 0., quantize: true },
             hotcues: HotcueStore::open_default(),
             gridfix: crate::gridfix::GridFixes::open_default(),
@@ -251,6 +256,8 @@ impl Engine {
             queue: VecDeque::new(),
             resume_after_queue: None,
             setrt: Default::default(),
+            patch_docs: Default::default(),
+            patch_store: None,
             recorder: None,
             handle,
         })
@@ -663,7 +670,7 @@ impl Engine {
             }
             AutoKind::Pattern { slot, seq, .. } => {
                 self.patch_loaded(slot)?;
-                if seq >= self.patches[slot].seqs {
+                if seq >= self.patch_rt[slot].seqs {
                     return Err(format!("P{} has no sequencer {seq}", slot + 1));
                 }
             }
@@ -1059,6 +1066,66 @@ impl Engine {
         self.with_runtime(|rt, h| rt.tick(h));
     }
 
+    // ---- patch decks (docs/patches.md) ----
+
+    /// Runs `f` with the slots and the engine as their host (the slots are taken out meanwhile)
+    fn with_patches<T>(&mut self, f: impl FnOnce(&mut crate::patch::slots::Slots, &mut Engine) -> T) -> T {
+        let mut slots = std::mem::take(&mut self.patch_docs);
+        let out = f(&mut slots, self);
+        self.patch_docs = slots;
+        out
+    }
+
+    pub fn set_patch_store(&mut self, store: Arc<crate::patch::store::PatchStore>) {
+        self.patch_store = Some(store);
+    }
+
+    /// `PatchLoad`, with the text of the patch file `name` (read by the caller)
+    pub fn patch_load(&mut self, slot: u32, name: &str, json: &str) -> Result<(), String> {
+        self.with_patches(|s, h| s.load(h, slot as usize, name, json))
+    }
+
+    /// Loads patch file `name` into `slot`, reading it here (the set runtime's way in)
+    fn patch_load_named(&mut self, slot: usize, name: &str) -> Result<(), String> {
+        let store = self.patch_store.clone().ok_or("no patch folder")?;
+        let (json, _) = store.source(name)?;
+        self.with_patches(|s, h| s.load(h, slot, name, &json))
+    }
+
+    pub fn patch_unload(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.unload(h, slot as usize))
+    }
+
+    pub fn patch_action(&mut self, slot: u32, json: &str) -> Result<(), String> {
+        self.with_patches(|s, h| s.action(h, slot as usize, json))
+    }
+
+    pub fn patch_undo(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.undo(h, slot as usize))
+    }
+
+    pub fn patch_redo(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.redo(h, slot as usize))
+    }
+
+    pub fn patch_set_live(&mut self, slot: u32, live: bool) -> Result<(), String> {
+        self.with_patches(|s, h| s.set_live(h, slot as usize, live))
+    }
+
+    /// `PatchSave`, first half: what to write
+    pub fn patch_save_job(&mut self, slot: u32) -> Result<crate::patch::slots::SaveJob, String> {
+        self.patch_docs.save_job(slot as usize)
+    }
+
+    /// `PatchSave`, second half: the slot's patch was written as `name`
+    pub fn patch_saved(&mut self, slot: u32, name: &str, hash: &str, json: &str) {
+        self.patch_docs.saved(slot as usize, name, hash, json);
+    }
+
+    pub fn patch_state(&mut self) -> Vec<crate::patch::slots::PatchSlot> {
+        self.with_patches(|s, h| s.state(h))
+    }
+
     /// Per deck: (position s, playing, decoded s, decoding finished)
     pub fn decks(&self) -> Vec<(f64, bool, f64, bool)> {
         (0..crate::audio::DECKS)
@@ -1255,8 +1322,8 @@ impl Engine {
     }
 }
 
-/// Patch slots: the document layer drives these (no caller in the daemon until it lands)
-#[allow(dead_code)]
+/// Patch slots, low level: the audio-thread calls with their range checks (`rt_patch_*`). The
+/// document layer reaches them through `PatchHost for Engine` (patch/engine_host.rs).
 impl Engine {
     /// A channel strip control of a patch slot (`deck_set` with deck 2 + slot): fader, low, mid,
     /// high, filter, gain (linear, as for decks) and cue (0/1)
@@ -1281,7 +1348,7 @@ impl Engine {
     }
 
     fn patch_loaded(&self, slot: usize) -> Result<(), String> {
-        match self.patches.get(slot) {
+        match self.patch_rt.get(slot) {
             None => Err(format!("no patch slot {slot} (P1..P{PATCH_SLOTS} are 0..{})", PATCH_SLOTS - 1)),
             Some(p) if !p.loaded => Err(format!("nothing loaded in P{}", slot + 1)),
             Some(_) => Ok(()),
@@ -1290,7 +1357,7 @@ impl Engine {
 
     fn patch_knob_ok(&self, slot: usize, knob: usize) -> Result<(), String> {
         self.patch_loaded(slot)?;
-        if knob >= self.patches[slot].knobs {
+        if knob >= self.patch_rt[slot].knobs {
             return Err(format!("P{} has no knob {knob}", slot + 1));
         }
         Ok(())
@@ -1298,11 +1365,11 @@ impl Engine {
 
     /// Compiles nothing: puts a compiled `program` (see `patch::program::compile`) in `slot`,
     /// cue-only with the strip back to neutral; the previous program crossfades out
-    pub fn patch_load(&mut self, slot: usize, program: Program) -> Result<(), String> {
+    pub fn rt_patch_load(&mut self, slot: usize, program: Program) -> Result<(), String> {
         if slot >= PATCH_SLOTS {
             return Err(format!("no patch slot {slot}"));
         }
-        self.patches[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
+        self.patch_rt[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
         self.audio.patch_load(slot, program);
         Ok(())
     }
@@ -1310,24 +1377,24 @@ impl Engine {
     /// A structural edit: like `patch_load`, but the state of the nodes that survived carries over
     /// and the controls stay; with `keep_live` the slot stays on the master (the contract's live
     /// safety says it goes back to the headphones: pass `false` for that)
-    pub fn patch_swap(&mut self, slot: usize, program: Program, keep_live: bool) -> Result<(), String> {
+    pub fn rt_patch_swap(&mut self, slot: usize, program: Program, keep_live: bool) -> Result<(), String> {
         if slot >= PATCH_SLOTS {
             return Err(format!("no patch slot {slot}"));
         }
-        self.patches[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
+        self.patch_rt[slot] = PatchMeta { loaded: true, knobs: program.knob_count(), seqs: program.seq_count() };
         self.audio.patch_swap(slot, program, keep_live);
         Ok(())
     }
 
-    pub fn patch_unload(&mut self, slot: usize) -> Result<(), String> {
+    pub fn rt_patch_unload(&mut self, slot: usize) -> Result<(), String> {
         self.patch_loaded(slot)?;
-        self.patches[slot] = PatchMeta::default();
+        self.patch_rt[slot] = PatchMeta::default();
         self.audio.patch_unload(slot);
         Ok(())
     }
 
     /// Sets a knob in its own units; a hand on it ends its automation
-    pub fn patch_knob(&mut self, slot: usize, knob: usize, value: f64) -> Result<(), String> {
+    pub fn rt_patch_knob(&mut self, slot: usize, knob: usize, value: f64) -> Result<(), String> {
         self.patch_knob_ok(slot, knob)?;
         if !value.is_finite() {
             return Err("bad value".into());
@@ -1337,7 +1404,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn patch_cell(
+    pub fn rt_patch_cell(
         &mut self,
         slot: usize,
         seq: usize,
@@ -1356,7 +1423,7 @@ impl Engine {
     }
 
     /// Switches a sequencer's pattern (0..7) now, or at the next bar of its clock
-    pub fn patch_pattern(&mut self, slot: usize, seq: usize, pattern: usize, now: bool) -> Result<(), String> {
+    pub fn rt_patch_pattern(&mut self, slot: usize, seq: usize, pattern: usize, now: bool) -> Result<(), String> {
         self.patch_seq_ok(slot, seq, pattern)?;
         self.audio.patch_pattern(slot, seq, pattern, now);
         Ok(())
@@ -1364,7 +1431,7 @@ impl Engine {
 
     fn patch_seq_ok(&self, slot: usize, seq: usize, pattern: usize) -> Result<(), String> {
         self.patch_loaded(slot)?;
-        if seq >= self.patches[slot].seqs {
+        if seq >= self.patch_rt[slot].seqs {
             return Err(format!("P{} has no sequencer {seq}", slot + 1));
         }
         if pattern >= crate::patch::seq::MAX_PATTERNS {
@@ -1374,17 +1441,30 @@ impl Engine {
     }
 
     /// Sends the slot to the master (or the external output), or back to the headphones only
-    pub fn patch_live(&mut self, slot: usize, live: bool) -> Result<(), String> {
+    pub fn rt_patch_live(&mut self, slot: usize, live: bool) -> Result<(), String> {
         self.patch_loaded(slot)?;
         self.audio.patch_live(slot, live);
         Ok(())
     }
 
     /// Lets a slot that was muted for a CPU overrun run again
-    pub fn patch_unmute(&mut self, slot: usize) -> Result<(), String> {
+    pub fn rt_patch_unmute(&mut self, slot: usize) -> Result<(), String> {
         self.patch_loaded(slot)?;
         self.audio.patch_unmute(slot);
         Ok(())
+    }
+
+    /// The output's sample rate, the rate patches are compiled for
+    pub fn output_rate(&self) -> u32 {
+        self.audio.rate()
+    }
+
+    /// Ends the knob automation of every knob of `slot` (the knob list is about to change)
+    pub fn cancel_patch_knob_automation(&mut self, slot: usize) {
+        let Some(p) = self.patch_rt.get(slot) else { return };
+        for knob in 0..p.knobs {
+            self.audio.cancel_control(crate::audio::DECKS + slot, Control::Knob { slot, knob });
+        }
     }
 
     /// What the audio thread knows of every patch slot: load state, cpu share, mute reason, knob
@@ -1448,6 +1528,24 @@ impl crate::sets::runtime::Host for Engine {
 
     fn decoded(&mut self, deck: usize) -> (f64, bool) {
         self.audio.decoded(deck)
+    }
+
+    fn patch_in_slot(&mut self, slot: usize) -> Option<(String, bool)> {
+        self.patch_docs.in_slot(slot)
+    }
+
+    fn patch_names(&mut self, slot: usize) -> Option<(Vec<String>, Vec<String>)> {
+        self.patch_docs.names(slot)
+    }
+
+    fn load_patch(&mut self, slot: usize, name: &str) -> Result<(), String> {
+        self.patch_load_named(slot, name)
+    }
+
+    fn patch_live(&mut self, slot: usize, live: bool) {
+        if let Err(e) = self.patch_set_live(slot as u32, live) {
+            warn!(slot, error = %e, "can't switch a patch deck live or cue");
+        }
     }
 }
 

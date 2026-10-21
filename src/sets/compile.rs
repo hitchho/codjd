@@ -98,21 +98,56 @@ pub enum PlanItem {
     LoopOff { deck: Deck, at_beat_rel: f64 },
     /// quantized jump to a beat of the deck's grid
     Jump { deck: Deck, to_beat: f64, at_beat_rel: f64 },
+    /// a patch deck's mixer control (engine deck `2 + slot`), timed like the track items
+    SlotRamp {
+        slot: u8,
+        control: Control,
+        from: Option<f32>,
+        to: f32,
+        start_beat_rel: f64,
+        end_beat_rel: f64,
+        curve: Curve,
+    },
+    SlotSet { slot: u8, control: Control, value: f32, at_beat_rel: f64 },
+    /// a patch knob (`knob` indexes the patch's knobs)
+    KnobRamp {
+        slot: u8,
+        knob: usize,
+        name: String,
+        from: Option<f32>,
+        to: f32,
+        start_beat_rel: f64,
+        end_beat_rel: f64,
+        curve: Curve,
+    },
+    KnobSet { slot: u8, knob: usize, name: String, value: f32, at_beat_rel: f64 },
+    /// queue pattern `pattern` of sequencer `seq` of the patch for the next bar
+    Pattern { slot: u8, seq: usize, name: String, pattern: u8, at_beat_rel: f64 },
+    /// to the master, or back to the headphones only
+    Live { slot: u8, live: bool, at_beat_rel: f64 },
 }
 
 impl PlanItem {
     /// where the item is done: a ramp's end, else its time
     pub fn end_beat_rel(&self) -> f64 {
         match self {
-            PlanItem::Ramp { end_beat_rel, .. } => *end_beat_rel,
+            PlanItem::Ramp { end_beat_rel, .. }
+            | PlanItem::SlotRamp { end_beat_rel, .. }
+            | PlanItem::KnobRamp { end_beat_rel, .. } => *end_beat_rel,
             other => other.start_beat_rel(),
         }
     }
 
     pub fn start_beat_rel(&self) -> f64 {
         match self {
-            PlanItem::Ramp { start_beat_rel, .. } => *start_beat_rel,
+            PlanItem::Ramp { start_beat_rel, .. }
+            | PlanItem::SlotRamp { start_beat_rel, .. }
+            | PlanItem::KnobRamp { start_beat_rel, .. } => *start_beat_rel,
             PlanItem::Set { at_beat_rel, .. }
+            | PlanItem::SlotSet { at_beat_rel, .. }
+            | PlanItem::KnobSet { at_beat_rel, .. }
+            | PlanItem::Pattern { at_beat_rel, .. }
+            | PlanItem::Live { at_beat_rel, .. }
             | PlanItem::Swap { at_beat_rel, .. }
             | PlanItem::Play { at_beat_rel, .. }
             | PlanItem::Pause { at_beat_rel, .. }
@@ -203,6 +238,35 @@ fn compile_mix(set: &Set, m: &Mix) -> Option<MixPlan> {
                 tracker.jumps[*deck as usize].push((at, *to_beat));
                 PlanItem::Jump { deck: *deck, to_beat: *to_beat, at_beat_rel: at }
             }
+            Action::SlotRamp { slot, control, from, to, curve } => PlanItem::SlotRamp {
+                slot: *slot,
+                control: *control,
+                from: *from,
+                to: *to,
+                start_beat_rel: at,
+                end_beat_rel: end,
+                curve: *curve,
+            },
+            Action::SlotSet { slot, control, value } => {
+                PlanItem::SlotSet { slot: *slot, control: *control, value: *value, at_beat_rel: at }
+            }
+            Action::KnobRamp { slot, knob, name, from, to, curve } => PlanItem::KnobRamp {
+                slot: *slot,
+                knob: *knob,
+                name: name.clone(),
+                from: *from,
+                to: *to,
+                start_beat_rel: at,
+                end_beat_rel: end,
+                curve: *curve,
+            },
+            Action::KnobSet { slot, knob, name, value } => {
+                PlanItem::KnobSet { slot: *slot, knob: *knob, name: name.clone(), value: *value, at_beat_rel: at }
+            }
+            Action::Pattern { slot, seq, name, pattern } => {
+                PlanItem::Pattern { slot: *slot, seq: *seq, name: name.clone(), pattern: *pattern, at_beat_rel: at }
+            }
+            Action::Live { slot, live } => PlanItem::Live { slot: *slot, live: *live, at_beat_rel: at },
             Action::JumpBy { deck, beats } => {
                 let to = tracker.pos(*deck, at).round() + beats;
                 // a beat jump takes a running loop along

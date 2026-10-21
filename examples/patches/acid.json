@@ -1,0 +1,29 @@
+{
+  "codj_patch": 1,
+  "title": "acid line",
+  "nodes": {
+    "1": { "type": "Clock", "name": "clock", "x": 20, "y": 20,
+           "params": { "source": "master", "steps_per_beat": 4 } },
+    "2": { "type": "MonoSeq", "name": "seq", "x": 150, "y": 20, "ins": { "clock": ["1", "out"] },
+           "params": {
+             "scale": "A minor", "root": 45, "steps": 16, "rows": 12, "pattern": 0,
+             "patterns": [
+               { "steps": 16, "cells": [[0, 0], [2, 7], [3, 0], [6, 3], [8, 0], [10, 7], [11, 9], [14, 4]] },
+               { "steps": 16, "cells": [[0, 0], [1, 0], [3, 7], [4, 0], [7, 5], [8, 0], [9, 3], [12, 7], [15, 9]] }
+             ]
+           } },
+    "3": { "type": "Saw", "name": "osc", "x": 300, "y": 20, "ins": { "freq": ["2", "freq"] } },
+    "4": { "type": "ADSR", "name": "env", "x": 300, "y": 120, "ins": { "gate": ["2", "gate"], "att": 0.003, "dec": ["5", "out"], "sus": 0, "rel": 0.05 } },
+    "5": { "type": "Knob", "name": "decay", "x": 150, "y": 140, "params": { "min": 0.05, "max": 0.6, "value": 0.2 } },
+    "6": { "type": "Knob", "name": "cutoff", "x": 150, "y": 220, "params": { "min": 0.0, "max": 1.0, "value": 0.3 } },
+    "7": { "type": "Knob", "name": "reso", "x": 150, "y": 300, "params": { "min": 0.0, "max": 0.95, "value": 0.6 } },
+    "8": { "type": "Knob", "name": "envmod", "x": 300, "y": 220, "params": { "min": 0.0, "max": 0.7, "value": 0.3 } },
+    "9": { "type": "Mul", "name": "envamt", "x": 450, "y": 200, "ins": { "in0": ["4", "out"], "in1": ["8", "out"] } },
+    "10": { "type": "Add", "name": "cutoff+env", "x": 600, "y": 200, "ins": { "in0": ["6", "out"], "in1": ["9", "out"] } },
+    "11": { "type": "Filter", "name": "lp", "x": 750, "y": 100, "params": { "mode": "lp" },
+            "ins": { "in": ["3", "out"], "cutoff": ["10", "out"], "reso": ["7", "out"] } },
+    "12": { "type": "Distort", "name": "drive", "x": 900, "y": 100, "ins": { "in": ["11", "out"], "amt": 0.3 } },
+    "13": { "type": "Mul", "name": "vca", "x": 1050, "y": 100, "ins": { "in0": ["12", "out"], "in1": ["4", "out"] } },
+    "14": { "type": "AudioOut", "x": 1200, "y": 100, "ins": { "left": ["13", "out"], "right": ["13", "out"] } }
+  }
+}

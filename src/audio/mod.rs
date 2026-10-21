@@ -314,7 +314,6 @@ impl Audio {
 
 /// The patch slots' side of [`Audio`]; the document layer drives these (they have no caller in
 /// the daemon until it lands)
-#[allow(dead_code)]
 impl Audio {
     // ---- patch slots (docs/patches.md) ----
 

@@ -29,7 +29,17 @@ pub struct File {
 pub enum Stmt {
     Set(Sp<String>),
     Track(TrackAst),
+    Patch(PatchAst),
     Mix(MixAst),
+}
+
+/// `patch <id> "<name>" slot <n>`
+#[derive(Debug, PartialEq)]
+pub struct PatchAst {
+    pub id: Sp<String>,
+    pub name: Sp<String>,
+    /// 1..4 once resolved
+    pub slot: Sp<f64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -135,6 +145,10 @@ pub enum ItemKind {
     Xfade(XfadeOp),
     Ctl { track: Sp<String>, control: Sp<String>, op: CtlOp },
     Stop(Sp<String>),
+    /// `<patch> pattern <A-H>`
+    Pattern { patch: Sp<String>, pattern: Sp<String> },
+    /// `<patch> live` / `<patch> cue`
+    Live { patch: Sp<String>, live: bool },
     Loop { track: Sp<String>, what: LoopWhat },
     Jump { track: Sp<String>, what: JumpWhat },
 }
@@ -166,7 +180,7 @@ pub enum JumpWhat {
 }
 
 /// Track ids that would be ambiguous at the start of a line
-pub const RESERVED: [&str; 6] = ["set", "track", "mix", "bar", "bars", "swap"];
+pub const RESERVED: [&str; 7] = ["set", "track", "mix", "bar", "bars", "swap", "patch"];
 
 /// Parses a whole file; the AST holds every statement that parsed, whatever the errors
 pub fn parse(src: &str) -> (File, Vec<Diag>) {
@@ -183,7 +197,7 @@ pub fn parse(src: &str) -> (File, Vec<Diag>) {
     for line in &lines {
         let first = line.toks.first().map(|t| &t.tok);
         let header = match first {
-            Some(Tok::Ident(w)) if matches!(w.as_str(), "set" | "track" | "mix") => Some(w.as_str()),
+            Some(Tok::Ident(w)) if matches!(w.as_str(), "set" | "track" | "mix" | "patch") => Some(w.as_str()),
             _ => None,
         };
         if line.bad {
@@ -213,6 +227,27 @@ pub fn parse(src: &str) -> (File, Vec<Diag>) {
                     c.finish()?;
                     file.stmts.push(Stmt::Track(TrackAst { id, file: file_s, lines: vec![] }));
                     block = Block::Track;
+                }
+                Some("patch") => {
+                    block = Block::Skip;
+                    c.next();
+                    let id = c.ident("a patch id")?;
+                    if RESERVED.contains(&id.v.as_str()) {
+                        return Err(id.diag(format!("`{}` can't be a patch id (reserved word)", id.v)));
+                    }
+                    let name = c.string(&format!("a quoted patch name after `patch {}`", id.v))?;
+                    if !c.eat_ident("slot") {
+                        return Err(c.err_here(format!(
+                            "expected `slot <1-4>` after `patch {} \"{}\"`, found {}",
+                            id.v,
+                            name.v,
+                            c.describe()
+                        )));
+                    }
+                    let slot = c.number("a slot number 1-4 (P1-P4)")?;
+                    c.finish()?;
+                    file.stmts.push(Stmt::Patch(PatchAst { id, name, slot }));
+                    block = Block::None;
                 }
                 Some(_) => {
                     block = Block::Skip;
@@ -760,6 +795,16 @@ fn item(c: &mut Cur) -> Result<ItemAst, Diag> {
                 c.next();
                 ItemKind::Stop(first)
             }
+            Some(Tok::Ident(w)) if w == "pattern" => {
+                c.next();
+                let pattern = c.ident("a pattern letter A-H after `pattern`")?;
+                ItemKind::Pattern { patch: first, pattern }
+            }
+            Some(Tok::Ident(w)) if w == "live" || w == "cue" => {
+                let live = w == "live";
+                c.next();
+                ItemKind::Live { patch: first, live }
+            }
             Some(Tok::Ident(w)) if w == "loop" => {
                 c.next();
                 let what = match c.peek_tok() {
@@ -793,7 +838,7 @@ fn item(c: &mut Cur) -> Result<ItemAst, Diag> {
             }
             _ => {
                 return Err(c.err_here(format!(
-                    "expected `.<control>`, `stop`, `loop` or `jump` after `{}`, found {}",
+                    "expected `.<control>`, `stop`, `loop`, `jump`, `pattern`, `live` or `cue` after `{}`, found {}",
                     first.v,
                     c.describe()
                 )))
@@ -962,5 +1007,26 @@ mix aft -> smk at aft.outro over 32 bars
         assert!(e[0].2.contains("unexpected unit `s`"));
         let e = errs("track a \"x\"\n  grid @ 3\n");
         assert!(e[0].2.contains("expected") || e[0].2.contains("unit"), "{e:?}");
+    }
+
+    #[test]
+    fn patch_statements_and_items() {
+        let f = ok("patch acid \"acid line\" slot 2\ntrack a \"A\"\ntrack b \"B\"\nmix a -> b at bar 1 over 8 bars\n  bars 0..4 acid.cutoff 0.2 -> 0.8; acid.fader = 1\n  bar 2 acid pattern B; acid live; acid cue; acid.low kill\n");
+        let Stmt::Patch(p) = &f.stmts[0] else { panic!() };
+        assert_eq!((p.id.v.as_str(), p.name.v.as_str(), p.slot.v), ("acid", "acid line", 2.));
+        let Stmt::Mix(m) = &f.stmts[3] else { panic!() };
+        let MixLine::Timed(t) = &m.lines[1] else { panic!() };
+        assert!(matches!(&t.items[0].kind, ItemKind::Pattern { patch, pattern } if patch.v == "acid" && pattern.v == "B"));
+        assert!(matches!(&t.items[1].kind, ItemKind::Live { live: true, .. }));
+        assert!(matches!(&t.items[2].kind, ItemKind::Live { live: false, .. }));
+        assert!(matches!(&t.items[3].kind, ItemKind::Ctl { op: CtlOp::Kill, .. }));
+        // a patch line has no body, and the next line starts a new statement
+        assert!(errs("patch acid \"x\" slot 1\n  cue x bar 1\n")[0].2.contains("expected `set`, `track` or `mix`"));
+        let e = errs("patch acid \"x\"\n");
+        assert!(e[0].2.contains("expected `slot <1-4>` after `patch acid \"x\"`"), "{e:?}");
+        assert!(errs("patch acid slot 1\n")[0].2.contains("a quoted patch name after `patch acid`"));
+        assert!(errs("patch patch \"x\" slot 1\n")[0].2.contains("reserved word"));
+        assert!(errs("patch a \"x\" slot\n")[0].2.contains("a slot number"));
+        assert!(errs("track patch \"x\"\n")[0].2.contains("reserved word"));
     }
 }
