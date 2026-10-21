@@ -23,6 +23,7 @@ use tracing::warn;
 pub use auto::{AutoItem, AutoKind, Control, Curve, AUTO_CAP};
 pub use beat::{sync_plan, GridSpec};
 pub use mixer::{DeckState, Mode, DECKS};
+pub(crate) use mixer::{Drive, Smooth};
 use mixer::{Cmd, Mixer, RtEvent, Shared};
 pub use output::list_devices;
 pub use track::Track;

@@ -324,13 +324,13 @@ impl Shared {
 
 /// A value that glides to its target, so changes don't click
 #[derive(Clone, Copy)]
-pub(super) struct Smooth {
+pub(crate) struct Smooth {
     pub current: f32,
     pub target: f32,
 }
 
 impl Smooth {
-    pub(super) fn new(v: f32) -> Self {
+    pub(crate) fn new(v: f32) -> Self {
         Self {
             current: v,
             target: v,
@@ -339,7 +339,7 @@ impl Smooth {
 
     /// One sample step; `k` sets the speed (about 1/(time constant in samples))
     #[inline]
-    pub(super) fn next(&mut self, k: f32) -> f32 {
+    pub(crate) fn next(&mut self, k: f32) -> f32 {
         let d = self.target - self.current;
         // land exactly: no endless tail of ever smaller steps
         let next = self.current + d * k;
@@ -355,7 +355,7 @@ impl Smooth {
 
 /// How [`Smooth::drive`] moves a parameter
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Drive {
+pub(crate) enum Drive {
     /// set the target; the glide (~10 ms) gets there, as for a hand on a knob
     Glide,
     /// follow a value that moves on its own every sample: no lag, but a jump to it is limited to
@@ -369,7 +369,7 @@ pub(super) enum Drive {
 const SLEW: f32 = 0.01;
 
 impl Smooth {
-    pub(super) fn drive(&mut self, v: f32, how: Drive) {
+    pub(crate) fn drive(&mut self, v: f32, how: Drive) {
         self.target = v;
         match how {
             Drive::Glide => {}
