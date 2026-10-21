@@ -584,4 +584,136 @@ mod tests {
         assert_eq!(m.track("third").unwrap().cues[0].name, "z");
         assert_eq!(m.mixes.len(), 1);
     }
+
+    /// A tiny deterministic generator, so the property test needs no crate
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn random_set(r: &mut Rng) -> String {
+        let eol = if r.next(4) == 0 { "\r\n" } else { "\n" };
+        let indents = ["  ", "    ", "\t", " "];
+        let mut lines: Vec<String> = vec![];
+        if r.next(2) == 0 {
+            lines.push("# a set".into());
+        }
+        if r.next(2) == 0 {
+            lines.push("set \"random\"".into());
+        }
+        let mut have = 0;
+        for (id, file) in [("aft", "Aftertekno"), ("smk", "Smokin")] {
+            if r.next(5) == 0 {
+                continue;
+            }
+            have += 1;
+            for _ in 0..r.next(3) {
+                lines.push(["", "# between", "   # indented remark"][r.next(3)].into());
+            }
+            let ind = indents[r.next(4)];
+            let tail = if r.next(3) == 0 { "   # note" } else { "" };
+            lines.push(format!("track {id} \"{file}\"{tail}"));
+            for k in 0..r.next(5) {
+                let tail = if r.next(3) == 0 { "  # why" } else { "" };
+                let body = match r.next(3) {
+                    0 => format!("cue c{k} bar {}", 1 + r.next(90)),
+                    1 => format!("loop l{k} bar {} len {} beats", 1 + r.next(90), 1 + r.next(8)),
+                    _ => format!("cue d{k} bar {} beat {}", 1 + r.next(90), 1 + r.next(4)),
+                };
+                lines.push(format!("{ind}{body}{tail}"));
+                if r.next(4) == 0 {
+                    lines.push(format!("{ind}# a remark inside"));
+                }
+                if r.next(5) == 0 {
+                    lines.push(String::new());
+                }
+            }
+        }
+        if have == 2 && r.next(2) == 0 {
+            lines.push(String::new());
+            lines.push("mix aft -> smk at bar 1 over 8 bars".into());
+            lines.push("  bar 8  aft stop".into());
+        }
+        let mut out = lines.join(eol);
+        if r.next(4) != 0 {
+            out.push_str(eol);
+        }
+        out
+    }
+
+    #[test]
+    fn random_files_and_edits_keep_everything_else() {
+        let mut r = Rng(0x9E3779B97F4A7C15);
+        let mut edits = 0;
+        for _ in 0..400 {
+            let src = random_set(&mut r);
+            let before = {
+                let l = load(Path::new("/s/x.codj"), &src, &spec_env());
+                assert!(l.diags.is_empty(), "{:?}\n{src}", l.diags);
+                l.compiled.unwrap().set
+            };
+            let id = if r.next(2) == 0 { "aft" } else { "smk" };
+            if before.track(id).is_none() {
+                continue;
+            }
+            // names that exist (replace) and names that don't (insert)
+            let name = ["c0", "c1", "d1", "l0", "new"][r.next(5)];
+            let is_loop = name.starts_with('l');
+            let (slot, body) = if is_loop {
+                (Slot::Loop(name), format!("loop {name} bar 7 len 2 bars"))
+            } else {
+                (Slot::Cue(name), format!("cue {name} bar 7 beat 2"))
+            };
+            let new = upsert_track_line(&src, id, slot, &body).unwrap();
+            edits += 1;
+            let after = model(&new);
+
+            // the model: that line is as written, everything else is as before
+            let (b, a) = (before.track(id).unwrap(), after.track(id).unwrap());
+            if is_loop {
+                assert_eq!(a.loop_def(name).unwrap().len, 2.);
+                assert!(a.loop_def(name).unwrap().in_bars);
+                assert_eq!(a.cues, b.cues);
+                let rest = |t: &crate::sets::model::Track| t.loops.iter().filter(|l| l.name != name).cloned().collect::<Vec<_>>();
+                assert_eq!(rest(a), rest(b));
+            } else {
+                assert_eq!(a.cue(name).unwrap().pos, Pos { bar: 7, beat: 2. });
+                assert_eq!(a.loops, b.loops);
+                let rest = |t: &crate::sets::model::Track| t.cues.iter().filter(|c| c.name != name).cloned().collect::<Vec<_>>();
+                assert_eq!(rest(a), rest(b));
+            }
+            let other = if id == "aft" { "smk" } else { "aft" };
+            assert_eq!(before.track(other), after.track(other));
+            assert_eq!(before.mixes, after.mixes);
+
+            // the text: one line replaced or one inserted, the rest byte for byte
+            let existed = match slot {
+                Slot::Loop(n) => b.loop_def(n).is_some(),
+                _ => b.cue(name).is_some(),
+            };
+            let o: Vec<&str> = src.split_inclusive('\n').collect();
+            let n: Vec<&str> = new.split_inclusive('\n').collect();
+            let differing = o.iter().zip(&n).take_while(|(x, y)| x == y).count();
+            let tail = o.iter().rev().zip(n.iter().rev()).take_while(|(x, y)| x == y).count();
+            if existed {
+                assert_eq!(o.len(), n.len(), "{src}\n----\n{new}");
+                assert!(differing + tail + 1 >= o.len(), "{src}\n----\n{new}");
+            } else {
+                assert_eq!(o.len() + 1, n.len(), "{src}\n----\n{new}");
+                // everything old is still there in order (a last line without a newline got one)
+                let strip = |v: &[&str]| v.iter().map(|l| l.trim_end_matches(['\r', '\n']).to_string()).collect::<Vec<_>>();
+                let mut want = strip(&o);
+                let at = n.iter().position(|l| l.contains(&body)).unwrap();
+                let mut got = strip(&n);
+                got.remove(at);
+                assert_eq!(got, std::mem::take(&mut want));
+            }
+        }
+        assert!(edits > 200, "{edits}");
+    }
 }

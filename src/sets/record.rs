@@ -305,6 +305,8 @@ pub struct RecEvent {
 /// The log of a recording in progress, kept by the engine
 #[derive(Debug, Default)]
 pub struct Recorder {
+    /// the active set's file when recording started
+    pub file: std::path::PathBuf,
     /// the deck on air
     pub out: usize,
     /// its position (seconds) when the recording started

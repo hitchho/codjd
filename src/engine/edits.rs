@@ -81,7 +81,7 @@ impl Engine {
         if self.recorder.is_some() {
             return Err("already recording".into());
         }
-        self.active_set()?;
+        let active = self.active_set()?;
         let states = self.audio.deck_states();
         let on_air = |d: usize| self.meta[d].path.is_some() && states[d].playing && !states[d].waiting && states[d].fader > SILENT;
         let out = match (on_air(0), on_air(1)) {
@@ -111,6 +111,7 @@ impl Engine {
         }
         let o = &states[other];
         self.recorder = Some(Recorder {
+            file: active.file,
             out,
             started_at: states[out].position,
             initial,
@@ -135,6 +136,9 @@ impl Engine {
     pub fn set_record_stop(&mut self) -> Result<EditJob, String> {
         let rec = self.recorder.take().ok_or("not recording")?;
         let active = self.active_set()?;
+        if active.file != rec.file {
+            return Err("the active set changed while recording".into());
+        }
         let mut decks = vec![];
         for (d, name) in [(0, "A"), (1, "B")] {
             let grid = self.gridded(d).map_err(|e| format!("deck {name}: {e}"))?;
