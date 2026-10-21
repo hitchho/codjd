@@ -5,11 +5,13 @@
 //! the analysis and builds the `model`, `compile` turns mixes into beat-timed plans and `store`
 //! keeps the set folder loaded and watched.
 
+pub mod capture;
 pub mod compile;
 pub mod edit;
 pub mod lexer;
 pub mod model;
 pub mod parser;
+pub mod record;
 pub mod resolve;
 pub mod live;
 pub mod runtime;

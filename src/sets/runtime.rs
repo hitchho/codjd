@@ -297,7 +297,7 @@ pub fn next_items(plan: &MixPlan, mix_beat: f64, out: usize) -> Vec<(f64, String
 
 // ---- helpers ----
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || match (a.canonicalize(), b.canonicalize()) {
             (Ok(x), Ok(y)) => x == y,

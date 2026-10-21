@@ -81,6 +81,12 @@ pub struct EditJob {
     pub change: Change,
 }
 
+impl std::fmt::Debug for EditJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EditJob({}: {})", self.file.display(), self.what)
+    }
+}
+
 pub struct Editor {
     store: Arc<Store>,
     /// held from reading the current version to the rename
