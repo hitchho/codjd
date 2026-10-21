@@ -6,6 +6,7 @@
 //! keeps the set folder loaded and watched.
 
 pub mod compile;
+pub mod edit;
 pub mod lexer;
 pub mod model;
 pub mod parser;

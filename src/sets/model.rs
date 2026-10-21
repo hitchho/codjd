@@ -93,6 +93,24 @@ impl Track {
     }
 }
 
+/// The inverse of [`Track::beat_of`]: the `bar n beat m` of beat index `beat` on grid `g`, with the
+/// beat rounded to a thousandth. None before `bar 1 beat 1`.
+pub fn pos_of_beat(g: &Grid, beat: f64) -> Option<Pos> {
+    let bpb = g.beats_per_bar as f64;
+    let rel = (beat * 1000.).round() / 1000. - g.downbeat_offset as f64;
+    if !rel.is_finite() || rel < -1e-9 || bpb < 1. {
+        return None;
+    }
+    let rel = rel.max(0.);
+    let mut bar = (rel / bpb).floor();
+    let mut in_bar = rel - bar * bpb;
+    if in_bar >= bpb - 1e-9 {
+        bar += 1.;
+        in_bar = 0.;
+    }
+    Some(Pos { bar: bar as u32 + 1, beat: 1. + in_bar })
+}
+
 /// Which deck of a mix: the outgoing track (`from`, the master) or the incoming one
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
