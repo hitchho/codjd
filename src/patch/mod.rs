@@ -14,3 +14,5 @@
 pub mod actions;
 pub mod doc;
 pub mod graph;
+pub mod host;
+pub mod slots;
