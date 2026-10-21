@@ -197,6 +197,10 @@ pub struct Engine {
     resume_after_queue: Option<u32>,
     /// the set runtime (`SetUse`, `SetArm`...), see `sets::runtime`
     setrt: crate::sets::runtime::Runtime,
+    /// the patch decks' slots (`PatchLoad`, `PatchAction`...), see `patch::slots`
+    patches: crate::patch::slots::Slots,
+    /// the patch files, for the set runtime's `load_patch`
+    patch_store: Option<Arc<crate::patch::store::PatchStore>>,
     /// a mix being recorded (`SetRecord`), see `edits`
     recorder: Option<crate::sets::record::Recorder>,
     handle: Codjd,
@@ -235,6 +239,8 @@ impl Engine {
             queue: VecDeque::new(),
             resume_after_queue: None,
             setrt: Default::default(),
+            patches: Default::default(),
+            patch_store: None,
             recorder: None,
             handle,
         })
@@ -1027,6 +1033,66 @@ impl Engine {
         self.with_runtime(|rt, h| rt.tick(h));
     }
 
+    // ---- patch decks (docs/patches.md) ----
+
+    /// Runs `f` with the slots and the engine as their host (the slots are taken out meanwhile)
+    fn with_patches<T>(&mut self, f: impl FnOnce(&mut crate::patch::slots::Slots, &mut Engine) -> T) -> T {
+        let mut slots = std::mem::take(&mut self.patches);
+        let out = f(&mut slots, self);
+        self.patches = slots;
+        out
+    }
+
+    pub fn set_patch_store(&mut self, store: Arc<crate::patch::store::PatchStore>) {
+        self.patch_store = Some(store);
+    }
+
+    /// `PatchLoad`, with the text of the patch file `name` (read by the caller)
+    pub fn patch_load(&mut self, slot: u32, name: &str, json: &str) -> Result<(), String> {
+        self.with_patches(|s, h| s.load(h, slot as usize, name, json))
+    }
+
+    /// Loads patch file `name` into `slot`, reading it here (the set runtime's way in)
+    fn patch_load_named(&mut self, slot: usize, name: &str) -> Result<(), String> {
+        let store = self.patch_store.clone().ok_or("no patch folder")?;
+        let (json, _) = store.source(name)?;
+        self.with_patches(|s, h| s.load(h, slot, name, &json))
+    }
+
+    pub fn patch_unload(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.unload(h, slot as usize))
+    }
+
+    pub fn patch_action(&mut self, slot: u32, json: &str) -> Result<(), String> {
+        self.with_patches(|s, h| s.action(h, slot as usize, json))
+    }
+
+    pub fn patch_undo(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.undo(h, slot as usize))
+    }
+
+    pub fn patch_redo(&mut self, slot: u32) -> Result<(), String> {
+        self.with_patches(|s, h| s.redo(h, slot as usize))
+    }
+
+    pub fn patch_set_live(&mut self, slot: u32, live: bool) -> Result<(), String> {
+        self.with_patches(|s, h| s.set_live(h, slot as usize, live))
+    }
+
+    /// `PatchSave`, first half: what to write
+    pub fn patch_save_job(&mut self, slot: u32) -> Result<crate::patch::slots::SaveJob, String> {
+        self.patches.save_job(slot as usize)
+    }
+
+    /// `PatchSave`, second half: the slot's patch was written as `name`
+    pub fn patch_saved(&mut self, slot: u32, name: &str, hash: &str, json: &str) {
+        self.patches.saved(slot as usize, name, hash, json);
+    }
+
+    pub fn patch_state(&mut self) -> Vec<crate::patch::slots::PatchSlot> {
+        self.with_patches(|s, h| s.state(h))
+    }
+
     /// Per deck: (position s, playing, decoded s, decoding finished)
     pub fn decks(&self) -> Vec<(f64, bool, f64, bool)> {
         (0..crate::audio::DECKS)
@@ -1277,6 +1343,20 @@ impl crate::sets::runtime::Host for Engine {
 
     fn decoded(&mut self, deck: usize) -> (f64, bool) {
         self.audio.decoded(deck)
+    }
+
+    fn patch_in_slot(&mut self, slot: usize) -> Option<(String, bool)> {
+        self.patches.in_slot(slot)
+    }
+
+    fn load_patch(&mut self, slot: usize, name: &str) -> Result<(), String> {
+        self.patch_load_named(slot, name)
+    }
+
+    fn patch_live(&mut self, slot: usize, live: bool) {
+        if let Err(e) = self.patch_set_live(slot as u32, live) {
+            warn!(slot, error = %e, "can't switch a patch deck live or cue");
+        }
     }
 }
 

@@ -125,6 +125,7 @@ impl PatchDoc {
     }
 
     /// The id of the next free numeric id (max + 1)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_id(&self) -> String {
         let max = self.nodes.keys().filter_map(|k| k.parse::<u64>().ok()).max().unwrap_or(0);
         (max + 1).to_string()

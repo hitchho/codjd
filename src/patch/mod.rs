@@ -8,11 +8,9 @@
 //! - `slots`: the four slots: loaded documents, edit history, `PatchState`
 //! - `store`: the patch files on disk (list, read, versioned write, import)
 
-// used by the compiler and the document layer, which are being built on top of it
-#![allow(dead_code)]
-
 pub mod actions;
 pub mod doc;
+pub mod engine_host;
 pub mod graph;
 pub mod host;
 pub mod import;

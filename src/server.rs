@@ -82,12 +82,18 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let editor = crate::sets::write::Editor::new(Arc::clone(&sets));
+    let patches = Arc::new(crate::patch::store::PatchStore::new(sets.dir()));
+    {
+        let patches = Arc::clone(&patches);
+        codjd.tell(move |e| e.set_patch_store(patches));
+    }
     let bus = Bus {
         codjd: codjd.clone(),
         slsk,
         analysis: Arc::clone(&analysis),
         sets: Arc::clone(&sets),
         editor,
+        patches,
     };
     let connection = connection::Builder::session()?
         .name(BUS_NAME)?

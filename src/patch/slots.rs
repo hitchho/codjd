@@ -89,17 +89,20 @@ impl Slots {
         self.slots[slot].as_mut().ok_or_else(|| format!("slot {slot} is empty: PatchLoad one first"))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_loaded(&self, slot: usize) -> bool {
         self.slots.get(slot).is_some_and(Option::is_some)
     }
 
-    /// The document of a slot, with its live edits
-    pub fn doc(&self, slot: usize) -> Option<&PatchDoc> {
-        self.slots.get(slot)?.as_ref().map(|s| &s.doc)
+    /// What a slot holds: (patch file name, has unsaved edits)
+    pub fn in_slot(&self, slot: usize) -> Option<(String, bool)> {
+        self.slots.get(slot)?.as_ref().map(|s| (s.name.clone(), s.doc != s.saved))
     }
 
-    pub fn graph(&self, slot: usize) -> Option<&PatchGraph> {
-        self.slots.get(slot)?.as_ref().map(|s| &s.graph)
+    /// The document of a slot, with its live edits
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn doc(&self, slot: usize) -> Option<&PatchDoc> {
+        self.slots.get(slot)?.as_ref().map(|s| &s.doc)
     }
 
     /// `PatchLoad`: the text of patch file `name` parsed, validated, compiled and loaded into
@@ -320,21 +323,6 @@ impl Slots {
             fader: rt.as_ref().map_or(1., |r| r.fader),
             headphones: rt.as_ref().map_or(true, |r| r.headphones),
         }
-    }
-
-    /// The knob names and sequencer names of a slot's patch, for the set runtime
-    pub fn names(&self, slot: usize) -> Option<(Vec<String>, Vec<String>)> {
-        let g = self.graph(slot)?;
-        Some((g.knobs.iter().map(|(n, _)| n.clone()).collect(), g.sequencers.iter().map(|(n, _)| n.clone()).collect()))
-    }
-
-    /// Index of a knob by name in a slot's patch
-    pub fn knob_index(&self, slot: usize, name: &str) -> Option<usize> {
-        self.graph(slot)?.knobs.iter().position(|(n, _)| n == name)
-    }
-
-    pub fn seq_index(&self, slot: usize, name: &str) -> Option<usize> {
-        self.graph(slot)?.sequencers.iter().position(|(n, _)| n == name)
     }
 }
 

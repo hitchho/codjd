@@ -376,10 +376,12 @@ impl History {
         Some(e.doc)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn undo_len(&self) -> usize {
         self.undo.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn redo_len(&self) -> usize {
         self.redo.len()
     }

@@ -232,6 +232,8 @@ impl NodeSpec {
         }
     }
 
+    // MERGE(patch-engine): the compiler reads text params (Filter mode, Clock source)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(&self, param: &str) -> Option<&str> {
         match self.params.get(param) {
             Some(ParamValue::Text(t)) => Some(t),

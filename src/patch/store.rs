@@ -25,10 +25,6 @@ impl PatchStore {
         Self { dir: sets_dir.join("patches"), lock: Mutex::new(()) }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// An existing patch file by name, with or without `.json`
     pub fn resolve(&self, name: &str) -> Option<PathBuf> {
         if name.is_empty() || name.contains(['/', '\\', '\0']) || name.contains("..") {
@@ -88,11 +84,6 @@ impl PatchStore {
                 .collect(),
             sequencers: g.sequencers.iter().map(|(n, _)| n.clone()).collect(),
         })
-    }
-
-    /// `PatchCheck`
-    pub fn check(&self, json: &str) -> Vec<String> {
-        doc::check(json)
     }
 
     /// `PatchWrite`. Replies with the new hash.
