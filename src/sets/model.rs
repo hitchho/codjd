@@ -34,6 +34,7 @@ pub struct PatchDecl {
 }
 
 impl Set {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn patch(&self, id: &str) -> Option<&PatchDecl> {
         self.patches.iter().find(|p| p.id == id)
     }
