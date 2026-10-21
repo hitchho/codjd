@@ -674,7 +674,7 @@ fn cross_checks(who: &str, kind: NodeKind, out: &mut Params, errs: &mut Vec<Stri
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub const ACID: &str = r#"{

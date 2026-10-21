@@ -11,5 +11,6 @@
 // used by the compiler and the document layer, which are being built on top of it
 #![allow(dead_code)]
 
+pub mod actions;
 pub mod doc;
 pub mod graph;
