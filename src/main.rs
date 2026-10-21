@@ -10,6 +10,7 @@ mod gridfix;
 mod hotcues;
 mod library;
 mod mpris;
+mod patch;
 mod net;
 mod server;
 mod sets;

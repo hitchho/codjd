@@ -152,7 +152,7 @@ struct PatchSlot {
     fader: f64, headphones: bool,
 }
 ```
-Signature: `a(bssbbbdsa(sddd)a(suuu)db)`.
+Signature: `a(bssbbdsa(sddd)a(suuu)db)`.
 
 Actions (`PatchAction`, JSON):
 `{"op":"add_node","id":"9","type":"Sine","name":"lfo","params":{...}}`,
