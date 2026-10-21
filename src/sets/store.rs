@@ -122,6 +122,14 @@ impl Store {
         sets.insert(file.to_path_buf(), Entry { name, good, errors });
     }
 
+    /// The errors `text` would have as the contents of `file` (`file:line:col: message`, the
+    /// whole pipeline: syntax, library search, grids, compile), without saving or loading it
+    pub fn check(&self, file: &Path, text: &str) -> Vec<String> {
+        let fname = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let env = Arc::clone(&self.env.read().unwrap());
+        load(file, text, &*env).diags.iter().map(|d| d.format(&fname)).collect()
+    }
+
     /// Tries the files that have errors again, e.g. after the library or analysis changed
     pub fn retry_errors(&self) {
         let bad: Vec<PathBuf> = {
