@@ -57,6 +57,8 @@ pub enum Event {
     PlaylistCreated(String),
 }
 
+mod edits;
+
 type Job = Box<dyn FnOnce(&mut Engine) + Send>;
 
 /// Cheap to clone handle to the engine
@@ -195,6 +197,8 @@ pub struct Engine {
     resume_after_queue: Option<u32>,
     /// the set runtime (`SetUse`, `SetArm`...), see `sets::runtime`
     setrt: crate::sets::runtime::Runtime,
+    /// a mix being recorded (`SetRecord`), see `edits`
+    recorder: Option<crate::sets::record::Recorder>,
     handle: Codjd,
 }
 
@@ -231,6 +235,7 @@ impl Engine {
             queue: VecDeque::new(),
             resume_after_queue: None,
             setrt: Default::default(),
+            recorder: None,
             handle,
         })
     }
@@ -456,6 +461,7 @@ impl Engine {
     ) -> Result<(), String> {
         check_deck(deck)?;
         let generation = self.audio.load(deck, path, at.max(0.), false)?;
+        self.rec_loaded(deck);
         if deck == PLAYER_DECK {
             // the player no longer owns what's on deck A
             self.generation = generation;
@@ -604,6 +610,14 @@ impl Engine {
     }
 
     pub fn deck_play(&mut self, deck: usize) -> Result<(), String> {
+        self.deck_start(deck)?;
+        let pos = self.audio.deck_states()[deck].position;
+        self.rec_play(deck, pos);
+        Ok(())
+    }
+
+    /// Starts a deck without telling the recording (the set runtime's own starts)
+    fn deck_start(&mut self, deck: usize) -> Result<(), String> {
         self.loaded(deck)?;
         if self.meta[deck].grid.is_none() {
             self.bind_analysis(deck, false);
@@ -711,6 +725,7 @@ impl Engine {
             ));
         }
         self.audio.sync(deck);
+        self.rec_synced(deck, true);
         Ok(())
     }
 
@@ -756,7 +771,9 @@ impl Engine {
         let ahead = (self.audio.deck_states()[deck].position + beats.max(0.) * 60. / grid.bpm)
             .max(0.);
         self.check_decoded(deck, ahead)?;
+        let from = self.audio.deck_states()[deck].position;
         self.audio.beat_jump(deck, beats);
+        self.rec_jump(deck, from, from + beats * 60. / grid.bpm);
         Ok(())
     }
 
@@ -775,6 +792,7 @@ impl Engine {
             self.check_decoded(deck, end)?;
         }
         self.audio.set_loop(deck, beats);
+        self.rec_loop(deck, beats);
         Ok(())
     }
 
@@ -804,7 +822,9 @@ impl Engine {
                     return Err(format!("hot cue {slot} is empty"));
                 };
                 self.check_decoded(deck, at)?;
+                let from = self.audio.deck_states()[deck].position;
                 self.audio.jump_to(deck, at, true);
+                self.rec_jump(deck, from, at);
             }
             other => return Err(format!("unknown action {other}")),
         }
@@ -814,12 +834,15 @@ impl Engine {
     pub fn deck_pause(&mut self, deck: usize) -> Result<(), String> {
         check_deck(deck)?;
         self.audio.pause(deck);
+        self.rec_pause(deck);
         Ok(())
     }
 
     pub fn deck_seek(&mut self, deck: usize, seconds: f64) -> Result<(), String> {
         check_deck(deck)?;
+        let from = self.audio.deck_states()[deck].position;
         self.audio.seek(deck, seconds.max(0.));
+        self.rec_jump(deck, from, seconds.max(0.));
         Ok(())
     }
 
@@ -871,6 +894,7 @@ impl Engine {
             "keylock" => {}
             other => return Err(format!("unknown control {other}")),
         }
+        self.rec_knob(control, deck, value);
         Ok(())
     }
 
@@ -1248,7 +1272,7 @@ impl crate::sets::runtime::Host for Engine {
     }
 
     fn play(&mut self, deck: usize) -> Result<(), String> {
-        self.deck_play(deck)
+        self.deck_start(deck)
     }
 
     fn decoded(&mut self, deck: usize) -> (f64, bool) {

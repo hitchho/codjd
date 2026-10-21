@@ -223,6 +223,7 @@ pub fn mix_index(src: &str, from: &str, to: &str) -> Option<usize> {
     blocks(src).iter().filter(|b| b.kind == Kind::Mix).position(|b| b.id == from && b.to == to)
 }
 
+#[cfg(test)]
 pub fn mix_count(src: &str) -> usize {
     blocks(src).iter().filter(|b| b.kind == Kind::Mix).count()
 }

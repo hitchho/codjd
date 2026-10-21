@@ -27,6 +27,8 @@ pub struct Bus {
     pub slsk: Arc<Slsk>,
     pub analysis: Arc<Analyzer>,
     pub sets: Arc<crate::sets::store::Store>,
+    /// every write to a set file goes through it (validated, hashed, versioned)
+    pub editor: Arc<crate::sets::write::Editor>,
 }
 
 impl Bus {
@@ -37,6 +39,26 @@ impl Bus {
         F: FnOnce(&mut crate::engine::Engine) -> T + Send + 'static,
     {
         self.codjd.call(f).await.unwrap_or_default()
+    }
+
+    /// Carries out a capture or recording the engine prepared, off the engine thread (git can
+    /// take a while); the reply is `ok <what happened>` or the reason
+    async fn write_job(
+        &self,
+        job: Option<Result<crate::sets::write::EditJob, String>>,
+        author: &'static str,
+    ) -> String {
+        let job = match job {
+            None => return "engine not running".to_string(),
+            Some(Err(e)) => return e,
+            Some(Ok(job)) => job,
+        };
+        let editor = Arc::clone(&self.editor);
+        match tokio::task::spawn_blocking(move || editor.modify(job, author)).await {
+            Ok(Ok(done)) => format!("ok {done}"),
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
     }
 }
 
@@ -514,6 +536,66 @@ impl Bus {
     /// the active set, its tracks and mixes, and the armed mix
     async fn set_state(&self) -> crate::sets::runtime::SetState {
         self.ask(|e| e.set_state()).await
+    }
+
+    // ---- set editing (docs/dj-api.md, "Set editing") ----
+
+    /// capture the deck's position as cue `name` of its track in the active set
+    async fn set_cue(&self, deck: u32, name: String) -> String {
+        let job = self.codjd.call(move |e| e.set_capture_cue(deck as usize, &name)).await;
+        self.write_job(job, "human").await
+    }
+
+    /// capture the deck's active loop as loop `name`
+    async fn set_loop_capture(&self, deck: u32, name: String) -> String {
+        let job = self.codjd.call(move |e| e.set_capture_loop(deck as usize, &name)).await;
+        self.write_job(job, "human").await
+    }
+
+    /// write the deck's current grid into the set as a `grid` line
+    async fn set_grid_capture(&self, deck: u32) -> String {
+        let job = self.codjd.call(move |e| e.set_capture_grid(deck as usize)).await;
+        self.write_job(job, "human").await
+    }
+
+    /// start or stop recording a mix; stopping writes the `mix` block
+    async fn set_record(&self, on: bool) -> String {
+        if on {
+            return reply(self.codjd.call(|e| e.set_record_start()).await);
+        }
+        let job = self.codjd.call(|e| e.set_record_stop()).await;
+        self.write_job(job, "human").await
+    }
+
+    /// (recording, beats on the outgoing deck's clock, events logged)
+    async fn set_recording(&self) -> (bool, f64, u32) {
+        self.ask(|e| e.set_recording()).await
+    }
+
+    // ---- set sources (for agents and editors) ----
+
+    /// the file as on disk and its sha-256
+    async fn set_source(&self, name: String) -> zbus::fdo::Result<(String, String)> {
+        self.editor.source(&name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// the errors of `text` as if it were saved as the active set's file (full pipeline)
+    async fn set_check(&self, text: String) -> Vec<String> {
+        let file = self.codjd.call(|e| e.set_active_file()).await.flatten();
+        let editor = Arc::clone(&self.editor);
+        tokio::task::spawn_blocking(move || editor.check(file.as_deref(), &text)).await.unwrap_or_default()
+    }
+
+    /// save `text` as set `name` after checking it; `base_hash` is the hash it was based on
+    /// ("" for a new set). Replies `ok <new hash>` or the reason
+    async fn set_write(&self, name: String, text: String, base_hash: String, author: String) -> String {
+        let editor = Arc::clone(&self.editor);
+        let done = tokio::task::spawn_blocking(move || editor.write(&name, &text, &base_hash, &author)).await;
+        match done {
+            Ok(Ok(hash)) => format!("ok {hash}"),
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
     }
 
     /// temporary tempo bend while held: -1..1 = -4..+4 %, 0 releases

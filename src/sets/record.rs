@@ -531,7 +531,6 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
         t: f64,
         raw: f64,
         v: f64,
-        prev: f64,
     }
     let mut kills: Vec<Step> = vec![];
     let mut restores: Vec<Step> = vec![];
@@ -560,7 +559,7 @@ pub fn build(inp: &Input) -> Result<Draft, String> {
                     what: What::Ramp { role: r, control, from: s.v0, to: s.v1, curve: s.curve },
                 }),
                 Move::Set { t, raw, v, prev } => {
-                    let step = Step { role: r, control, t, raw, v, prev };
+                    let step = Step { role: r, control, t, raw, v };
                     if is_band(control) && v <= KILL && prev > KILL {
                         if r == Role::Out {
                             kills.push(step);

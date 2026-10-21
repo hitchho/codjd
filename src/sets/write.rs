@@ -98,6 +98,7 @@ impl Editor {
         Arc::new(Self { store, lock: Mutex::new(()) })
     }
 
+    #[cfg(test)]
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }

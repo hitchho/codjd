@@ -356,6 +356,15 @@ impl Runtime {
         self.store = Some(store);
     }
 
+    pub fn store(&self) -> Option<&Arc<Store>> {
+        self.store.as_ref()
+    }
+
+    /// The file of the active set
+    pub fn active_file(&self) -> Option<&Path> {
+        self.active.as_ref().map(|a| a.file.as_path())
+    }
+
     fn active(&self) -> Result<&Active, String> {
         self.active.as_ref().ok_or_else(|| "no active set: SetUse first".to_string())
     }
