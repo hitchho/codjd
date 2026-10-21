@@ -4,6 +4,7 @@
 # that control, everything else of the recipe stays. Mixes should start on a phrase: bar 1, 9,
 # 17, 25 ... (every 8 bars); codjd warns if they don't (SetWarnings).
 # To see what a recipe does, expand it into a commented mix block you can edit: SetRecipeText.
+# The tracks are searched in the library by "artist - title" or file name; change them to yours.
 set "recipes: five ways to change tracks"
 
 track warm "Pneumatix - Aftertekno"
