@@ -216,7 +216,10 @@ fn map_plan_late(plan: &MixPlan, out: usize, inn: usize, group: u32, late: f64) 
             None => (out, Box::new(at) as Box<dyn Fn(f64) -> f64>),
         };
         let (at_beat, kind) = match *it {
-            // patch knobs, patterns and live/cue are not automation items of this engine yet
+            // MERGE(patch-engine): map `KnobRamp` to `AutoKind::Ramp` with `Control::Knob { slot, knob }`,
+            // `KnobSet` to `AutoKind::Set`, `Pattern` to `AutoKind::Pattern { slot, seq, pattern }`.
+            // None of them exists in this branch's engine, so they are skipped here. `Live` is not an
+            // automation item at all: the runtime fires it from `follow` through `Host::patch_live`.
             PlanItem::KnobRamp { .. } | PlanItem::KnobSet { .. } | PlanItem::Pattern { .. } | PlanItem::Live { .. } => {
                 continue;
             }
