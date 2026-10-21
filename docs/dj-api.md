@@ -187,3 +187,16 @@ with `DjLoad`.
   holds for a track loaded from the library; `next_items` text has no bar prefix (the client prints
   it from the beat), deck letters are the real decks (`A`/`B`), a ramp reads
   `bars 16–32 · A filter 0 → -0.6`.
+
+## Set editing (D-Bus)
+
+| method | args | does |
+|---|---|---|
+| `SetCue` | `u deck, s name` | capture the deck's position as cue `name` into the active set (see set-language.md, Editing) |
+| `SetLoopCapture` | `u deck, s name` | capture the deck's active loop as loop `name` |
+| `SetGridCapture` | `u deck` | write the deck's current grid into the set as a `grid` line |
+| `SetRecord` | `b on` | start/stop recording a mix; stopping writes the `mix` block and replies e.g. `ok mix 2: aft -> smk, 16 bars, 9 items` |
+| `SetRecording` | — | `(b recording, d beats, u events)`: elapsed beats on the outgoing deck's clock and events logged so far |
+
+All need an active set (`SetUse`) and reply `"ok ..."` or an error string. Edits are written, then
+hot-reloaded; the reply comes after the reload, so a following `SetState` shows the result.

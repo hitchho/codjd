@@ -179,3 +179,35 @@ exist is an error without a search. The library is the daemon's playlist (`Playl
 `SetList() -> a(ssu)` (name, file, error count), `SetErrors(s) -> as` (`file:line:col: message`),
 `SetShow(s) -> s` (JSON: name, file, errors, and the active resolved model with its compiled
 plans, `{"name","file","errors","active":{"set","plans"}}`).
+
+## Editing from codj (capture and recording)
+
+codjd writes to set files itself, so playing by hand turns into code. Edits are line-level: the
+parser's spans locate the track or mix block, and only the affected lines are inserted or
+replaced; comments, blank lines and formatting elsewhere stay exactly as written. Files are
+written atomically (temp + rename), then hot-reloaded like any save, so vim with `autoread` shows
+the change.
+
+- **Capture**: `cue <name> bar N [beat M]` (the deck's position, snapped to the nearest beat when
+  quantize is on), `loop <name> bar N [beat M] len K beats|bars` (the deck's active loop), and the
+  deck's current grid as a `grid` line, written into that track's block. A line with the same cue
+  or loop name is replaced; a `grid` line is replaced. A deck whose track is not in the active set
+  gets a new `track` block appended (id from the title: lowercase, `[a-z0-9_]`, made unique).
+- **Recording a mix**: while recording, every control change on either deck (from any client:
+  keys, MCP, D-Bus), plus play/pause/loop/jump/hot-cue events, is logged with the outgoing deck's
+  beat position. On stop, the log becomes a `mix` block:
+  - outgoing = the deck that was on air when recording started (playing, fader up); incoming = the
+    other deck. Both tracks are added to the set if missing.
+  - start = the first event's beat floored to a bar; length = last event ceiled to a bar.
+  - `play from`: the incoming deck's position when it started, as a cue name if one is within half
+    a beat, else `bar N [beat M]`; `unsynced` if it wasn't synced.
+  - Knob movements are simplified to ramps: a piecewise-linear fit (tolerance 0.05 of the range),
+    segment ends snapped to the nearest beat, adjacent segments merged; a fit closer to an S-curve
+    or exp than to linear gets that curve. Jumps of a band to −1 within a beat become `kill`; a
+    band killed on one deck and restored on the other within a beat becomes `swap <band>`; quick
+    changes become `bar n: x = v`.
+  - Bars are written with up to two decimals (`bar 16.5`) when needed.
+  - An existing `mix a -> b` with the same two tracks is replaced; otherwise the block is appended.
+- **History**: if the set folder is a git repository, every edit codjd makes is committed
+  (`codj: cue drop on aft`, `codj: recorded mix aft -> smk`). Without git, the previous file is
+  kept as `<file>.bak` before each edit. Hand-written versions are never lost.
