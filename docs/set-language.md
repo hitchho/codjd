@@ -211,3 +211,23 @@ the change.
 - **History**: if the set folder is a git repository, every edit codjd makes is committed
   (`codj: cue drop on aft`, `codj: recorded mix aft -> smk`). Without git, the previous file is
   kept as `<file>.bak` before each edit. Hand-written versions are never lost.
+
+## Humans and agents edit the same files
+
+Sets are edited by people (vim, codj) and by AI agents (MCP) through the same rules:
+
+- **Validate before saving**: agents never write blind. `SetCheck` runs the full pipeline (parse,
+  library search, grids, compile) on a text without saving it and returns every
+  `file:line:col: message`. `SetWrite` refuses a text with errors.
+- **No lost edits**: every write carries the hash of the version it was based on (`SetSource`
+  returns text + hash). If the file changed since (a save from vim, another agent, a capture), the
+  write is refused with "set changed since you read it", and the writer re-reads and retries.
+- **Attribution**: every write names its author: `human`, or `agent:<name>`. With git, commits
+  read `codj: …` or `codj (agent: claude): …`; without git, the `.bak` rule applies to every
+  write. `git log -p` on the set folder shows exactly who changed what.
+- **Small, reviewable edits**: agents should prefer whole-block replacements of one track or mix
+  over rewriting the file, so diffs stay small; codj's own captures and recordings follow the
+  line-level rules above.
+- **Live safety**: writing a set never changes what is playing. A running mix keeps its plan; the
+  edit applies to the next arm (see the runtime rules). Only arming/previewing changes the audio,
+  and over MCP that needs `codj mcp --live`.

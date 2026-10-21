@@ -200,3 +200,21 @@ with `DjLoad`.
 
 All need an active set (`SetUse`) and reply `"ok ..."` or an error string. Edits are written, then
 hot-reloaded; the reply comes after the reload, so a following `SetState` shows the result.
+
+## Set sources (D-Bus, for agents and editors)
+
+| method | args | does |
+|---|---|---|
+| `SetSource` | `s name` | `(s text, s hash)`: the file as on disk and its hash (sha-256 hex) |
+| `SetCheck` | `s text` | `as`: errors of `text` as if it were saved (full pipeline), empty = valid |
+| `SetWrite` | `s name, s text, s base_hash, s author` | save after checking; refused if `base_hash` isn't the current hash or the text has errors. `name` of a new file creates it (`base_hash` ""). Replies `ok <new hash>` or the reason |
+
+`author` is `human` or `agent:<name>`; it goes into the git commit message (or is ignored without
+git). The capture/record methods above use author `human` unless called from MCP.
+
+## MCP tools for sets (client, `codj mcp`)
+
+`sets_list`, `set_source`, `set_check`, `set_write` (needs `base_hash`), `set_use`, `set_cue`,
+`set_loop_capture`, `set_grid_capture`, `set_record` (start/stop) — always allowed (they never
+change what is playing). `set_arm`, `set_disarm`, `set_auto`, `set_preview`, `set_load` — refused
+without `--live`. MCP writes use author `agent:<client name from MCP initialize>`.
