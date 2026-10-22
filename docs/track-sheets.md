@@ -224,12 +224,29 @@ Duplicate names within a sheet are errors.
 error, and the whole sheet is set aside (the view uses observations only, and says so). A file
 with `version 2` read by a codjd that knows only 1 is set aside the same way, never partly read.
 
-**Open (O2): time in bars or in seconds.** (a) as above: bar positions pinned by a `grid` line
+**v1 implemented** (`src/tracks/sheet.rs`: parse and check). v1 notes:
+- **I5, made exact:** a sheet with any `bar` position needs a grid line with a tempo *and* a
+  first beat (`grid <bpm> @ <s>s [beat1 <n>]`): only that pins bars against a new analysis. A
+  grid line that only corrects (`grid x2`, `grid beat1 3`) is allowed in a sheet with no bar
+  positions (it is how `:grid x2` will be stored). The suggested line quotes the current
+  effective grid as `grid <bpm> @ <first beat>s beat1 <n>`, which reads back as the same grid.
+- Spans: `bar <a>..<b>` is whole bars, both included (`bar 33..48` ends where bar 49 starts);
+  `@ <s>s..<t>s` in seconds. Spans are separated by `,`, a token the set lexer now has (the set
+  language doesn't use it).
+- Mark slots, cues, loops and sections share one namespace (they are all addressed as
+  `<track>.<name>` from a set): a name used twice is an error, whatever the statements.
+- A bar has 4 beats in a sheet (the analysis only finds 4/4); `beat 5` is an error.
+- `section ... len <k> bars` takes whole bars, at least 1.
+- `version 2` (or any newer) stops the reading at that line with the one error, so nothing of a
+  newer grammar is reported as a mistake. `version` must be the first statement.
+- The `audio` line is read as raw text up to a comment (a hex id doesn't lex as one token).
+
+**Decided (O2): time in bars or in seconds.** (a) as above: bar positions pinned by a `grid` line
 in the sheet, readable in bars, the same rule the set language already has. (b) Store every
 position in seconds, show bars only in the view: never a pinning rule, but the file is no longer
 readable as music. Recommended: (a).
 
-**Open (O3): where and what name.** Recommended: `$XDG_DATA_HOME/codj/tracks/`, next to `sets/`,
+**Decided (O3): where and what name.** Recommended: `$XDG_DATA_HOME/codj/tracks/`, next to `sets/`,
 same git repository; the file name a readable slug (`lollipops-limousines.codj`), the AudioId
 inside, and an index from id to file. Alternative: the AudioId as the file name (no index, unreadable listing).
 

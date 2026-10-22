@@ -34,6 +34,8 @@ pub enum Tok {
     DotDot,
     Dot,
     Semi,
+    /// `,` (sheets separate spans with it; the set language has no use for it)
+    Comma,
     Colon,
     Eq,
     At,
@@ -145,6 +147,10 @@ fn lex_line(no: usize, text: &str, diags: &mut Vec<Diag>) -> Vec<Token> {
             }
             b';' => {
                 toks.push(simple(Tok::Semi, 1));
+                i += 1;
+            }
+            b',' => {
+                toks.push(simple(Tok::Comma, 1));
                 i += 1;
             }
             b':' => {

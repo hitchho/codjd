@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod sections;
+pub mod sheet;
 
 use serde::Serialize;
 

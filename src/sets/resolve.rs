@@ -55,8 +55,8 @@ pub trait Env: Send + Sync {
 
 /// Bounds of the values the engine accepts
 pub const GAIN_DB: (f64, f64) = (-48., 12.);
-const BPM: (f64, f64) = (30., 300.);
-const SCALE: (f64, f64) = (0.2, 5.);
+pub const BPM: (f64, f64) = (30., 300.);
+pub const SCALE: (f64, f64) = (0.2, 5.);
 
 /// Never fails: the set is built from whatever was valid and the caller discards it if `Diag`s
 /// came back
