@@ -233,7 +233,7 @@ impl Bus {
 
     async fn reload_config(&self) {
         let config = Config::try_from_env().unwrap_or_else(|e| {
-            eprintln!("{e}\nfalling back to the default config (no music path)");
+            eprintln!("{e}\nusing the defaults (music from ~/Music)");
             Config::default()
         });
         if let Some(paths) = self

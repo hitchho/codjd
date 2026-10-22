@@ -31,7 +31,7 @@ pub fn start_tracing() {
 pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Starting `codjd`...");
     let config = Config::try_from_env().unwrap_or_else(|e| {
-        eprintln!("{e}\nfalling back to the default config (no music path)");
+        eprintln!("{e}\nusing the defaults (music from ~/Music)");
         Config::default()
     });
     let music_dir = PathBuf::from(&config.path);

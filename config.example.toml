@@ -1,3 +1,5 @@
+# Every setting is optional. Without a config codjd plays ~/Music.
+# `path = "~/Music/dj"` alone is a complete config.
 path = "/home/user/Music/" # path to media DIRECTORY
 sort = "ByDurationDescending" # ByTitleAscending, ByTitleDescending, ByDurationAscending, ByDurationDescending, Shuffle 
 repeat = "AllMusics" # Dont, ThisMusic
