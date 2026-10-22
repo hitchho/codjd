@@ -1,7 +1,8 @@
 # Tracks: identity, observations, sheets (draft spec)
 
-Status: **draft, nothing implemented.** Decisions still open are marked **Open** and collected at
-the end.
+Status: **v1 being implemented** (branch `feat/track-model`). Each section says what is done;
+"v1 notes" record where the implementation decided something this draft left open or got
+wrong. The open decisions at the end are decided (the recommendations were taken).
 
 Everything codjd knows about a track should be in one model that people, codj and AI agents read
 the same way, so transitions can be chosen by the music (where the outro starts, where the
@@ -81,8 +82,25 @@ it changes. A file the demuxer cannot read has no AudioId and no sheet; it still
 copies (title, artist, length within 2 s; `dedup.rs`). It stays a display concern in v1. A later
 version may let a sheet say `same-as <AudioId> offset <s>` to share statements across encodings.
 
-**Open (O1)**: SHA-256 (already a dependency, for the model weights) or BLAKE3 (faster, one more
-crate). Hashing is I/O bound at library sizes; SHA-256 is the default unless measured otherwise.
+**Decided (O1)**: SHA-256.
+
+**v1 implemented** (`src/analysis/audio_id.rs`). v1 notes:
+- The hashed header is exact and part of the scheme: `b"codj-audio-id-1"`, then u32 LE sample
+  rate, channel count, bits per sample, extra-data length (an absent value is 0), then the extra
+  data; then every packet's data concatenated **without lengths**. The **codec id is left out**:
+  symphonia numbers codecs itself and a renumbering must not change every id (the packet bytes
+  differ between codecs anyway). No lengths, so a demuxer that cuts raw PCM into packets of
+  another size gives the same id.
+- The fast pass hashes each packet before decoding it (a packet the decoder rejects still
+  counts). A demuxer error after the first packet ends the stream, as it ends the pass.
+  `audio_id::compute` is the same hash demuxing only; a test checks the two agree.
+- The index is its own file, `<cache dir>/audio-ids.json` (`path -> {size, mtime, id}`; the
+  reverse map is built on load). A file already in `analysis.json` without an id gets a
+  demux-only job, never a new analysis. `Analyzer::audio_id(path)` hashes on demand (and
+  records it) when the index doesn't know the file as it is now.
+- **Not yet done:** `analysis.json` and the waveform files are still keyed by path (+ size +
+  mtime, md5 of the path). Rekeying them by AudioId is left for later; everything below looks
+  observations up through the id's paths.
 
 ## 2. Observations
 

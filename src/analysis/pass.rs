@@ -19,7 +19,10 @@ use symphonia::{
     default::{get_codecs, get_probe},
 };
 
-use super::waveform::{Waveform, WaveformBuilder};
+use super::{
+    audio_id::IdHasher,
+    waveform::{Waveform, WaveformBuilder},
+};
 
 /// bliss expects exactly this
 pub const BLISS_RATE: u32 = 22_050;
@@ -36,6 +39,8 @@ pub struct Pass {
     /// averaged stereo; bliss's downmix is sqrt(2) louder)
     pub average_gain: f32,
     pub waveform: Waveform,
+    /// the AudioId of the file (see `audio_id.rs`), hashed from the packets read here
+    pub audio_id: String,
 }
 
 pub fn run(path: &Path) -> Result<Pass, String> {
@@ -61,6 +66,7 @@ pub fn run(path: &Path) -> Result<Pass, String> {
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|e| e.to_string())?;
 
+    let mut hasher = IdHasher::new(&params);
     let mut ebu = EbuR128::new(2, rate, Mode::I | Mode::SAMPLE_PEAK).map_err(|e| e.to_string())?;
     let mut wave = WaveformBuilder::new(rate);
     let mut resampler = Resampler::new(rate, BLISS_RATE);
@@ -85,6 +91,8 @@ pub fn run(path: &Path) -> Result<Pass, String> {
         if packet.track_id != track_id {
             continue;
         }
+        // before decoding: a packet the decoder rejects is still part of the file's audio
+        hasher.packet(&packet.data);
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(Error::DecodeError(_)) if errors < 10 => {
@@ -138,6 +146,7 @@ pub fn run(path: &Path) -> Result<Pass, String> {
         mono,
         average_gain,
         waveform: wave.finish(duration_ms),
+        audio_id: hasher.finish(),
     })
 }
 
@@ -333,6 +342,8 @@ mod tests {
         assert_eq!(pass.duration_ms, 6000);
         assert!(pass.mono.len().abs_diff(6 * BLISS_RATE as usize) <= 1);
         assert_eq!(pass.waveform.columns.len(), 6 * 50);
+        // the pass and the demux-only hash agree
+        assert_eq!(pass.audio_id, super::super::audio_id::compute(&wav).unwrap());
         // a mono file is measured as if played on both speakers
         let mono: Vec<f32> = samples.iter().step_by(2).copied().collect();
         write_wav(&wav, rate, 1, &mono);

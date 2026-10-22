@@ -9,8 +9,11 @@
 //! `grid.rs`, `models.rs`; skipped without the model weights). Results are cached in
 //! `~/.cache/codjd/analysis.json` (override the directory with `CODJD_CACHE_DIR`), keyed on
 //! path + size + mtime, so a file is only analyzed again when it changes. Waveforms are too big
-//! for that file and live next to it, one per track (see `waveform.rs`).
+//! for that file and live next to it, one per track (see `waveform.rs`). The fast pass also
+//! hashes the packets into the file's AudioId (`audio_id.rs`), kept in `audio-ids.json` next to
+//! the cache; a cached file without one gets it from a demux-only job, not a new analysis.
 
+pub mod audio_id;
 mod grid;
 mod key;
 mod models;
@@ -36,7 +39,16 @@ use bliss_audio::{Song, AnalysisIndex, FeaturesVersion};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use audio_id::IdIndex;
 use models::Weights;
+
+/// What a worker is asked to do with a file
+enum Job {
+    /// the whole analysis (it computes the AudioId too)
+    Full(PathBuf),
+    /// the file is analyzed and unchanged, only its AudioId is missing
+    Id(PathBuf),
+}
 
 /// What we keep per analyzed file
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -139,8 +151,12 @@ pub struct Analyzer {
     failed: Mutex<HashSet<PathBuf>>,
     /// files waiting or being analyzed
     pending: Mutex<HashSet<PathBuf>>,
-    work: Mutex<mpsc::Sender<PathBuf>>,
+    work: Mutex<mpsc::Sender<Job>>,
     cache_path: Option<PathBuf>,
+    /// `(path, size, mtime) -> AudioId` and back
+    ids: Mutex<IdIndex>,
+    /// where `ids` is saved; None (tests without a cache file) keeps it in memory
+    ids_path: Option<PathBuf>,
     /// where the beat-this weights are looked for; None (tests) means there are none
     models_dir: Option<PathBuf>,
     /// whether missing weights may be downloaded (`CODJD_MODEL_DOWNLOAD=1`)
@@ -208,7 +224,9 @@ impl Analyzer {
             .collect::<HashMap<_, _>>();
         info!(cached = cache.len(), "analysis cache loaded");
 
-        let (tx, rx) = mpsc::channel::<PathBuf>();
+        let ids_path = cache_path.as_deref().and_then(Path::parent).map(|d| d.join("audio-ids.json"));
+        let ids = IdIndex::load(ids_path.as_deref());
+        let (tx, rx) = mpsc::channel::<Job>();
         let analyzer = Arc::new(Self {
             cache: Mutex::new(cache),
             failed: Mutex::default(),
@@ -218,6 +236,8 @@ impl Analyzer {
             download_models,
             weights: OnceLock::new(),
             wave_dir: cache_path.as_deref().and_then(Path::parent).map(|d| d.join("waveforms")),
+            ids: Mutex::new(ids),
+            ids_path,
             cache_path,
             done: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
@@ -238,6 +258,7 @@ impl Analyzer {
     pub fn enqueue<I: IntoIterator<Item = PathBuf>>(&self, paths: I) {
         let grid_wanted = self.grid_wanted();
         let cache = self.cache.lock().unwrap();
+        let ids = self.ids.lock().unwrap();
         let failed = self.failed.lock().unwrap();
         let mut pending = self.pending.lock().unwrap();
         let work = self.work.lock().unwrap();
@@ -248,11 +269,12 @@ impl Analyzer {
                     && !(grid_wanted && !f.grid_done)
                     && f.key.as_ref().is_none_or(|k| k.source == key::SOURCE)
             });
-            if fresh || failed.contains(&path) || !pending.insert(path.clone()) {
+            let has_id = || stat(&path).is_some_and(|st| ids.get(&path, st).is_some());
+            if (fresh && has_id()) || failed.contains(&path) || !pending.insert(path.clone()) {
                 continue;
             }
             self.total.fetch_add(1, Ordering::Relaxed);
-            let _ = work.send(path);
+            let _ = work.send(if fresh { Job::Id(path) } else { Job::Full(path) });
         }
     }
 
@@ -282,6 +304,50 @@ impl Analyzer {
         self.weights
             .get_or_init(|| models::locate(self.models_dir.as_deref()?, self.download_models))
             .as_ref()
+    }
+
+    /// The AudioId of the file at `path`, hashed now (a demux of the whole file, so call it off
+    /// the async executor) if the index doesn't have it for the file as it is. None when the
+    /// file can't be read or demuxed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn audio_id(&self, path: &Path) -> Option<String> {
+        let st = stat(path)?;
+        if let Some(id) = self.ids.lock().unwrap().get(path, st) {
+            return Some(id.to_string());
+        }
+        let id = audio_id::compute(path).ok()?;
+        self.record_id(path, st, id.clone());
+        self.save_ids();
+        Some(id)
+    }
+
+    /// The id of `path` if it is known for the file as it is, without hashing
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn known_audio_id(&self, path: &Path) -> Option<String> {
+        let st = stat(path)?;
+        self.ids.lock().unwrap().get(path, st).map(str::to_string)
+    }
+
+    /// The files known to hold the audio `id`, as they are now (a file changed since it was
+    /// hashed is left out)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn paths_of(&self, id: &str) -> Vec<PathBuf> {
+        let ids = self.ids.lock().unwrap();
+        ids.paths(id)
+            .into_iter()
+            .filter(|p| stat(p).is_some_and(|st| ids.get(p, st) == Some(id)))
+            .collect()
+    }
+
+    fn record_id(&self, path: &Path, st: (u64, u64), id: String) {
+        self.ids.lock().unwrap().insert(path, st, id);
+    }
+
+    fn save_ids(&self) {
+        let Some(file) = &self.ids_path else { return };
+        if let Err(e) = self.ids.lock().unwrap().save(file) {
+            warn!(error = %e, "can't save the AudioId index");
+        }
     }
 
     pub fn features(&self, path: &Path) -> Option<Features> {
@@ -348,6 +414,7 @@ impl Analyzer {
 
     /// Writes the cache atomically (temp file + rename)
     fn save(&self) {
+        self.save_ids();
         let Some(path) = &self.cache_path else { return };
         let file = CacheFile {
             tracks: self.cache.lock().unwrap().clone(),
@@ -367,22 +434,44 @@ impl Analyzer {
     }
 }
 
-fn worker(rx: Arc<Mutex<mpsc::Receiver<PathBuf>>>, analyzer: std::sync::Weak<Analyzer>) {
+fn worker(rx: Arc<Mutex<mpsc::Receiver<Job>>>, analyzer: std::sync::Weak<Analyzer>) {
     let mut last_save = Instant::now();
     // loaded on first use, then kept for the next tracks
     let mut beats = BeatModel::default();
     loop {
         let next = rx.lock().unwrap().recv();
-        let Ok(path) = next else { return };
+        let Ok(job) = next else { return };
         let Some(analyzer) = analyzer.upgrade() else { return };
+        let path = match job {
+            Job::Full(path) => path,
+            Job::Id(path) => {
+                let st = stat(&path);
+                match (st, audio_id::compute(&path)) {
+                    (Some(st), Ok(id)) => analyzer.record_id(&path, st, id),
+                    (_, Err(e)) => warn!(path = %path.display(), error = %e, "can't hash the audio"),
+                    (None, _) => {}
+                }
+                analyzer.finish(path, true);
+                if analyzer.idle() || last_save.elapsed() > Duration::from_secs(30) {
+                    analyzer.save();
+                    last_save = Instant::now();
+                }
+                continue;
+            }
+        };
         match analyze(&path, analyzer.wave_file(&path)) {
             None => {
                 warn!(path = %path.display(), "can't analyze");
+                // a file that won't decode may still demux: it keeps an identity
+                if let (Some(st), Ok(id)) = (stat(&path), audio_id::compute(&path)) {
+                    analyzer.record_id(&path, st, id);
+                }
                 analyzer.finish(path, false);
             }
             Some(fast) => {
                 // loudness, waveform and bliss are usable now; the heavy part follows
                 let stamp = (fast.features.size, fast.features.mtime);
+                analyzer.record_id(&path, stamp, fast.audio_id);
                 analyzer.store(&path, fast.features);
                 let started = Instant::now();
                 let stage = grid_stage(&mut beats, &analyzer, fast.mono, fast.average_gain);
@@ -410,6 +499,7 @@ struct Fast {
     /// mono 22.05 kHz, kept for the grid stage so the file is not decoded twice
     mono: Vec<f32>,
     average_gain: f32,
+    audio_id: String,
 }
 
 /// Decode pass + bliss + waveform: everything that was analyzed before beat grids
@@ -445,7 +535,7 @@ fn analyze(path: &Path, wave_file: Option<PathBuf>) -> Option<Fast> {
         key: None,
         grid_done: false,
     };
-    Some(Fast { features, mono: pass.mono, average_gain: pass.average_gain })
+    Some(Fast { features, mono: pass.mono, average_gain: pass.average_gain, audio_id: pass.audio_id })
 }
 
 /// What the grid stage found
@@ -650,8 +740,40 @@ mod tests {
         while !cache.exists() && start.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let b = Analyzer::start_with(Some(cache), 1);
-        assert_eq!(b.features(&wav), Some(f));
+        let b = Analyzer::start_with(Some(cache.clone()), 1);
+        assert_eq!(b.features(&wav), Some(f.clone()));
+
+        // the fast pass gave it an AudioId, kept across a restart
+        let id = a.known_audio_id(&wav).expect("an id from the pass");
+        assert_eq!(id, audio_id::compute(&wav).unwrap());
+        assert_eq!(b.known_audio_id(&wav), Some(id.clone()));
+        assert_eq!(b.paths_of(&id), [wav.clone()]);
+        // a copy under another name is the same audio
+        let copy = dir.join("copy.wav");
+        std::fs::copy(&wav, &copy).unwrap();
+        assert_eq!(b.audio_id(&copy), Some(id.clone()));
+        assert_eq!(b.paths_of(&id), [wav.clone(), copy.clone()]);
+        assert!(b.audio_id(&dir.join("missing.wav")).is_none());
+        drop(b);
+
+        // a cache from before AudioIds: the file is only hashed, not analyzed again (the
+        // tampered loudness stays)
+        std::fs::remove_file(dir.join("audio-ids.json")).unwrap();
+        let mut file: CacheFile = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        file.tracks.get_mut(&wav).unwrap().lufs = -33.;
+        std::fs::write(&cache, serde_json::to_vec(&file).unwrap()).unwrap();
+        let c = Analyzer::start_with(Some(cache), 1);
+        assert!(c.known_audio_id(&wav).is_none());
+        c.enqueue([wav.clone()]);
+        let start = Instant::now();
+        while c.progress() != (1, 1) && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(c.known_audio_id(&wav), Some(id));
+        assert_eq!(c.features(&wav).unwrap().lufs, -33.);
+        // and then it is complete: nothing queued
+        c.enqueue([wav.clone()]);
+        assert_eq!(c.progress(), (1, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
