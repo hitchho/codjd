@@ -250,6 +250,20 @@ readable as music. Recommended: (a).
 same git repository; the file name a readable slug (`lollipops-limousines.codj`), the AudioId
 inside, and an index from id to file. Alternative: the AudioId as the file name (no index, unreadable listing).
 
+**v1 implemented** (`src/tracks/store.rs`). v1 notes:
+- The folder is `<sets dir>/../tracks` (so `$XDG_DATA_HOME/codj/tracks` by default, and next
+  to a `[sets] dir` that was moved). It shares the sets' git repository only when that
+  repository contains both folders (a repository at `codj/`); with a repository at `sets/`
+  alone, the tracks folder keeps `.bak` files.
+- A new sheet's file name is the slug of its `name` line, else of a hint (the track's file
+  name), else the short id; `-<short id>` is added when the name is taken.
+- The index id -> file is in memory, built by reading the folder and read again whenever the
+  folder's mtime changes (a create, rename or delete) or a file no longer says the id it was
+  indexed under. No watcher: a sheet is read from disk every time a view is made.
+- **Two files about the same AudioId:** the first by file name is the sheet; the others are
+  listed with an error ("... is about the same audio and wins; this one is set aside") and the
+  view says so. Nothing is deleted.
+
 ## 4. The view
 
 ```
