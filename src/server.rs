@@ -109,18 +109,29 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .build()
         .await
         .map_err(|e| format!("can't start on the session bus: {e}"))?;
-    // never queue behind a running codjd: two daemons would both play
+    // never queue behind a running codjd: two daemons would both play. A codjd that replaced
+    // itself with a newer build waits a little: the bus drops the old process's name only once
+    // it has seen its connection close
     use zbus::fdo::{RequestNameFlags, RequestNameReply};
-    match connection
-        .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
-        .await
-    {
-        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}
-        Ok(_) | Err(zbus::Error::NameTaken) => {
-            return Err("already running (stop it first, or just use codj)".into())
+    let patience = if std::env::var_os(crate::upgrade::REEXEC_ENV).is_some() { 50 } else { 1 };
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match connection
+            .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
+            .await
+        {
+            Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => break,
+            Ok(_) | Err(zbus::Error::NameTaken) if tries < patience => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Ok(_) | Err(zbus::Error::NameTaken) => {
+                return Err("already running (stop it first, or just use codj)".into())
+            }
+            Err(e) => return Err(format!("can't take the name {BUS_NAME}: {e}").into()),
         }
-        Err(e) => return Err(format!("can't take the name {BUS_NAME}: {e}").into()),
     }
+    std::env::remove_var(crate::upgrade::REEXEC_ENV);
     dbus::forward_signals(&connection, &codjd)?;
     // media keys, playerctl and desktop widgets; codjd still works if another player owns it
     match connection.request_name(crate::mpris::BUS_NAME).await {
@@ -161,6 +172,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         music_display,
         if tracks == 0 { " (empty: set `path` in ~/.config/codjd/config.toml)" } else { "" }
     );
+
+    // a newer build installed later takes over by itself once nothing plays
+    crate::upgrade::spawn(codjd.clone());
 
     // stop on Ctrl+C, kill/systemd (SIGTERM) and a closed terminal (SIGHUP)
     use tokio::signal::unix::{signal, SignalKind};

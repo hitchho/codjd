@@ -17,6 +17,7 @@ mod sets;
 mod slsk;
 mod soulseek;
 mod types;
+mod upgrade;
 mod watcher;
 
 #[tokio::main]

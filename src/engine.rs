@@ -1143,6 +1143,25 @@ impl Engine {
     }
 
     /// (xruns, second output underruns, second output skips, sample rate)
+    /// Nothing anyone would miss if codjd restarted now: no sound from the player, the decks or a
+    /// live patch, no recording (audio or a mix), no armed mix, no unsaved patch edits
+    /// `Some(paused)`: idle, and whether the player holds a paused track (whose place a restart
+    /// would lose); None: busy
+    pub fn idle_for_restart(&mut self) -> Option<bool> {
+        let playing = matches!(self.status(), PlayingStatus::Playing) || self.audio.deck_states().iter().any(|d| d.playing);
+        let recording = self.audio.record_state().on || self.set_recording().0;
+        let armed = self.with_runtime(|rt, h| rt.state(h).armed >= 0);
+        let patches = self.patch_state().iter().any(|p| p.live || p.dirty);
+        (!(playing || recording || armed || patches)).then(|| matches!(self.status(), PlayingStatus::Pausing))
+    }
+
+    /// Writes what is only in memory (the playlist and where it is) before codjd is replaced
+    pub fn save_state(&mut self) {
+        if let Err(e) = self.playlist.save(self.store.path()) {
+            warn!("failed to save playlist: {}", e);
+        }
+    }
+
     /// `[record] dir`: where recorded mixes go
     pub fn set_record_dir(&mut self, dir: std::path::PathBuf) {
         self.record_dir = Some(dir);
