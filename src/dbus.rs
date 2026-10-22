@@ -31,6 +31,8 @@ pub struct Bus {
     pub editor: Arc<crate::sets::write::Editor>,
     /// the patch files (`<sets dir>/patches`), written through the same versioned path
     pub patches: Arc<crate::patch::store::PatchStore>,
+    /// the track model: AudioIds, sheets, views (docs/track-sheets.md)
+    pub tracks: Arc<crate::tracks::Tracks>,
 }
 
 impl Bus {
@@ -637,6 +639,87 @@ impl Bus {
     async fn set_write(&self, name: String, text: String, base_hash: String, author: String) -> String {
         let editor = Arc::clone(&self.editor);
         let done = tokio::task::spawn_blocking(move || editor.write(&name, &text, &base_hash, &author)).await;
+        match done {
+            Ok(Ok(hash)) => format!("ok {hash}"),
+            Ok(Err(e)) => e,
+            Err(e) => format!("internal error: {e}"),
+        }
+    }
+
+    // ---- tracks: AudioId, sheets, views (docs/track-sheets.md) ----
+
+    /// the resolved track as text: a sheet with what the analysis measured on lines marked
+    /// `# analysis`, the diagnostics as comments. `path_or_id` is a file or an AudioId
+    async fn track_view(&self, path_or_id: String) -> zbus::fdo::Result<String> {
+        let tracks = Arc::clone(&self.tracks);
+        // may hash a file that was never analyzed
+        tokio::task::spawn_blocking(move || tracks.view(&path_or_id).map(|v| crate::tracks::view::render(&v)))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// the resolved track as JSON, every field with its source
+    async fn track_view_json(&self, path_or_id: String) -> zbus::fdo::Result<String> {
+        let tracks = Arc::clone(&self.tracks);
+        tokio::task::spawn_blocking(move || {
+            tracks.view(&path_or_id).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+        })
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        .map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// (AudioId, name, path) of the library tracks whose artist, title or file name contains
+    /// `query`, and of the sheets whose name does (path "" when no file has that audio)
+    async fn track_find(&self, query: String) -> Vec<(String, String, String)> {
+        let library: Vec<crate::tracks::LibEntry> = self
+            .ask(|e| {
+                e.playlist
+                    .musics
+                    .iter()
+                    .map(|m| crate::tracks::LibEntry {
+                        artist: m.artist.clone(),
+                        title: m.title.clone(),
+                        path: <&std::path::Path>::from(&m.path).to_path_buf(),
+                    })
+                    .collect()
+            })
+            .await;
+        let tracks = Arc::clone(&self.tracks);
+        tokio::task::spawn_blocking(move || tracks.find(&query, &library)).await.unwrap_or_default()
+    }
+
+    /// the sheet of an AudioId (or of a file's audio) as on disk and its sha-256; ("", "") when
+    /// it has none yet
+    async fn sheet_source(&self, id: String) -> zbus::fdo::Result<(String, String)> {
+        let tracks = Arc::clone(&self.tracks);
+        tokio::task::spawn_blocking(move || tracks.sheet_source(&id))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// the errors of `text` as a sheet (`file:line:col: message`), nothing saved; empty = valid
+    async fn sheet_check(&self, text: String) -> Vec<String> {
+        let tracks = Arc::clone(&self.tracks);
+        tokio::task::spawn_blocking(move || tracks.sheet_check(&text)).await.unwrap_or_default()
+    }
+
+    /// save `text` as the sheet of `id` after checking it; `base_hash` is the hash it was based
+    /// on ("" for a new sheet). Replies `ok <new hash>` or the reason. Never changes what plays
+    async fn sheet_write(&self, id: String, text: String, base_hash: String, author: String) -> String {
+        let tracks = Arc::clone(&self.tracks);
+        let sets = Arc::clone(&self.sets);
+        let done = tokio::task::spawn_blocking(move || {
+            let r = tracks.sheet_write(&id, &text, &base_hash, &author);
+            if r.is_ok() {
+                // sets read names, grids and gains of sheets: the next arm uses the new ones
+                sets.load_all();
+            }
+            r
+        })
+        .await;
         match done {
             Ok(Ok(hash)) => format!("ok {hash}"),
             Ok(Err(e)) => e,

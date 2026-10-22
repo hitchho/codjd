@@ -58,6 +58,30 @@ pub struct Track {
     pub grid: Option<Grid>,
     pub cues: Vec<Cue>,
     pub loops: Vec<LoopDef>,
+    /// what `<track>.<name>` finds when the set has no cue or loop of that name: the track's
+    /// sheet (cues, loops, marks, sections), then its measured sections, in that order
+    /// (`docs/track-sheets.md`, "Sets"). Positions are beat indices on this track's grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<TrackName>,
+    /// spans with a voice, as beat indices on this track's grid; None when unknown
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocals: Option<Vec<(f64, f64)>>,
+}
+
+/// A name from the track model
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TrackName {
+    pub name: String,
+    /// where it starts, beat index on the set track's grid
+    pub beat: f64,
+    /// a loop: its length in beats
+    pub loop_beats: Option<f64>,
+    /// a section: its kind and end (beat index)
+    pub section: Option<(String, f64)>,
+    /// `sheet` or `analysis`
+    pub source: String,
+    /// a measured section's confidence
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -102,6 +126,19 @@ impl Track {
 
     pub fn cue(&self, name: &str) -> Option<&Cue> {
         self.cues.iter().find(|c| c.name == name)
+    }
+
+    /// A name of the track model, when the set itself has no cue of that name
+    pub fn model_name(&self, name: &str) -> Option<&TrackName> {
+        self.names.iter().find(|n| n.name == name)
+    }
+
+    /// Beat index of a cue of the set, else of a name of the track model
+    pub fn named_beat(&self, name: &str) -> Option<f64> {
+        match self.cue(name) {
+            Some(c) => self.beat_of(&c.pos),
+            None => self.model_name(name).map(|n| n.beat),
+        }
     }
 
     pub fn loop_def(&self, name: &str) -> Option<&LoopDef> {

@@ -926,3 +926,166 @@ fn the_patch_examples_are_valid_and_the_example_set_loads() {
     assert_eq!(items.iter().filter(|i| matches!(i, PlanItem::Pattern { pattern: 1, .. })).count(), 2);
     assert!(items.iter().any(|i| matches!(i, PlanItem::Live { slot: 1, live: true, .. })));
 }
+
+// ---- the track model behind `<track>.<name>` (docs/track-sheets.md, "Sets") ----
+
+mod track_model {
+    use super::*;
+    use crate::{
+        analysis::Grid,
+        sets::model::Action,
+        tracks::{
+            sections::{Kind, Section},
+            store::{check_text, ReadSheet},
+            view::{view, Observations},
+            Observation, Value,
+        },
+    };
+
+    const AFT: &str = "/music/Pneumatix - Aftertekno.flac";
+    const SMK: &str = "/music/Aasi & Swooh - Smokin.flac";
+    const ID: &str = "a1:00000000000000000000000000000001";
+
+    /// a measured section from bar `a` for `len` bars on grid `g`
+    fn section(g: &Grid, name: &str, kind: Kind, a: u32, len: u32, confidence: f64) -> Section {
+        let bar = 60. / g.bpm * g.beats_per_bar as f64;
+        let t0 = g.first_beat_s + g.downbeat_offset as f64 * 60. / g.bpm;
+        Section {
+            name: name.into(),
+            kind,
+            start_s: t0 + (a - 1) as f64 * bar,
+            end_s: t0 + (a - 1 + len) as f64 * bar,
+            start_bar: a,
+            len_bars: len,
+            energy: [5, 5, 5],
+            confidence,
+        }
+    }
+
+    /// spec_env with views: aft has an intro, a drop at bar 33 and an outro at bar 129 (shaky);
+    /// smk an intro and a drop at bar 17; `sheets` per file
+    fn env(aft_sheet: Option<&str>, smk_sheet: Option<&str>) -> FakeEnv {
+        let mut e = spec_env();
+        let ga = e.grids[Path::new(AFT)].clone();
+        let gs = e.grids[Path::new(SMK)].clone();
+        let mut add = |file: &str, g: &Grid, sections: Vec<Section>, sheet: Option<&str>| {
+            let obs = Observations {
+                id: ID.into(),
+                duration_s: Some(600.),
+                loudness: Some((-9., -2.)),
+                grid: Some(g.clone()),
+                grid_factor: 1.,
+                key: None,
+                sections: Some(Observation { producer: crate::tracks::sections::producer(), value: Value::Known(sections) }),
+            };
+            let read = sheet.map(|t| {
+                let text = format!("version 1\naudio {ID}\n{t}");
+                let sheet = check_text("x.codj", &text, None);
+                assert!(sheet.is_ok(), "{sheet:?}");
+                ReadSheet { file: "/tracks/x.codj".into(), sheet, others: vec![] }
+            });
+            e.views.insert(PathBuf::from(file), view(&obs, read.as_ref(), &[]));
+        };
+        add(
+            AFT,
+            &ga,
+            vec![
+                section(&ga, "intro", Kind::Intro, 1, 32, 0.9),
+                section(&ga, "drop", Kind::Drop, 33, 32, 0.9),
+                section(&ga, "outro", Kind::Outro, 129, 32, 0.3),
+            ],
+            aft_sheet,
+        );
+        add(SMK, &gs, vec![section(&gs, "intro", Kind::Intro, 1, 16, 0.9), section(&gs, "drop", Kind::Drop, 17, 32, 0.8)], smk_sheet);
+        e
+    }
+
+    fn load_with(e: &FakeEnv, src: &str) -> Loaded {
+        load(Path::new("/sets/k.codj"), src, e)
+    }
+
+    fn ok(e: &FakeEnv, src: &str) -> (super::super::Compiled, Vec<String>) {
+        let l = load_with(e, src);
+        assert!(l.diags.is_empty(), "{:#?}", l.diags);
+        (l.compiled.unwrap(), l.warnings.iter().map(|d| format!("{}:{}: {}", d.line, d.col, d.msg)).collect())
+    }
+
+    const TRACKS: &str = "track aft \"Pneumatix - Aftertekno.flac\"\ntrack smk \"Smokin\"\n";
+
+    #[test]
+    fn measured_sections_need_no_hand_placed_cues() {
+        let (c, w) = ok(&env(None, None), &format!("{TRACKS}mix aft -> smk at aft.outro recipe blend\n"));
+        // bar 129 on aft's grid
+        assert_eq!(c.set.mixes[0].start_beat, 512.);
+        // the outro was measured with confidence 0.3: worth a look
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("3:23: aft.outro is a measured outro with confidence 0.3"), "{w:?}");
+        // play from a measured section of the incoming track, jump to one
+        let (c, w) = ok(&env(None, None), &format!("{TRACKS}mix aft -> smk at aft.intro over 8 bars\n  smk play from drop\n  bar 4 aft jump drop\n"));
+        assert!(w.is_empty(), "{w:?}");
+        let m = &c.set.mixes[0];
+        // smk's bar 17: grid beat 2 + 64
+        assert_eq!(m.play_from_beat, 66.);
+        assert!(m.items.iter().any(|i| i.action == Action::JumpTo { deck: Deck::Out, to_beat: 128. }), "{:?}", m.items);
+    }
+
+    #[test]
+    fn the_set_then_the_sheet_then_the_analysis() {
+        // the sheet's cue `outro` replaces the measured section's name
+        let e = env(Some("cue outro @ 200s\n"), None);
+        let (c, w) = ok(&e, &format!("{TRACKS}mix aft -> smk at aft.outro over 8 bars\n"));
+        assert_eq!(c.set.mixes[0].start_beat, ((200. - 0.5) * 112. / 60. * 1000. as f64).round() / 1000.);
+        assert!(w.is_empty(), "{w:?}");
+        // and the set's own cue wins over both
+        let src = "track aft \"Pneumatix - Aftertekno.flac\"\n  cue outro bar 100\ntrack smk \"Smokin\"\nmix aft -> smk at aft.outro over 8 bars\n";
+        assert_eq!(ok(&e, src).0.set.mixes[0].start_beat, 99. * 4.);
+        // a mark is a name too, and a sheet loop is a loop
+        let e = env(Some("mark c @ 30.5s\nloop roll @ 100s len 2 bars\n"), None);
+        let (c, _) = ok(&e, &format!("{TRACKS}mix aft -> smk at aft.c over 8 bars\n  bar 2 aft loop roll\n"));
+        let m = &c.set.mixes[0];
+        assert_eq!(m.start_beat, 56.);
+        let start = ((100. - 0.5) * 112. / 60. * 1000. as f64).round() / 1000.;
+        assert!(m.items.iter().any(|i| i.action == Action::Loop { deck: Deck::Out, start_beat: start, beats: 8. }), "{:?}", m.items);
+        // an unknown name lists what there is
+        let l = load_with(&env(None, None), &format!("{TRACKS}mix aft -> smk at aft.nope over 8 bars\n"));
+        assert!(l.diags[0].msg.contains("unknown cue \"nope\" on track aft (cues: intro, drop, outro)"), "{:?}", l.diags);
+    }
+
+    #[test]
+    fn the_sheet_grid_and_gain_count_and_its_bars_keep_their_time() {
+        let e = env(Some("grid 120 @ 1s beat1 1\ngain -4dB\ncue hook bar 9\n"), None);
+        let (c, _) = ok(&e, &format!("{TRACKS}mix aft -> smk at aft.hook over 8 bars\n"));
+        let aft = c.set.track("aft").unwrap();
+        let g = aft.grid.as_ref().unwrap();
+        assert_eq!((g.bpm, g.first_beat_s), (120., 1.));
+        assert_eq!(aft.gain_db, Some(-4.));
+        assert_eq!(c.set.mixes[0].start_beat, 32.);
+        // the set's own grid line wins, and the sheet's bar 9 stays where it is in time (17 s),
+        // it is not bar 9 of the set's grid
+        let src = "track aft \"Pneumatix - Aftertekno.flac\"\n  grid 112 @ 0.5s\n  gain -1dB\ntrack smk \"Smokin\"\nmix aft -> smk at aft.hook over 8 bars\n";
+        let (c, _) = ok(&e, src);
+        assert_eq!(c.set.mixes[0].start_beat, 30.8);
+        assert_eq!(c.set.track("aft").unwrap().gain_db, Some(-1.));
+        // without a sheet the analysis gain stays the deck's auto-gain
+        assert_eq!(ok(&env(None, None), &format!("{TRACKS}mix aft -> smk at aft.drop over 8 bars\n")).0.set.track("aft").unwrap().gain_db, None);
+    }
+
+    #[test]
+    fn warnings_for_drops_and_vocals() {
+        // starting in the middle of the drop
+        let (_, w) = ok(&env(None, None), &format!("{TRACKS}mix aft -> smk at bar 41 over 8 bars\n"));
+        assert_eq!(w, ["3:23: the mix starts inside aft's drop (analysis, bars 33..64 of the track): the drop is cut off"]);
+        // at its start is fine
+        assert!(ok(&env(None, None), &format!("{TRACKS}mix aft -> smk at aft.drop over 8 bars\n")).1.is_empty());
+        // both tracks sing at once: aft from 75 s (bar ~2.75 of the mix), smk over its first 15 bars
+        let e = env(Some("vocals @ 75s..90s\n"), Some("vocals @ 0s..30s\n"));
+        let (_, w) = ok(&e, &format!("{TRACKS}mix aft -> smk at bar 33 over 16 bars\n"));
+        assert_eq!(w, ["3:12: the vocals of aft and smk overlap in this mix (bars 2.75..10 of the mix)"]);
+        // one of them without vocals: nothing to say
+        let e = env(Some("vocals @ 75s..90s\n"), Some("vocals none\n"));
+        assert!(ok(&e, &format!("{TRACKS}mix aft -> smk at aft.drop over 16 bars\n")).1.is_empty());
+        // unknown vocals are not "none" but say nothing either
+        let e = env(Some("vocals @ 75s..90s\n"), None);
+        assert!(ok(&e, &format!("{TRACKS}mix aft -> smk at aft.drop over 16 bars\n")).1.is_empty());
+    }
+}

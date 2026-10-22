@@ -16,6 +16,7 @@ mod server;
 mod sets;
 mod slsk;
 mod soulseek;
+mod tracks;
 mod types;
 mod upgrade;
 mod watcher;

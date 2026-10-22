@@ -525,6 +525,8 @@ mod tests {
         assert_eq!(pos_of_beat(&g, 6.), Some(Pos { bar: 2, beat: 1. }));
         assert_eq!(pos_of_beat(&g, 1.), None);
         let t = crate::sets::model::Track {
+            names: vec![],
+            vocals: None,
             id: "x".into(),
             file: Default::default(),
             grid_override: None,

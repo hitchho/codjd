@@ -1,7 +1,9 @@
 # Tracks: identity, observations, sheets (draft spec)
 
-Status: **draft, nothing implemented.** Decisions still open are marked **Open** and collected at
-the end.
+Status: **v1 implemented** (branch `feat/track-model`): identity, observations (with sections),
+sheets, the store, the view, the D-Bus/MCP interfaces and set resolution. Each section says what
+is done; "v1 notes" record where the implementation decided something this draft left open or
+got wrong. Not done yet: see "Not done in v1" at the end.
 
 Everything codjd knows about a track should be in one model that people, codj and AI agents read
 the same way, so transitions can be chosen by the music (where the outro starts, where the
@@ -81,8 +83,25 @@ it changes. A file the demuxer cannot read has no AudioId and no sheet; it still
 copies (title, artist, length within 2 s; `dedup.rs`). It stays a display concern in v1. A later
 version may let a sheet say `same-as <AudioId> offset <s>` to share statements across encodings.
 
-**Open (O1)**: SHA-256 (already a dependency, for the model weights) or BLAKE3 (faster, one more
-crate). Hashing is I/O bound at library sizes; SHA-256 is the default unless measured otherwise.
+**Decided (O1)**: SHA-256.
+
+**v1 implemented** (`src/analysis/audio_id.rs`). v1 notes:
+- The hashed header is exact and part of the scheme: `b"codj-audio-id-1"`, then u32 LE sample
+  rate, channel count, bits per sample, extra-data length (an absent value is 0), then the extra
+  data; then every packet's data concatenated **without lengths**. The **codec id is left out**:
+  symphonia numbers codecs itself and a renumbering must not change every id (the packet bytes
+  differ between codecs anyway). No lengths, so a demuxer that cuts raw PCM into packets of
+  another size gives the same id.
+- The fast pass hashes each packet before decoding it (a packet the decoder rejects still
+  counts). A demuxer error after the first packet ends the stream, as it ends the pass.
+  `audio_id::compute` is the same hash demuxing only; a test checks the two agree.
+- The index is its own file, `<cache dir>/audio-ids.json` (`path -> {size, mtime, id}`; the
+  reverse map is built on load). A file already in `analysis.json` without an id gets a
+  demux-only job, never a new analysis. `Analyzer::audio_id(path)` hashes on demand (and
+  records it) when the index doesn't know the file as it is now.
+- **Not yet done:** `analysis.json` and the waveform files are still keyed by path (+ size +
+  mtime, md5 of the path). Rekeying them by AudioId is left for later; everything below looks
+  observations up through the id's paths.
 
 ## 2. Observations
 
@@ -130,6 +149,27 @@ Input: `bands` and a `grid` that is not `variable`. Without such a grid, `sectio
 Output spans in seconds (I6), with bar numbers available through the view. The rules and
 thresholds are part of the producer's `params` (I7), so changing them re-segments the library.
 Deterministic: the same bands and grid always give the same sections.
+
+**v1 implemented** (`src/tracks/sections.rs`). v1 notes, where the rules above were circular or
+loose:
+- A span's **level** is the mean of its three normalized bands; "energy above x" means level.
+  "High-energy" is level >= 0.6.
+- The rules apply in a fixed order, each only to spans not yet named: intro; outro (every span
+  after the last high-energy one, never the first span); breakdown (low < 0.2, with a span of
+  level > 0.6 somewhere before and somewhere after); drop (after each breakdown, the first span
+  of level > 0.7, unless another breakdown comes first); build (a span whose level rises by
+  more than 0.1 from its first half to its second, right before a drop, or right before an
+  unnamed span of level > 0.7, which then becomes a drop); body.
+- Boundary candidates compare the 8 bars before with the 8 (or fewer, at the end) after; the
+  distance threshold is 0.35. A last span under 8 bars joins the one before. The first span
+  starts at bar 1 (the first downbeat), the last ends at the end of the track.
+- Confidence is `0.5 + margin / 0.4`, clamped to 0..1, where margin is how far the deciding
+  value is past its threshold (for `body`: the distance to the nearest of the drop-level and
+  breakdown-low thresholds).
+- Sections are **not cached**: they are computed when a view is asked for, from the stored
+  waveform and the **observed** grid as analyzed (no hand correction: observations don't read
+  statements). Cheap (one pass over the bars). A grid that is an octave off gives phrases of 4
+  or 16 real bars; the spans are still correct times.
 
 ## 3. Sheets
 
@@ -185,14 +225,45 @@ Duplicate names within a sheet are errors.
 error, and the whole sheet is set aside (the view uses observations only, and says so). A file
 with `version 2` read by a codjd that knows only 1 is set aside the same way, never partly read.
 
-**Open (O2): time in bars or in seconds.** (a) as above: bar positions pinned by a `grid` line
+**v1 implemented** (`src/tracks/sheet.rs`: parse and check). v1 notes:
+- **I5, made exact:** a sheet with any `bar` position needs a grid line with a tempo *and* a
+  first beat (`grid <bpm> @ <s>s [beat1 <n>]`): only that pins bars against a new analysis. A
+  grid line that only corrects (`grid x2`, `grid beat1 3`) is allowed in a sheet with no bar
+  positions (it is how `:grid x2` will be stored). The suggested line quotes the current
+  effective grid as `grid <bpm> @ <first beat>s beat1 <n>`, which reads back as the same grid.
+- Spans: `bar <a>..<b>` is whole bars, both included (`bar 33..48` ends where bar 49 starts);
+  `@ <s>s..<t>s` in seconds. Spans are separated by `,`, a token the set lexer now has (the set
+  language doesn't use it).
+- Mark slots, cues, loops and sections share one namespace (they are all addressed as
+  `<track>.<name>` from a set): a name used twice is an error, whatever the statements.
+- A bar has 4 beats in a sheet (the analysis only finds 4/4); `beat 5` is an error.
+- `section ... len <k> bars` takes whole bars, at least 1.
+- `version 2` (or any newer) stops the reading at that line with the one error, so nothing of a
+  newer grammar is reported as a mistake. `version` must be the first statement.
+- The `audio` line is read as raw text up to a comment (a hex id doesn't lex as one token).
+
+**Decided (O2): time in bars or in seconds.** (a) as above: bar positions pinned by a `grid` line
 in the sheet, readable in bars, the same rule the set language already has. (b) Store every
 position in seconds, show bars only in the view: never a pinning rule, but the file is no longer
 readable as music. Recommended: (a).
 
-**Open (O3): where and what name.** Recommended: `$XDG_DATA_HOME/codj/tracks/`, next to `sets/`,
+**Decided (O3): where and what name.** Recommended: `$XDG_DATA_HOME/codj/tracks/`, next to `sets/`,
 same git repository; the file name a readable slug (`lollipops-limousines.codj`), the AudioId
 inside, and an index from id to file. Alternative: the AudioId as the file name (no index, unreadable listing).
+
+**v1 implemented** (`src/tracks/store.rs`). v1 notes:
+- The folder is `<sets dir>/../tracks` (so `$XDG_DATA_HOME/codj/tracks` by default, and next
+  to a `[sets] dir` that was moved). It shares the sets' git repository only when that
+  repository contains both folders (a repository at `codj/`); with a repository at `sets/`
+  alone, the tracks folder keeps `.bak` files.
+- A new sheet's file name is the slug of its `name` line, else of a hint (the track's file
+  name), else the short id; `-<short id>` is added when the name is taken.
+- The index id -> file is in memory, built by reading the folder and read again whenever the
+  folder's mtime changes (a create, rename or delete) or a file no longer says the id it was
+  indexed under. No watcher: a sheet is read from disk every time a view is made.
+- **Two files about the same AudioId:** the first by file name is the sheet; the others are
+  listed with an error ("... is about the same audio and wins; this one is set aside") and the
+  view says so. Nothing is deleted.
 
 ## 4. The view
 
@@ -225,6 +296,23 @@ The view has a **rendered text form**, the same shape as a sheet plus the observ
 `# analysis`, read-only. That is what an AI reads (`track_view`) and what `codj` shows. Editing
 always goes to the sheet; the rendered form is never written back.
 
+**v1 implemented** (`src/tracks/view.rs`: `view`, `render`; the JSON is the serialized
+`TrackView`). v1 notes:
+- The grid is the analysis, then the hand correction (`AnalysisCorrected`), then the sheet's
+  grid line on top of that (a full line replaces it, `x2` scales it): the same layering as a
+  set's track, through one shared function (`sets::resolve::apply_grid_override`).
+- "Pinned grid differs" compares the sheet's grid with the corrected analysis: tempo by more
+  than 0.5 %, or beats more than 20 ms apart (beat phase, so a sheet that calls a different
+  downbeat bar 1 is not flagged).
+- Marks, cues, loops, notes and tags come only from the sheet in v1 (`hotcues.json` is not
+  migrated yet). The key comes only from the analysis (a sheet has no `key` statement).
+- The rendered form reads back as a valid sheet: what can't be stated (file paths, duration,
+  key, unknown vocals, diagnostics) is in comments, measured lines carry `# analysis`, and a
+  measured section whose name a sheet cue, loop or mark takes is shown commented out. The
+  sheet's `section <name> hidden` lines are kept (`TrackView.hidden`).
+- The "observation is stale" diagnostic is not there: sections are computed when asked, and
+  the other kinds are re-analyzed by the existing cache rules.
+
 ## 5. Sets
 
 No new statements are needed. `track lol "<file>"` resolves the file to its AudioId and binds
@@ -240,6 +328,26 @@ analysis. So `mix lol -> cria at lol.outro recipe blend` works with no hand-plac
 New warnings (never errors): a mix whose incoming part overlaps known vocals of both tracks; a
 mix that starts inside a `drop`; a section reference that resolved to an observation with
 confidence under 0.5.
+
+**v1 implemented** (`sets/resolve.rs`, `Env::track_view`). v1 notes:
+- A track's names, vocals and grid come from its view. A name's position goes sheet bars ->
+  seconds (on the sheet's pinned grid, I5) -> beat index on the set track's effective grid, so a
+  set `grid` line never moves a sheet's cue in time.
+- The sheet's gain becomes the track's `gain` when the set has none; the analysis gain stays the
+  deck's auto-gain, as before.
+- `<track>.<name>` works in `at`, `play from`, `jump` and `loop` (a sheet `loop`). A recipe's
+  "the incoming track has a drop" sees sheet and measured drops too.
+- "Overlapping vocals" compares both tracks' vocal spans in bars from the mix start (the
+  outgoing from the mix start, the incoming from where it plays), cut to the mix; more than a
+  quarter bar of overlap warns. Unknown vocals never warn (I4). "Inside a drop" means after its
+  first beat and before its last.
+- The sets are reloaded after a `SheetWrite`; a sheet edited by hand is seen at the next reload
+  of the set (there is no sheet folder watcher).
+- Loading a set never hashes a file: a track whose AudioId isn't known yet resolves without its
+  sheet and measured sections. A set that needs one of its names fails ("unknown cue") and loads
+  once the analysis has hashed the file (sets with errors are tried again every 5 s), as for a
+  missing grid. A set that loaded without them picks up the sheet's grid and gain at its next
+  reload (a save, a `SheetWrite`, a restart).
 
 ## 6. Writes
 
@@ -277,6 +385,12 @@ D-Bus, and the same as MCP tools:
 
 No interface writes observations (I1). Writing a sheet never changes what plays (as for sets).
 
+**v1 implemented**: the D-Bus methods (`src/dbus.rs`, documented in `dj-api.md`) and the MCP
+tools `track_view`, `track_find`, `sheet_source`, `sheet_check`, `sheet_write` in codj (`codj
+mcp`; `sheet_write` is not a LIVE tool, like `set_write`). v1 notes: `SheetSource` and
+`SheetWrite` take a path as well as an id; `TrackFind` gives at most 25 hits; a successful
+`SheetWrite` makes the sets with errors try again (one may have been waiting for a cue).
+
 ## 8. Not in v1
 
 - A vocal detector (the `vocals` kind is reserved and always `Unknown` until one is chosen).
@@ -285,11 +399,20 @@ No interface writes observations (I1). Writing a sheet never changes what plays 
 - Sections on tracks with a variable tempo.
 - Key changes within a track.
 
-## Open decisions
+## Decisions (were open)
 
-- **O1** AudioId digest: SHA-256 (recommended, already a dependency) or BLAKE3.
-- **O2** Positions in a sheet: bars pinned by a grid line (recommended) or seconds.
-- **O3** Sheet files: readable slug names with the id inside (recommended) or the id as the name.
-- **O4** Marks written during a gig: batched commits (recommended) or one per write.
-- **O5** Strictness: a sheet with any error is set aside whole (recommended, I8), or valid lines
-  apply and errors are reported.
+- **O1** AudioId digest: SHA-256.
+- **O2** Positions in a sheet: bars pinned by a grid line (I5).
+- **O3** Sheet files: readable slug names with the id inside, an index id -> file.
+- **O4** Marks written during a gig: batched commits. **Not built yet**: nothing writes marks
+  to sheets in v1 (codj's `m{a-h}` still writes `hotcues.json`), so every `SheetWrite` is one
+  commit, like `SetWrite`. The batching comes with the codj mark writer.
+- **O5** Strictness: a sheet with any error is set aside whole (I8).
+
+## Not done in v1 (this branch)
+
+- Migration of `hotcues.json` and `grid-overrides.json` into sheets, and codj writing marks,
+  grid corrections and cues to sheets (section 6, "codj's own actions").
+- `analysis.json` and the waveform files keyed by AudioId (they are still keyed by path).
+- A vocals detector (always `Unknown` unless a sheet states vocals).
+- A watcher on the sheet folder.

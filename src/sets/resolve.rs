@@ -3,7 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{analysis::Grid, gridfix};
+use crate::{
+    analysis::Grid,
+    gridfix,
+    tracks::view::{Source as ViewSource, TrackView},
+};
 
 use super::{
     lexer::Diag,
@@ -51,12 +55,20 @@ pub trait Env: Send + Sync {
     fn patch_info(&self, _name: &str) -> Option<Result<PatchInfo, String>> {
         None
     }
+    /// The track model's view of the file (`docs/track-sheets.md`): its sheet's grid, gain and
+    /// names and its measured sections. None when there is none (no AudioId, or no model here)
+    fn track_view(&self, _path: &Path) -> Option<crate::tracks::view::TrackView> {
+        None
+    }
 }
+
+/// A measured section below this confidence is worth a warning when a set uses it
+const LOW_CONFIDENCE: f64 = 0.5;
 
 /// Bounds of the values the engine accepts
 pub const GAIN_DB: (f64, f64) = (-48., 12.);
-const BPM: (f64, f64) = (30., 300.);
-const SCALE: (f64, f64) = (0.2, 5.);
+pub const BPM: (f64, f64) = (30., 300.);
+pub const SCALE: (f64, f64) = (0.2, 5.);
 
 /// Never fails: the set is built from whatever was valid and the caller discards it if `Diag`s
 /// came back
@@ -122,6 +134,7 @@ fn resolve_track(t: &parser::TrackAst, env: &dyn Env, diags: &mut Vec<Diag>) -> 
             PathBuf::new()
         }
     };
+    let view = if file.as_os_str().is_empty() { None } else { env.track_view(&file) };
     let mut track = Track {
         id: t.id.v.clone(),
         file,
@@ -130,6 +143,8 @@ fn resolve_track(t: &parser::TrackAst, env: &dyn Env, diags: &mut Vec<Diag>) -> 
         grid: None,
         cues: vec![],
         loops: vec![],
+        names: vec![],
+        vocals: None,
     };
     let mut grid_ast: Option<&parser::GridAst> = None;
     for line in &t.lines {
@@ -181,7 +196,14 @@ fn resolve_track(t: &parser::TrackAst, env: &dyn Env, diags: &mut Vec<Diag>) -> 
             beat1: g.beat1.as_ref().map(|s| s.v as u8),
         });
     }
-    track.grid = effective_grid(env, &track.file, grid_ast, diags);
+    track.grid = effective_grid(env, &track.file, view.as_ref(), grid_ast, diags);
+    if let Some(v) = &view {
+        // the set's gain line, then the sheet's (the analysis's is the deck's auto-gain)
+        if track.gain_db.is_none() {
+            track.gain_db = v.gain_db.as_ref().filter(|g| g.source == ViewSource::Sheet).map(|g| g.value);
+        }
+        model_names(&mut track, v);
+    }
 
     // beats inside a bar need the bar length
     if let Some(bpb) = track.beats_per_bar() {
@@ -210,17 +232,108 @@ fn pos_of(p: &PosAst) -> Pos {
     Pos { bar: p.bar.v as u32, beat: p.beat.as_ref().map(|b| b.v).unwrap_or(1.) }
 }
 
-/// analysis grid -> hand tempo correction -> the `grid` line
-fn effective_grid(env: &dyn Env, file: &Path, ov: Option<&parser::GridAst>, diags: &mut Vec<Diag>) -> Option<Grid> {
+/// The names of the track model on this track's grid: the sheet's cues, loops, marks and
+/// sections, then the measured sections (the view has already let the sheet replace or hide
+/// those). Positions go through seconds, so bars of the sheet keep meaning the sheet's grid.
+fn model_names(track: &mut Track, v: &TrackView) {
+    let Some(g) = track.grid.clone().filter(|g| g.bpm > 0.) else { return };
+    let beat = |s: f64| ((s - g.first_beat_s) * g.bpm / 60. * 1000.).round() / 1000.;
+    let bpb = g.beats_per_bar as f64;
+    let src = |s: ViewSource| if s == ViewSource::Sheet { "sheet" } else { "analysis" }.to_string();
+    let mut names = Vec::new();
+    for c in &v.cues {
+        names.push(TrackName { name: c.name.clone(), beat: beat(c.pos.seconds), loop_beats: None, section: None, source: src(c.source), confidence: None });
+    }
+    for l in &v.loops {
+        let beats = if l.in_bars { l.len * bpb } else { l.len };
+        names.push(TrackName { name: l.name.clone(), beat: beat(l.pos.seconds), loop_beats: Some(beats), section: None, source: src(l.source), confidence: None });
+    }
+    for (i, m) in v.marks.iter().enumerate() {
+        if let Some(m) = m {
+            let name = crate::tracks::sheet::MARKS[i].to_string();
+            names.push(TrackName { name, beat: beat(m.value.seconds), loop_beats: None, section: None, source: src(m.source), confidence: None });
+        }
+    }
+    let mut sections: Vec<_> = v.sections.iter().collect();
+    // the sheet's before the measured ones, so a name taken twice means the sheet's
+    sections.sort_by_key(|s| s.source != ViewSource::Sheet);
+    for s in sections {
+        names.push(TrackName {
+            name: s.name.clone(),
+            beat: beat(s.start.seconds),
+            loop_beats: None,
+            section: Some((s.kind.as_str().to_string(), beat(s.end_s))),
+            source: src(s.source),
+            confidence: s.confidence,
+        });
+    }
+    track.names = names;
+    if let crate::tracks::Value::Known(v) = &v.vocals {
+        track.vocals = Some(v.value.iter().map(|&(a, b)| (beat(a), beat(b))).collect());
+    }
+}
+
+/// The base grid (the track model's: its sheet, else the analysis with the hand tempo
+/// correction) -> the `grid` line
+fn effective_grid(
+    env: &dyn Env,
+    file: &Path,
+    view: Option<&TrackView>,
+    ov: Option<&parser::GridAst>,
+    diags: &mut Vec<Diag>,
+) -> Option<Grid> {
     let base = if file.as_os_str().is_empty() {
         None
+    } else if let Some(v) = view {
+        v.grid.as_ref().map(|g| g.value.clone())
     } else {
         env.analysis_grid(file).map(|g| gridfix::apply(&g, env.grid_factor(file)))
     };
     let Some(ov) = ov else { return base };
+    // the parts that are in range; each bad one is reported and left out
+    let mut ok = GridOverride::default();
+    if let Some(bpm) = &ov.bpm {
+        if !(BPM.0..=BPM.1).contains(&bpm.v) {
+            diags.push(bpm.diag(format!("tempo {} is outside {}..{} BPM", fmt_num(bpm.v), BPM.0, BPM.1)));
+        } else {
+            ok.bpm = Some(bpm.v);
+        }
+    }
+    if let Some(s) = &ov.scale {
+        if !(SCALE.0..=SCALE.1).contains(&s.v) {
+            diags.push(s.diag(format!("tempo factor {} is outside {}..{}", fmt_num(s.v), SCALE.0, SCALE.1)));
+        } else {
+            ok.scale = Some(s.v);
+        }
+    }
+    if let Some(t) = &ov.first_beat_s {
+        if t.v < 0. {
+            diags.push(t.diag("the first beat can't be before 0 s"));
+        } else {
+            ok.first_beat_s = Some(t.v);
+        }
+    }
+    if let Some(n) = &ov.beat1 {
+        let bpb = base.as_ref().map_or(4, |g| g.beats_per_bar.max(1)) as f64;
+        if n.v.fract() != 0. || n.v < 1. || n.v > bpb {
+            diags.push(n.diag(format!("`beat1` is which beat of the bar the first beat is: 1..{bpb}")));
+        } else {
+            ok.beat1 = Some(n.v as u8);
+        }
+    }
+    // a bad tempo on a track with no analysis: there is nothing to build a grid on
+    if base.is_none() && ov.bpm.is_some() && ok.bpm.is_none() {
+        return None;
+    }
+    apply_grid_override(base, &ok)
+}
 
-    let mut g = match (&base, &ov.bpm) {
-        (Some(b), _) => b.clone(),
+/// A `grid` line (already checked) over a base grid: a tempo replaces it (or makes a grid when
+/// there is none), a scale multiplies it, `@ <s>s` moves beat 0 there as a downbeat and
+/// `beat1 <n>` says which beat of the bar beat 0 is. None without a base and without a tempo.
+pub fn apply_grid_override(base: Option<Grid>, ov: &GridOverride) -> Option<Grid> {
+    let mut g = match (base, ov.bpm) {
+        (Some(b), _) => b,
         (None, Some(_)) => Grid {
             bpm: 0.,
             first_beat_s: 0.,
@@ -233,38 +346,22 @@ fn effective_grid(env: &dyn Env, file: &Path, ov: Option<&parser::GridAst>, diag
         // nothing to scale or shift: the track simply has no grid yet
         (None, None) => return None,
     };
-    if let Some(bpm) = &ov.bpm {
-        if !(BPM.0..=BPM.1).contains(&bpm.v) {
-            diags.push(bpm.diag(format!("tempo {} is outside {}..{} BPM", fmt_num(bpm.v), BPM.0, BPM.1)));
-        } else {
-            g.bpm = bpm.v;
-            g.variable = false;
-            g.octave_doubt = false;
-        }
+    if let Some(bpm) = ov.bpm {
+        g.bpm = bpm;
+        g.variable = false;
+        g.octave_doubt = false;
     }
-    if let Some(s) = &ov.scale {
-        if !(SCALE.0..=SCALE.1).contains(&s.v) {
-            diags.push(s.diag(format!("tempo factor {} is outside {}..{}", fmt_num(s.v), SCALE.0, SCALE.1)));
-        } else {
-            g = gridfix::apply(&g, s.v);
-        }
+    if let Some(s) = ov.scale {
+        g = gridfix::apply(&g, s);
     }
-    if let Some(t) = &ov.first_beat_s {
-        if t.v < 0. {
-            diags.push(t.diag("the first beat can't be before 0 s"));
-        } else {
-            g.first_beat_s = t.v;
-            g.downbeat_offset = 0;
-        }
+    if let Some(t) = ov.first_beat_s {
+        g.first_beat_s = t;
+        g.downbeat_offset = 0;
     }
-    if let Some(n) = &ov.beat1 {
-        let bpb = g.beats_per_bar.max(1) as f64;
-        if n.v.fract() != 0. || n.v < 1. || n.v > bpb {
-            diags.push(n.diag(format!("`beat1` is which beat of the bar the first beat is: 1..{bpb}")));
-        } else {
-            let k = n.v as u8 - 1;
-            g.downbeat_offset = (g.beats_per_bar - k) % g.beats_per_bar;
-        }
+    if let Some(n) = ov.beat1 {
+        let bpb = g.beats_per_bar.max(1);
+        let k = (n.max(1) - 1) % bpb;
+        g.downbeat_offset = (bpb - k) % bpb;
     }
     Some(g)
 }
@@ -641,20 +738,7 @@ fn resolve_mix(
         }
         Some(beat)
     };
-    let cue_of = |t: &Track, name: &Sp<String>, diags: &mut Vec<Diag>| -> Option<f64> {
-        match t.cue(&name.v) {
-            Some(c) => t.beat_of(&c.pos),
-            None => {
-                diags.push(name.diag(format!(
-                    "unknown cue \"{}\" on track {} (cues: {})",
-                    name.v,
-                    t.id,
-                    list(t.cues.iter().map(|c| c.name.clone()))
-                )));
-                None
-            }
-        }
-    };
+    let cue_of = |t: &Track, name: &Sp<String>, diags: &mut Vec<Diag>, warnings: &mut Vec<Diag>| named_beat(t, name, diags, warnings);
 
     let (start, start_beat) = match &m.at {
         MixAt::Cue { track, name } => {
@@ -665,7 +749,7 @@ fn resolve_mix(
                 )));
                 (MixStart::Cue(name.v.clone()), None)
             } else {
-                (MixStart::Cue(name.v.clone()), cue_of(a, name, diags))
+                (MixStart::Cue(name.v.clone()), cue_of(a, name, diags, warnings))
             }
         }
         MixAt::Pos(p) => (MixStart::Pos(pos_of(p)), check_pos(a, p, diags)),
@@ -678,7 +762,7 @@ fn resolve_mix(
             let ctx = recipes::Ctx {
                 a: &a.id,
                 b: &b.id,
-                b_has_drop: b.cue("drop").is_some(),
+                b_has_drop: b.named_beat("drop").is_some(),
                 beats_per_bar: a.beats_per_bar().unwrap_or(4.),
             };
             let (lines, bad) = parser::parse_mix_lines(&recipes::lines(r, &ctx, length).join("\n"));
@@ -716,7 +800,7 @@ fn resolve_mix(
         synced = !p.unsynced;
         match &p.from {
             None => {}
-            Some(PlayFrom::Cue(name)) => match cue_of(b, name, diags) {
+            Some(PlayFrom::Cue(name)) => match cue_of(b, name, diags, warnings) {
                 Some(x) => play_from = Some(x),
                 None => {}
             },
@@ -728,7 +812,7 @@ fn resolve_mix(
     }
 
     // timeline
-    let timeline = |lines: &[MixLine], diags: &mut Vec<Diag>| {
+    let timeline = |lines: &[MixLine], diags: &mut Vec<Diag>, warnings: &mut Vec<Diag>| {
         let mut items = Vec::new();
         for line in lines {
             let MixLine::Timed(t) = line else { continue };
@@ -752,7 +836,7 @@ fn resolve_mix(
                     }
                     continue;
                 }
-                if let Some((action, is_ramp)) = resolve_item(item, t, (a, b), diags) {
+                if let Some((action, is_ramp)) = resolve_item(item, t, (a, b), diags, warnings) {
                     let end_bar = if is_ramp { t.end.as_ref().map(|e| e.v) } else { None };
                     items.push(MixItem { at_bar: t.at.v, end_bar, action });
                 }
@@ -760,8 +844,8 @@ fn resolve_mix(
         }
         items
     };
-    let from_recipe = timeline(&recipe_lines, &mut Vec::new());
-    let own = timeline(&m.lines, diags);
+    let from_recipe = timeline(&recipe_lines, &mut Vec::new(), &mut Vec::new());
+    let own = timeline(&m.lines, diags, warnings);
     let items = merge(from_recipe, own);
 
     // a recipe mix should start where a phrase starts
@@ -771,6 +855,16 @@ fn resolve_mix(
         }
     }
     let (start_beat, play_from) = (start_beat?, play_from?);
+    let at = match &m.at {
+        MixAt::Pos(p) => Sp { v: (), line: p.bar.line, col: p.bar.col },
+        MixAt::Cue { track, .. } => Sp { v: (), line: track.line, col: track.col },
+    };
+    if let Some(w) = drop_warning(a, start_beat, &at) {
+        warnings.push(w);
+    }
+    if let Some(w) = vocals_warning((a, start_beat), (b, play_from), length, &m.to) {
+        warnings.push(w);
+    }
     Some(Mix {
         from: a.id.clone(),
         to: b.id.clone(),
@@ -817,6 +911,74 @@ fn touches(a: &Action) -> Touches {
 /// The merge rule of `mix ... recipe <name>` blocks: the recipe's items first, then the block's
 /// own; an own item removes every recipe item that touches the same thing (see [`Touches`]).
 /// Everything else of the recipe stays.
+/// Beat index of `<track>.<name>`: the set's cue, else the track model's name (sheet, then
+/// measured section). Unknown is an error; a doubtful measured section is a warning.
+fn named_beat(t: &Track, name: &Sp<String>, diags: &mut Vec<Diag>, warnings: &mut Vec<Diag>) -> Option<f64> {
+    if let Some(c) = t.cue(&name.v) {
+        return t.beat_of(&c.pos);
+    }
+    if let Some(n) = t.model_name(&name.v) {
+        if let (Some(c), Some((kind, _))) = (n.confidence, &n.section) {
+            if n.source == "analysis" && c < LOW_CONFIDENCE {
+                warnings.push(name.diag(format!(
+                    "{}.{} is a measured {kind} with confidence {}: check it by ear, or state it in the track's sheet",
+                    t.id,
+                    name.v,
+                    crate::tracks::sheet::trim(c, 2)
+                )));
+            }
+        }
+        return Some(n.beat);
+    }
+    let mut names: Vec<String> = t.cues.iter().map(|c| c.name.clone()).collect();
+    for n in &t.names {
+        if !names.contains(&n.name) {
+            names.push(n.name.clone());
+        }
+    }
+    diags.push(name.diag(format!("unknown cue \"{}\" on track {} (cues: {})", name.v, t.id, list(names.into_iter()))));
+    None
+}
+
+/// A mix should not start in the middle of the outgoing track's drop
+fn drop_warning(a: &Track, start_beat: f64, at: &Sp<()>) -> Option<Diag> {
+    let d = a.names.iter().find(|n| {
+        n.section.as_ref().is_some_and(|(kind, end)| kind == "drop" && start_beat > n.beat + 0.5 && start_beat < end - 0.5)
+    })?;
+    let bpb = a.beats_per_bar()?;
+    Some(at.diag(format!(
+        "the mix starts inside {}'s {} ({}, bars {}..{} of the track): the drop is cut off",
+        a.id,
+        d.name,
+        d.source,
+        fmt_num(((d.beat - a.grid.as_ref()?.downbeat_offset as f64) / bpb).round() + 1.),
+        fmt_num(((d.section.as_ref()?.1 - a.grid.as_ref()?.downbeat_offset as f64) / bpb).round()),
+    )))
+}
+
+/// Both tracks have a voice at the same time during the mix
+fn vocals_warning((a, start): (&Track, f64), (b, play_from): (&Track, f64), bars: f64, at: &Sp<String>) -> Option<Diag> {
+    let (va, vb) = (a.vocals.as_ref()?, b.vocals.as_ref()?);
+    let (ba, bb) = (a.beats_per_bar()?, b.beats_per_bar()?);
+    // spans in bars from the mix start, cut to the mix
+    let rel = |spans: &[(f64, f64)], from: f64, bpb: f64| -> Vec<(f64, f64)> {
+        spans
+            .iter()
+            .map(|&(x, y)| (((x - from) / bpb).max(0.), ((y - from) / bpb).min(bars)))
+            .filter(|(x, y)| y > x)
+            .collect()
+    };
+    let (ra, rb) = (rel(va, start, ba), rel(vb, play_from, bb));
+    let (x, y) = ra.iter().flat_map(|p| rb.iter().map(move |q| (p.0.max(q.0), p.1.min(q.1)))).find(|(x, y)| y - x > 0.25)?;
+    Some(at.diag(format!(
+        "the vocals of {} and {} overlap in this mix (bars {}..{} of the mix)",
+        a.id,
+        b.id,
+        fmt_num((x * 4.).floor() / 4.),
+        fmt_num((y * 4.).ceil() / 4.)
+    )))
+}
+
 pub fn merge(recipe: Vec<MixItem>, own: Vec<MixItem>) -> Vec<MixItem> {
     let taken: Vec<Touches> = own.iter().map(|i| touches(&i.action)).collect();
     let mut items: Vec<MixItem> = recipe.into_iter().filter(|i| !taken.contains(&touches(&i.action))).collect();
@@ -858,6 +1020,7 @@ fn resolve_item(
     line: &parser::TimedAst,
     (a, b): (&Track, &Track),
     diags: &mut Vec<Diag>,
+    warnings: &mut Vec<Diag>,
 ) -> Option<(Action, bool)> {
     let side = |id: &Sp<String>, diags: &mut Vec<Diag>| -> Option<(Deck, &Track)> {
         if id.v == a.id {
@@ -982,12 +1145,21 @@ fn resolve_item(
                         Action::Loop { deck, start_beat: t.beat_of(&l.pos)?, beats: t.loop_beats(l)? },
                         false,
                     )),
+                    None if t.model_name(&n.v).is_some_and(|x| x.loop_beats.is_some()) => {
+                        let x = t.model_name(&n.v)?;
+                        Some((Action::Loop { deck, start_beat: x.beat, beats: x.loop_beats? }, false))
+                    }
                     None => {
                         diags.push(n.diag(format!(
                             "unknown loop \"{}\" on track {} (loops: {})",
                             n.v,
                             t.id,
-                            list(t.loops.iter().map(|l| l.name.clone()))
+                            list(
+                                t.loops
+                                    .iter()
+                                    .map(|l| l.name.clone())
+                                    .chain(t.names.iter().filter(|x| x.loop_beats.is_some()).map(|x| x.name.clone()))
+                            )
                         )));
                         None
                     }
@@ -998,18 +1170,9 @@ fn resolve_item(
             let (deck, t) = side(track, diags)?;
             match what {
                 parser::JumpWhat::Beats(k) => Some((Action::JumpBy { deck, beats: k.v }, false)),
-                parser::JumpWhat::Cue(n) => match t.cue(&n.v) {
-                    Some(c) => Some((Action::JumpTo { deck, to_beat: t.beat_of(&c.pos)? }, false)),
-                    None => {
-                        diags.push(n.diag(format!(
-                            "unknown cue \"{}\" on track {} (cues: {})",
-                            n.v,
-                            t.id,
-                            list(t.cues.iter().map(|c| c.name.clone()))
-                        )));
-                        None
-                    }
-                },
+                parser::JumpWhat::Cue(n) => {
+                    named_beat(t, n, diags, warnings).map(|to_beat| (Action::JumpTo { deck, to_beat }, false))
+                }
             }
         }
     }

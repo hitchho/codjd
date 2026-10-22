@@ -292,31 +292,36 @@ pub fn parse(src: &str) -> (File, Vec<Diag>) {
 
 // ---- cursor ----
 
-struct Cur<'a> {
+/// A cursor over the tokens of one line (the sheet parser in `tracks` shares it)
+pub(crate) struct Cur<'a> {
     line: &'a Line<'a>,
     pos: usize,
 }
 
 impl<'a> Cur<'a> {
-    fn peek(&self) -> Option<&'a Token> {
+    pub(crate) fn new(line: &'a Line<'a>) -> Self {
+        Self { line, pos: 0 }
+    }
+
+    pub(crate) fn peek(&self) -> Option<&'a Token> {
         self.line.toks.get(self.pos)
     }
 
-    fn peek_tok(&self) -> Option<&'a Tok> {
+    pub(crate) fn peek_tok(&self) -> Option<&'a Tok> {
         self.peek().map(|t| &t.tok)
     }
 
-    fn next(&mut self) -> Option<&'a Token> {
+    pub(crate) fn next(&mut self) -> Option<&'a Token> {
         let t = self.line.toks.get(self.pos);
         self.pos += 1;
         t
     }
 
-    fn at_end(&self) -> bool {
+    pub(crate) fn at_end(&self) -> bool {
         self.pos >= self.line.toks.len()
     }
 
-    fn eat(&mut self, tok: &Tok) -> bool {
+    pub(crate) fn eat(&mut self, tok: &Tok) -> bool {
         if self.peek_tok() == Some(tok) {
             self.pos += 1;
             true
@@ -325,11 +330,11 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn peek_ident(&self, word: &str) -> bool {
+    pub(crate) fn peek_ident(&self, word: &str) -> bool {
         matches!(self.peek_tok(), Some(Tok::Ident(w)) if w == word)
     }
 
-    fn eat_ident(&mut self, word: &str) -> bool {
+    pub(crate) fn eat_ident(&mut self, word: &str) -> bool {
         if self.peek_ident(word) {
             self.pos += 1;
             true
@@ -339,22 +344,22 @@ impl<'a> Cur<'a> {
     }
 
     /// 1-based column of the next token, or just after the last one
-    fn col_here(&self) -> usize {
+    pub(crate) fn col_here(&self) -> usize {
         match self.peek() {
             Some(t) => t.start + 1,
             None => self.line.toks.last().map(|t| t.end + 1).unwrap_or(1),
         }
     }
 
-    fn err_here(&self, msg: impl Into<String>) -> Diag {
+    pub(crate) fn err_here(&self, msg: impl Into<String>) -> Diag {
         Diag::new(self.line.no, self.col_here(), msg)
     }
 
-    fn sp<T>(&self, t: &Token, v: T) -> Sp<T> {
+    pub(crate) fn sp<T>(&self, t: &Token, v: T) -> Sp<T> {
         Sp { v, line: self.line.no, col: t.start + 1 }
     }
 
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self.peek() {
             Some(t) => format!("`{}`", &self.line.text[t.start..t.end]),
             None => "end of line".into(),
@@ -362,13 +367,13 @@ impl<'a> Cur<'a> {
     }
 
     /// The source text of tokens `from..self.pos`
-    fn text_since(&self, from: usize) -> &'a str {
+    pub(crate) fn text_since(&self, from: usize) -> &'a str {
         let a = self.line.toks[from].start;
         let b = self.line.toks[self.pos - 1].end;
         &self.line.text[a..b]
     }
 
-    fn finish(&self) -> Result<(), Diag> {
+    pub(crate) fn finish(&self) -> Result<(), Diag> {
         if self.at_end() {
             Ok(())
         } else {
@@ -376,7 +381,7 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn ident(&mut self, what: &str) -> Result<Sp<String>, Diag> {
+    pub(crate) fn ident(&mut self, what: &str) -> Result<Sp<String>, Diag> {
         match self.peek() {
             Some(t @ Token { tok: Tok::Ident(w), .. }) => {
                 self.pos += 1;
@@ -386,7 +391,7 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn string(&mut self, what: &str) -> Result<Sp<String>, Diag> {
+    pub(crate) fn string(&mut self, what: &str) -> Result<Sp<String>, Diag> {
         match self.peek() {
             Some(t @ Token { tok: Tok::Str(s), .. }) => {
                 self.pos += 1;
@@ -396,7 +401,7 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn expect(&mut self, tok: Tok, shown: &str) -> Result<(), Diag> {
+    pub(crate) fn expect(&mut self, tok: Tok, shown: &str) -> Result<(), Diag> {
         if self.eat(&tok) {
             Ok(())
         } else {
@@ -405,7 +410,7 @@ impl<'a> Cur<'a> {
     }
 
     /// A number whose unit is one of `units` ("" = none); returns the unit it had
-    fn number_unit(&mut self, what: &str, units: &[&str]) -> Result<(Sp<f64>, String), Diag> {
+    pub(crate) fn number_unit(&mut self, what: &str, units: &[&str]) -> Result<(Sp<f64>, String), Diag> {
         match self.peek() {
             Some(t @ Token { tok: Tok::Num { value, unit }, .. }) => {
                 let unit_ok = units.iter().any(|u| u.eq_ignore_ascii_case(unit));
@@ -428,7 +433,7 @@ impl<'a> Cur<'a> {
         }
     }
 
-    fn number(&mut self, what: &str) -> Result<Sp<f64>, Diag> {
+    pub(crate) fn number(&mut self, what: &str) -> Result<Sp<f64>, Diag> {
         self.number_unit(what, &[""]).map(|(n, _)| n)
     }
 }
@@ -436,7 +441,7 @@ impl<'a> Cur<'a> {
 // ---- statements ----
 
 /// `bar <n> [beat <m>]`, after the `bar` keyword; used for tracks, `at` and `play from`
-fn pos_after_bar(c: &mut Cur) -> Result<PosAst, Diag> {
+pub(crate) fn pos_after_bar(c: &mut Cur) -> Result<PosAst, Diag> {
     let bar = c.number("a bar number after `bar`")?;
     if bar.v < 1. || bar.v.fract() != 0. {
         return Err(bar.diag(format!("bar numbers in a track count whole bars from 1, got {}", fmt_num(bar.v))));
@@ -501,7 +506,7 @@ fn track_line(c: &mut Cur) -> Result<TrackLine, Diag> {
     }
 }
 
-fn grid_line(c: &mut Cur, kw: Sp<String>) -> Result<TrackLine, Diag> {
+pub(crate) fn grid_line(c: &mut Cur, kw: Sp<String>) -> Result<TrackLine, Diag> {
     let mut g = GridAst::default();
     let dup = |what: &str, at: &Sp<f64>| at.diag(format!("`grid` already has {what}"));
     while let Some(t) = c.peek() {

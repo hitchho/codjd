@@ -63,9 +63,20 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
     let slsk = Arc::new(Slsk::new(codjd.clone(), Arc::clone(&analysis)));
 
+    let tracks = crate::tracks::Tracks::new(
+        Arc::clone(&analysis),
+        crate::tracks::Tracks::dir_for(&sets_dir),
+        // the file is small and changes with every DjGridScale
+        Box::new(|p| crate::gridfix::GridFixes::open_default().factor(p)),
+    );
     let sets = crate::sets::store::Store::new(
         sets_dir.clone(),
-        Arc::new(crate::sets::live::LiveEnv::snapshot(&codjd, &analysis).await.with_sets_dir(sets_dir)),
+        Arc::new(
+            crate::sets::live::LiveEnv::snapshot(&codjd, &analysis)
+                .await
+                .with_sets_dir(sets_dir)
+                .with_tracks(Arc::clone(&tracks)),
+        ),
     );
     if let Err(e) = crate::sets::store::spawn_watcher(Arc::clone(&sets)) {
         eprintln!("can't watch the set folder: {e}");
@@ -102,6 +113,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         sets: Arc::clone(&sets),
         editor,
         patches,
+        tracks: Arc::clone(&tracks),
     };
     let connection = connection::Builder::session()?
         .max_queued(1000)
@@ -149,6 +161,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             let codjd = codjd.clone();
             let analysis = Arc::clone(&analysis);
             let sets = Arc::clone(&sets);
+            let tracks = Arc::clone(&tracks);
             tokio::spawn(async move {
                 let add = path.clone();
                 // added before the event, so a client refetching on it sees the file
@@ -156,7 +169,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     analysis.enqueue([path.clone()]);
                     codjd.emit(Event::LibraryChanged(path));
                     // a set may have been waiting for this track
-                    crate::sets::live::refresh(&sets, &codjd, &analysis).await;
+                    crate::sets::live::refresh(&sets, &codjd, &analysis, &tracks).await;
                 }
             });
         });
