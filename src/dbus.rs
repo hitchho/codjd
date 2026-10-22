@@ -596,6 +596,23 @@ impl Bus {
         self.write_job(job, "human").await
     }
 
+    /// Records what the room hears (the master, never the headphones) to a WAV file in the
+    /// record folder (`[record] dir`, `~/Music/codj-mixes`). On: "ok <path>"; off: "ok <path>
+    /// (<length>)"; else why not.
+    async fn record_audio(&self, on: bool) -> String {
+        match self.codjd.call(move |e| e.record_audio(on)).await {
+            Some(Ok(text)) => format!("ok {text}"),
+            Some(Err(e)) => e,
+            None => "engine not running".to_string(),
+        }
+    }
+
+    /// (recording, file, seconds written, frames dropped, why it stopped by itself or "")
+    async fn record_audio_state(&self) -> (bool, String, f64, u64, String) {
+        let s = self.ask(|e| e.record_audio_state()).await;
+        (s.on, s.path, s.seconds, s.dropped, s.error)
+    }
+
     /// (recording, beats on the outgoing deck's clock, events logged)
     async fn set_recording(&self) -> (bool, f64, u32) {
         self.ask(|e| e.set_recording()).await

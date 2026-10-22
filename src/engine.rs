@@ -180,6 +180,8 @@ struct MixerKnobs {
 
 pub struct Engine {
     audio: Audio,
+    /// `[record] dir`, where `RecordAudio` writes
+    record_dir: Option<std::path::PathBuf>,
     analyzer: Option<Arc<Analyzer>>,
     meta: [DeckMeta; crate::audio::DECKS],
     knobs: [DeckKnobs; crate::audio::DECKS],
@@ -237,6 +239,7 @@ impl Engine {
         });
         Ok(Self {
             audio,
+            record_dir: None,
             analyzer: None,
             meta: Default::default(),
             knobs: Default::default(),
@@ -1140,6 +1143,34 @@ impl Engine {
     }
 
     /// (xruns, second output underruns, second output skips, sample rate)
+    /// `[record] dir`: where recorded mixes go
+    pub fn set_record_dir(&mut self, dir: std::path::PathBuf) {
+        self.record_dir = Some(dir);
+    }
+
+    /// `RecordAudio`: on starts writing the master to a new file in the record folder and
+    /// returns its path; off stops and returns the path and length
+    pub fn record_audio(&mut self, on: bool) -> Result<String, String> {
+        if on {
+            let dir = self.record_dir.clone().ok_or("no record folder")?;
+            let path = (0..100)
+                .map(|n| dir.join(if n == 0 { format!("mix-{}.wav", stamp()) } else { format!("mix-{}-{n}.wav", stamp()) }))
+                .find(|p| !p.exists())
+                .ok_or("too many recordings this second")?;
+            self.audio.record_start(&path)?;
+            return Ok(path.display().to_string());
+        }
+        let s = self.audio.record_stop();
+        if s.path.is_empty() {
+            return Err("not recording".into());
+        }
+        Ok(format!("{} ({})", s.path, minutes(s.seconds)))
+    }
+
+    pub fn record_audio_state(&self) -> crate::audio::RecState {
+        self.audio.record_state()
+    }
+
     pub fn audio_health(&self) -> (u64, u64, u64, u32) {
         let h = self.audio.health();
         (h.xruns, h.second_underruns, h.second_skips, self.audio.rate())
@@ -1661,4 +1692,25 @@ mod tests {
         assert_eq!(check_channel("rate", 2), Err("rate is not a patch slot control".to_string()));
         assert_eq!(check_channel("rate", 9), Err("no deck 9".to_string()));
     }
+}
+
+/// Local date and time for a file name, `2026-10-23-0442`: from `date`, else seconds since 1970
+fn stamp() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d-%H%M%S")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string()
+        })
+}
+
+/// `1:02:03` or `4:05`
+fn minutes(seconds: f64) -> String {
+    let s = seconds.max(0.) as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }

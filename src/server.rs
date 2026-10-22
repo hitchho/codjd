@@ -42,6 +42,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let allow_formats = config.allow_formats.clone();
     let net_config = config.net.clone();
     let sets_dir = config.sets.dir.clone();
+    let record_dir = config.record.dir.clone();
 
     let codjd = Codjd::start(config)?;
     let analysis = Analyzer::start();
@@ -90,6 +91,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     {
         let patches = Arc::clone(&patches);
         codjd.tell(move |e| e.set_patch_store(patches));
+    }
+    {
+        codjd.tell(move |e| e.set_record_dir(record_dir));
     }
     let bus = Bus {
         codjd: codjd.clone(),

@@ -23,6 +23,8 @@ const SECOND_CAPACITY: usize = 16384;
 pub struct Outputs {
     _streams: Vec<Stream>,
     pub rate: u32,
+    /// records the master bus to a file
+    pub recorder: super::record::Recorder,
 }
 
 /// Finds an output device: "default", or part of its name (case-insensitive)
@@ -95,6 +97,7 @@ pub fn start(
     };
     let main_channels = config.channels as usize;
     let mut mixer = mixer_for_rate(rate);
+    let (recorder, mut tap) = super::record::new(rate);
 
     let (mut to_second, from_main) = rtrb::RingBuffer::<(f32, f32)>::new(SECOND_CAPACITY);
     let has_second = second.is_some();
@@ -108,6 +111,8 @@ pub fn start(
                 let mode = mixer.mode();
                 for frame in data.chunks_exact_mut(main_channels) {
                     let buses = mixer.next();
+                    // the recording is what the room hears: the master bus, never the cue
+                    tap.push(buses.master);
                     let (l, r) = main_bus(mode, &buses);
                     frame[0] = l;
                     frame[1] = r;
@@ -206,5 +211,6 @@ pub fn start(
     Ok(Outputs {
         _streams: streams,
         rate,
+        recorder,
     })
 }

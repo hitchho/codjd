@@ -26,3 +26,6 @@ second = ""
 # Set files (*.codj, see docs/set-language.md); this is the default
 # [sets]
 # dir = "/home/you/.local/share/codj/sets"
+
+# [record]
+# dir = "~/Music/codj-mixes"     # where :rec audio writes the recorded mixes (WAV)

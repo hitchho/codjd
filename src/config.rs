@@ -27,6 +27,29 @@ pub struct Config {
     /// patch decks (`[patches]`)
     #[serde(default)]
     pub patches: crate::patch::PatchesConfig,
+    /// where `RecordAudio` writes the mixes (`[record]`)
+    #[serde(default)]
+    pub record: RecordConfig,
+}
+
+/// `[record]`: the folder of recorded mixes, `~/Music/codj-mixes` unless `dir` is given
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct RecordConfig {
+    #[serde(default = "default_record_dir")]
+    pub dir: PathBuf,
+}
+
+impl Default for RecordConfig {
+    fn default() -> Self {
+        Self { dir: default_record_dir() }
+    }
+}
+
+fn default_record_dir() -> PathBuf {
+    dirs::audio_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("codj-mixes")
 }
 
 /// `[sets]`: the set folder, `$XDG_DATA_HOME/codj/sets` unless `dir` is given
@@ -65,6 +88,7 @@ impl Default for Config {
             net: None,
             sets: SetsConfig::default(),
             patches: Default::default(),
+            record: RecordConfig::default(),
         }
     }
 }
@@ -78,6 +102,7 @@ impl Config {
         })?;
         config.path = expand_home(&config.path);
         config.playlist_save_path = expand_home(&config.playlist_save_path);
+        config.record.dir = PathBuf::from(expand_home(&config.record.dir.to_string_lossy()));
         Ok(config)
     }
 

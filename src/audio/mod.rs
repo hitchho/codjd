@@ -9,6 +9,7 @@ mod beat;
 mod eq;
 mod mixer;
 mod output;
+mod record;
 mod track;
 
 use std::{
@@ -26,6 +27,7 @@ pub use mixer::{DeckState, Mode, SlotRtState, CHANNELS, DECKS};
 pub(crate) use mixer::{Drive, Smooth};
 use mixer::{Cmd, Garbage, Mixer, RtEvent, Shared};
 pub use output::list_devices;
+pub use record::RecState;
 pub use track::Track;
 
 use crate::patch::{program::Program, SLOTS};
@@ -125,6 +127,20 @@ impl Audio {
             rate: outputs.rate,
             _outputs: outputs,
         })
+    }
+
+    /// Starts recording the master to `path`
+    pub fn record_start(&self, path: &Path) -> Result<(), String> {
+        self._outputs.recorder.start(path)
+    }
+
+    /// Stops recording; the final state
+    pub fn record_stop(&self) -> RecState {
+        self._outputs.recorder.stop()
+    }
+
+    pub fn record_state(&self) -> RecState {
+        self._outputs.recorder.state()
     }
 
     fn send(&mut self, cmd: Cmd) {
