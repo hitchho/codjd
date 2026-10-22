@@ -149,6 +149,27 @@ Output spans in seconds (I6), with bar numbers available through the view. The r
 thresholds are part of the producer's `params` (I7), so changing them re-segments the library.
 Deterministic: the same bands and grid always give the same sections.
 
+**v1 implemented** (`src/tracks/sections.rs`). v1 notes, where the rules above were circular or
+loose:
+- A span's **level** is the mean of its three normalized bands; "energy above x" means level.
+  "High-energy" is level >= 0.6.
+- The rules apply in a fixed order, each only to spans not yet named: intro; outro (every span
+  after the last high-energy one, never the first span); breakdown (low < 0.2, with a span of
+  level > 0.6 somewhere before and somewhere after); drop (after each breakdown, the first span
+  of level > 0.7, unless another breakdown comes first); build (a span whose level rises by
+  more than 0.1 from its first half to its second, right before a drop, or right before an
+  unnamed span of level > 0.7, which then becomes a drop); body.
+- Boundary candidates compare the 8 bars before with the 8 (or fewer, at the end) after; the
+  distance threshold is 0.35. A last span under 8 bars joins the one before. The first span
+  starts at bar 1 (the first downbeat), the last ends at the end of the track.
+- Confidence is `0.5 + margin / 0.4`, clamped to 0..1, where margin is how far the deciding
+  value is past its threshold (for `body`: the distance to the nearest of the drop-level and
+  breakdown-low thresholds).
+- Sections are **not cached**: they are computed when a view is asked for, from the stored
+  waveform and the **observed** grid as analyzed (no hand correction: observations don't read
+  statements). Cheap (one pass over the bars). A grid that is an octave off gives phrases of 4
+  or 16 real bars; the spans are still correct times.
+
 ## 3. Sheets
 
 A sheet is a text file in the set language's lexical rules (`set-language.md`): one statement
