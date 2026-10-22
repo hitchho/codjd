@@ -218,9 +218,50 @@ fn effective_grid(env: &dyn Env, file: &Path, ov: Option<&parser::GridAst>, diag
         env.analysis_grid(file).map(|g| gridfix::apply(&g, env.grid_factor(file)))
     };
     let Some(ov) = ov else { return base };
+    // the parts that are in range; each bad one is reported and left out
+    let mut ok = GridOverride::default();
+    if let Some(bpm) = &ov.bpm {
+        if !(BPM.0..=BPM.1).contains(&bpm.v) {
+            diags.push(bpm.diag(format!("tempo {} is outside {}..{} BPM", fmt_num(bpm.v), BPM.0, BPM.1)));
+        } else {
+            ok.bpm = Some(bpm.v);
+        }
+    }
+    if let Some(s) = &ov.scale {
+        if !(SCALE.0..=SCALE.1).contains(&s.v) {
+            diags.push(s.diag(format!("tempo factor {} is outside {}..{}", fmt_num(s.v), SCALE.0, SCALE.1)));
+        } else {
+            ok.scale = Some(s.v);
+        }
+    }
+    if let Some(t) = &ov.first_beat_s {
+        if t.v < 0. {
+            diags.push(t.diag("the first beat can't be before 0 s"));
+        } else {
+            ok.first_beat_s = Some(t.v);
+        }
+    }
+    if let Some(n) = &ov.beat1 {
+        let bpb = base.as_ref().map_or(4, |g| g.beats_per_bar.max(1)) as f64;
+        if n.v.fract() != 0. || n.v < 1. || n.v > bpb {
+            diags.push(n.diag(format!("`beat1` is which beat of the bar the first beat is: 1..{bpb}")));
+        } else {
+            ok.beat1 = Some(n.v as u8);
+        }
+    }
+    // a bad tempo on a track with no analysis: there is nothing to build a grid on
+    if base.is_none() && ov.bpm.is_some() && ok.bpm.is_none() {
+        return None;
+    }
+    apply_grid_override(base, &ok)
+}
 
-    let mut g = match (&base, &ov.bpm) {
-        (Some(b), _) => b.clone(),
+/// A `grid` line (already checked) over a base grid: a tempo replaces it (or makes a grid when
+/// there is none), a scale multiplies it, `@ <s>s` moves beat 0 there as a downbeat and
+/// `beat1 <n>` says which beat of the bar beat 0 is. None without a base and without a tempo.
+pub fn apply_grid_override(base: Option<Grid>, ov: &GridOverride) -> Option<Grid> {
+    let mut g = match (base, ov.bpm) {
+        (Some(b), _) => b,
         (None, Some(_)) => Grid {
             bpm: 0.,
             first_beat_s: 0.,
@@ -233,38 +274,22 @@ fn effective_grid(env: &dyn Env, file: &Path, ov: Option<&parser::GridAst>, diag
         // nothing to scale or shift: the track simply has no grid yet
         (None, None) => return None,
     };
-    if let Some(bpm) = &ov.bpm {
-        if !(BPM.0..=BPM.1).contains(&bpm.v) {
-            diags.push(bpm.diag(format!("tempo {} is outside {}..{} BPM", fmt_num(bpm.v), BPM.0, BPM.1)));
-        } else {
-            g.bpm = bpm.v;
-            g.variable = false;
-            g.octave_doubt = false;
-        }
+    if let Some(bpm) = ov.bpm {
+        g.bpm = bpm;
+        g.variable = false;
+        g.octave_doubt = false;
     }
-    if let Some(s) = &ov.scale {
-        if !(SCALE.0..=SCALE.1).contains(&s.v) {
-            diags.push(s.diag(format!("tempo factor {} is outside {}..{}", fmt_num(s.v), SCALE.0, SCALE.1)));
-        } else {
-            g = gridfix::apply(&g, s.v);
-        }
+    if let Some(s) = ov.scale {
+        g = gridfix::apply(&g, s);
     }
-    if let Some(t) = &ov.first_beat_s {
-        if t.v < 0. {
-            diags.push(t.diag("the first beat can't be before 0 s"));
-        } else {
-            g.first_beat_s = t.v;
-            g.downbeat_offset = 0;
-        }
+    if let Some(t) = ov.first_beat_s {
+        g.first_beat_s = t;
+        g.downbeat_offset = 0;
     }
-    if let Some(n) = &ov.beat1 {
-        let bpb = g.beats_per_bar.max(1) as f64;
-        if n.v.fract() != 0. || n.v < 1. || n.v > bpb {
-            diags.push(n.diag(format!("`beat1` is which beat of the bar the first beat is: 1..{bpb}")));
-        } else {
-            let k = n.v as u8 - 1;
-            g.downbeat_offset = (g.beats_per_bar - k) % g.beats_per_bar;
-        }
+    if let Some(n) = ov.beat1 {
+        let bpb = g.beats_per_bar.max(1);
+        let k = (n.max(1) - 1) % bpb;
+        g.downbeat_offset = (bpb - k) % bpb;
     }
     Some(g)
 }

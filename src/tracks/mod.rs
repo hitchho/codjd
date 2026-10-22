@@ -8,6 +8,7 @@
 pub mod sections;
 pub mod sheet;
 pub mod store;
+pub mod view;
 
 use serde::Serialize;
 

@@ -295,6 +295,23 @@ The view has a **rendered text form**, the same shape as a sheet plus the observ
 `# analysis`, read-only. That is what an AI reads (`track_view`) and what `codj` shows. Editing
 always goes to the sheet; the rendered form is never written back.
 
+**v1 implemented** (`src/tracks/view.rs`: `view`, `render`; the JSON is the serialized
+`TrackView`). v1 notes:
+- The grid is the analysis, then the hand correction (`AnalysisCorrected`), then the sheet's
+  grid line on top of that (a full line replaces it, `x2` scales it): the same layering as a
+  set's track, through one shared function (`sets::resolve::apply_grid_override`).
+- "Pinned grid differs" compares the sheet's grid with the corrected analysis: tempo by more
+  than 0.5 %, or beats more than 20 ms apart (beat phase, so a sheet that calls a different
+  downbeat bar 1 is not flagged).
+- Marks, cues, loops, notes and tags come only from the sheet in v1 (`hotcues.json` is not
+  migrated yet). The key comes only from the analysis (a sheet has no `key` statement).
+- The rendered form reads back as a valid sheet: what can't be stated (file paths, duration,
+  key, unknown vocals, diagnostics) is in comments, measured lines carry `# analysis`, and a
+  measured section whose name a sheet cue, loop or mark takes is shown commented out. The
+  sheet's `section <name> hidden` lines are kept (`TrackView.hidden`).
+- The "observation is stale" diagnostic is not there: sections are computed when asked, and
+  the other kinds are re-analyzed by the existing cache rules.
+
 ## 5. Sets
 
 No new statements are needed. `track lol "<file>"` resolves the file to its AudioId and binds
