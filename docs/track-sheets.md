@@ -328,6 +328,21 @@ New warnings (never errors): a mix whose incoming part overlaps known vocals of 
 mix that starts inside a `drop`; a section reference that resolved to an observation with
 confidence under 0.5.
 
+**v1 implemented** (`sets/resolve.rs`, `Env::track_view`). v1 notes:
+- A track's names, vocals and grid come from its view. A name's position goes sheet bars ->
+  seconds (on the sheet's pinned grid, I5) -> beat index on the set track's effective grid, so a
+  set `grid` line never moves a sheet's cue in time.
+- The sheet's gain becomes the track's `gain` when the set has none; the analysis gain stays the
+  deck's auto-gain, as before.
+- `<track>.<name>` works in `at`, `play from`, `jump` and `loop` (a sheet `loop`). A recipe's
+  "the incoming track has a drop" sees sheet and measured drops too.
+- "Overlapping vocals" compares both tracks' vocal spans in bars from the mix start (the
+  outgoing from the mix start, the incoming from where it plays), cut to the mix; more than a
+  quarter bar of overlap warns. Unknown vocals never warn (I4). "Inside a drop" means after its
+  first beat and before its last.
+- The sets are reloaded after a `SheetWrite`; a sheet edited by hand is seen at the next reload
+  of the set (there is no sheet folder watcher).
+
 ## 6. Writes
 
 Same rules as sets (I9): `SheetSource(id) -> (text, hash)`, `SheetCheck(text) -> errors`,
@@ -378,11 +393,20 @@ mcp`; `sheet_write` is not a LIVE tool, like `set_write`). v1 notes: `SheetSourc
 - Sections on tracks with a variable tempo.
 - Key changes within a track.
 
-## Open decisions
+## Decisions (were open)
 
-- **O1** AudioId digest: SHA-256 (recommended, already a dependency) or BLAKE3.
-- **O2** Positions in a sheet: bars pinned by a grid line (recommended) or seconds.
-- **O3** Sheet files: readable slug names with the id inside (recommended) or the id as the name.
-- **O4** Marks written during a gig: batched commits (recommended) or one per write.
-- **O5** Strictness: a sheet with any error is set aside whole (recommended, I8), or valid lines
-  apply and errors are reported.
+- **O1** AudioId digest: SHA-256.
+- **O2** Positions in a sheet: bars pinned by a grid line (I5).
+- **O3** Sheet files: readable slug names with the id inside, an index id -> file.
+- **O4** Marks written during a gig: batched commits. **Not built yet**: nothing writes marks
+  to sheets in v1 (codj's `m{a-h}` still writes `hotcues.json`), so every `SheetWrite` is one
+  commit, like `SetWrite`. The batching comes with the codj mark writer.
+- **O5** Strictness: a sheet with any error is set aside whole (I8).
+
+## Not done in v1 (this branch)
+
+- Migration of `hotcues.json` and `grid-overrides.json` into sheets, and codj writing marks,
+  grid corrections and cues to sheets (section 6, "codj's own actions").
+- `analysis.json` and the waveform files keyed by AudioId (they are still keyed by path).
+- A vocals detector (always `Unknown` unless a sheet states vocals).
+- A watcher on the sheet folder.

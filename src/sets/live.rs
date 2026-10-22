@@ -6,6 +6,7 @@ use crate::{
     analysis::{Analyzer, Grid},
     engine::Codjd,
     gridfix::GridFixes,
+    tracks::Tracks,
 };
 
 use super::{store::Store, Env, LibTrack};
@@ -18,6 +19,8 @@ pub struct LiveEnv {
     analyzer: Arc<Analyzer>,
     /// the set folder, whose `patches` folder holds the patch files
     sets_dir: Option<PathBuf>,
+    /// the track model: sheets and measured sections behind `<track>.<name>`
+    tracks: Option<Arc<Tracks>>,
 }
 
 impl LiveEnv {
@@ -38,7 +41,7 @@ impl LiveEnv {
             })
             .await
             .unwrap_or_default();
-        Self { root, library, analyzer: Arc::clone(analyzer), sets_dir: None }
+        Self { root, library, analyzer: Arc::clone(analyzer), sets_dir: None, tracks: None }
     }
 }
 
@@ -48,11 +51,17 @@ impl LiveEnv {
         self.sets_dir = Some(sets_dir);
         self
     }
+
+    pub fn with_tracks(mut self, tracks: Arc<Tracks>) -> Self {
+        self.tracks = Some(tracks);
+        self
+    }
 }
 
 /// Takes a new snapshot into `store` and tries the sets that had errors again
-pub async fn refresh(store: &Arc<Store>, codjd: &Codjd, analyzer: &Arc<Analyzer>) {
-    store.set_env(Arc::new(LiveEnv::snapshot(codjd, analyzer).await.with_sets_dir(store.dir().to_path_buf())));
+pub async fn refresh(store: &Arc<Store>, codjd: &Codjd, analyzer: &Arc<Analyzer>, tracks: &Arc<Tracks>) {
+    let env = LiveEnv::snapshot(codjd, analyzer).await.with_sets_dir(store.dir().to_path_buf()).with_tracks(Arc::clone(tracks));
+    store.set_env(Arc::new(env));
     store.retry_errors();
 }
 
@@ -72,6 +81,10 @@ impl Env for LiveEnv {
     fn patch_info(&self, name: &str) -> Option<Result<super::PatchInfo, String>> {
         let dir = self.sets_dir.as_ref()?;
         Some(crate::patch::store::PatchStore::new(dir).info(name))
+    }
+
+    fn track_view(&self, path: &std::path::Path) -> Option<crate::tracks::view::TrackView> {
+        self.tracks.as_ref()?.view_of_path(path)
     }
 
     fn grid_factor(&self, path: &std::path::Path) -> f64 {

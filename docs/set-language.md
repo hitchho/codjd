@@ -170,8 +170,10 @@ stop` moves the stop. Items at the same time keep that order: the recipe's, then
 ## Warnings
 
 Errors stop a file from loading; warnings do not. A warning says the set works but is probably
-not what was meant: for now, a recipe mix that does not start on a phrase (every 8 bars from bar
-1, on the first beat). They have the same `file:line:col: message` form, point at the `at` position
+not what was meant: a recipe mix that does not start on a phrase (every 8 bars from bar 1, on
+the first beat); a mix that starts inside the outgoing track's `drop`; a mix where both tracks
+have stated vocals at the same time; a `<track>.<name>` that resolved to a measured section with
+confidence under 0.5 (these three come from the track model, `track-sheets.md`). They have the same `file:line:col: message` form, point at the `at` position
 (its bar number, or the track of `<track>.<cue>`), and are read with `SetWarnings`; `SetErrors`
 and `SetCheck` list errors only.
 
@@ -287,6 +289,12 @@ is used; none or several is an error naming up to five candidates. An absolute p
 exist is an error without a search. The library is the daemon's playlist (`Playlist.musics`).
 
 ### Names and reloading
+- `<track>.<name>` (in `at`, `play from`, `jump`, `loop`) is the set's own `cue`/`loop` of that
+  track, else the track's sheet (its `cue`, `loop`, `mark` a-h or `section`), else a measured
+  section (`intro`, `drop`, `drop2`, `outro`, ...; see `track-sheets.md`). The grid and gain
+  follow the same order: the set's line, the sheet's, the analysis. Sheet positions keep their
+  time: a sheet's `bar 9` is bar 9 of the sheet's grid, wherever that falls on the set's grid.
+  Saving a sheet (`SheetWrite`) reloads the sets.
 - The set name is the `set` line, else the file name without `.codj`. `SetErrors`/`SetShow` take
   a set name, a file name or a file stem.
 - Duplicate track ids, cue names or loop names within a track, a second `set`/`grid`/`gain`/`play`

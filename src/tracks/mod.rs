@@ -147,7 +147,6 @@ impl Tracks {
     }
 
     /// The view of the file at `path`, for the set compiler; None when it has no AudioId
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn view_of_path(&self, path: &Path) -> Option<TrackView> {
         let id = self.analyzer.audio_id(path)?;
         Some(self.view_with(&id, Some(path)))

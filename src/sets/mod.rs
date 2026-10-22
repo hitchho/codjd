@@ -91,6 +91,8 @@ pub mod testenv {
         pub patches: HashMap<String, PatchInfo>,
         /// `patch_info` is `None` (no patch folder) when false
         pub has_patch_dir: bool,
+        /// the track model's views by file
+        pub views: HashMap<PathBuf, crate::tracks::view::TrackView>,
     }
 
     pub fn grid(bpm: f64, first: f64, offset: u8) -> Grid {
@@ -131,6 +133,9 @@ pub mod testenv {
         }
         fn grid_factor(&self, p: &Path) -> f64 {
             self.factors.get(p).copied().unwrap_or(1.)
+        }
+        fn track_view(&self, p: &Path) -> Option<crate::tracks::view::TrackView> {
+            self.views.get(p).cloned()
         }
         fn patch_info(&self, name: &str) -> Option<Result<PatchInfo, String>> {
             self.has_patch_dir.then(|| {

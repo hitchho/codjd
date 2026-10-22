@@ -714,8 +714,8 @@ impl Bus {
         let done = tokio::task::spawn_blocking(move || {
             let r = tracks.sheet_write(&id, &text, &base_hash, &author);
             if r.is_ok() {
-                // a set may name a cue of this sheet
-                sets.retry_errors();
+                // sets read names, grids and gains of sheets: the next arm uses the new ones
+                sets.load_all();
             }
             r
         })
