@@ -2172,6 +2172,8 @@ mod auto_tests;
 #[cfg(test)]
 mod dj_tests;
 #[cfg(test)]
+mod patch_doc_tests;
+#[cfg(test)]
 mod patch_tests;
 #[cfg(test)]
 mod set_tests;
