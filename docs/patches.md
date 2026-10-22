@@ -125,6 +125,19 @@ Live edits: a knob, cell or pattern change never recompiles. A structural edit (
 added/removed) recompiles and swaps; node state (oscillator phases, envelope levels, sequencer
 positions) carries over for nodes whose id survived, and the swap crossfades old → new over 10 ms.
 
+### How the two layers meet in the code
+
+- `Engine` implements `patch::host::PatchHost` (`src/patch/engine_host.rs`): `compile` is
+  `program::compile` at the output's sample rate, a structural edit is `patch_swap(keep_live = false)`
+  (cue-only after it), and `patch_rt` is built from `Audio::patch_slot_states()`.
+- The checked audio-thread calls on `Engine` are `rt_patch_load/swap/unload/knob/cell/pattern/live/unmute`
+  (the field `patch_rt` is what the audio thread holds per slot); `patch_load(slot, name, json)`,
+  `patch_unload(slot)` and the other `patch_*` methods are the document layer's (field `patch_docs`).
+- `PatchCheck`, `PatchWrite`, `PatchImport` and the knob lists a set resolves against run the compiler
+  too (at 48 kHz): a feedback cycle without a Delay or Hold is refused where it is written, not at load.
+- A set's knob and sequencer items are looked up by name again when the mix is armed, against what the
+  slot holds then; a knob that is gone refuses the arm and names the knobs there are.
+
 ### Engine behavior (clarifications, not contract changes)
 
 Implemented in `src/patch/` (compiler, nodes) and `src/audio/mixer.rs` (slots). Additions only.
