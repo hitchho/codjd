@@ -113,7 +113,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     {
         Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}
         Ok(_) | Err(zbus::Error::NameTaken) => {
-            return Err("codjd is already running (stop it first, or just use codj)".into())
+            return Err("already running (stop it first, or just use codj)".into())
         }
         Err(e) => return Err(format!("can't take the name {BUS_NAME}: {e}").into()),
     }
