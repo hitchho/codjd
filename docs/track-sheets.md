@@ -1,8 +1,9 @@
 # Tracks: identity, observations, sheets (draft spec)
 
-Status: **v1 being implemented** (branch `feat/track-model`). Each section says what is done;
-"v1 notes" record where the implementation decided something this draft left open or got
-wrong. The open decisions at the end are decided (the recommendations were taken).
+Status: **v1 implemented** (branch `feat/track-model`): identity, observations (with sections),
+sheets, the store, the view, the D-Bus/MCP interfaces and set resolution. Each section says what
+is done; "v1 notes" record where the implementation decided something this draft left open or
+got wrong. Not done yet: see "Not done in v1" at the end.
 
 Everything codjd knows about a track should be in one model that people, codj and AI agents read
 the same way, so transitions can be chosen by the music (where the outro starts, where the
