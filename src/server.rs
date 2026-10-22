@@ -35,6 +35,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         Config::default()
     });
     let music_dir = PathBuf::from(&config.path);
+    let music_display = match dirs::home_dir().map(|h| h.to_string_lossy().into_owned()) {
+        Some(home) if !home.is_empty() && config.path.starts_with(&home) => format!("~{}", &config.path[home.len()..]),
+        _ => config.path.clone(),
+    };
     let allow_formats = config.allow_formats.clone();
     let net_config = config.net.clone();
     let sets_dir = config.sets.dir.clone();
@@ -96,11 +100,23 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         patches,
     };
     let connection = connection::Builder::session()?
-        .name(BUS_NAME)?
         .max_queued(1000)
         .serve_at(dbus::PATH, bus)?
         .build()
-        .await?;
+        .await
+        .map_err(|e| format!("can't start on the session bus: {e}"))?;
+    // never queue behind a running codjd: two daemons would both play
+    use zbus::fdo::{RequestNameFlags, RequestNameReply};
+    match connection
+        .request_name_with_flags(BUS_NAME, RequestNameFlags::DoNotQueue.into())
+        .await
+    {
+        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}
+        Ok(_) | Err(zbus::Error::NameTaken) => {
+            return Err("codjd is already running (stop it first, or just use codj)".into())
+        }
+        Err(e) => return Err(format!("can't take the name {BUS_NAME}: {e}").into()),
+    }
     dbus::forward_signals(&connection, &codjd)?;
     // media keys, playerctl and desktop widgets; codjd still works if another player owns it
     match connection.request_name(crate::mpris::BUS_NAME).await {
@@ -133,6 +149,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             eprintln!("can't watch the music folder: {e}");
         }
     }
+
+    // one line so a hand-started codjd says it's up and what it plays
+    let tracks = codjd.call(|e| e.playlist.musics.len()).await.unwrap_or(0);
+    eprintln!(
+        "codjd ready: {tracks} tracks from {}{} · control it with codj · Ctrl+C stops",
+        music_display,
+        if tracks == 0 { " (empty: set `path` in ~/.config/codjd/config.toml)" } else { "" }
+    );
 
     // stop on Ctrl+C, kill/systemd (SIGTERM) and a closed terminal (SIGHUP)
     use tokio::signal::unix::{signal, SignalKind};

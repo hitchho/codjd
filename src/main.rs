@@ -31,5 +31,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().nth(1).as_deref() == Some("fetch-models") {
         std::process::exit(analysis::fetch_models());
     }
-    server::run().await
+    if let Err(e) = server::run().await {
+        eprintln!("codjd: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
