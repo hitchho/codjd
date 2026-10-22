@@ -203,7 +203,7 @@ impl Analyzer {
     }
 
     #[cfg(test)]
-    fn start_with(cache_path: Option<PathBuf>, threads: usize) -> Arc<Self> {
+    pub(crate) fn start_with(cache_path: Option<PathBuf>, threads: usize) -> Arc<Self> {
         Self::start_full(cache_path, threads, None, false)
     }
 
@@ -370,6 +370,12 @@ impl Analyzer {
         self.features(path)?;
         let wave = waveform::Waveform::from_bytes(&std::fs::read(self.wave_file(path)?).ok()?)?;
         Some(waveform::pack(wave.duration_ms, &wave.resampled(columns)))
+    }
+
+    /// The stored waveform of an analyzed track, all columns
+    pub fn waveform_full(&self, path: &Path) -> Option<waveform::Waveform> {
+        self.features(path)?;
+        waveform::Waveform::from_bytes(&std::fs::read(self.wave_file(path)?).ok()?)
     }
 
     /// The `n` analyzed `candidates` closest to `path`, nearest first (`path` itself excluded).

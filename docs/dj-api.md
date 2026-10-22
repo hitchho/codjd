@@ -236,6 +236,20 @@ high-pass sweep and a fade, see the loop clock rule under Runtime behavior.
 `author` is `human` or `agent:<name>`; it goes into the git commit message (or is ignored without
 git). The capture/record methods above use author `human` unless called from MCP.
 
+## Tracks: AudioId, sheets, views (D-Bus)
+
+See `docs/track-sheets.md`. `path_or_id` is a file path or an AudioId (`a1:` + 32 hex digits);
+a path whose audio was never hashed is hashed on the call.
+
+| method | args | does |
+|---|---|---|
+| `TrackView` | `s path_or_id` | `s`: the resolved track as text, in the shape of a sheet; measured lines end in `# analysis`, diagnostics are `# !` comments. It parses as a sheet |
+| `TrackViewJson` | `s path_or_id` | `s`: the same as JSON, every field with its `source` (`sheet`, `analysis`, `analysis_corrected`) |
+| `TrackFind` | `s query` | `a(sss)`: (id, name, path) of library tracks whose artist, title or file name contains `query`, and of sheets whose `name` does (path "" for an orphaned sheet); at most 25 |
+| `SheetSource` | `s id` | `(s text, s hash)` of the sheet; `("", "")` when there is none yet. A path works too |
+| `SheetCheck` | `s text` | `as`: errors of `text` as a sheet, `file:line:col: message`, empty = valid; the I5 message quotes the current grid of the `audio` it names |
+| `SheetWrite` | `s id, s text, s base_hash, s author` | save after checking; like `SetWrite` (`ok <new hash>` or the reason, "sheet changed since you read it" on a stale hash). The text's `audio` line must be `id` |
+
 ## MCP tools for sets (client, `codj mcp`)
 
 `sets_list`, `set_source`, `set_check`, `set_write` (needs `base_hash`), `set_use`, `set_cue`,

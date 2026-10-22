@@ -132,6 +132,7 @@ pub struct TrackView {
     pub diagnostics: Vec<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl TrackView {
     /// The cue of that name
     pub fn named(&self, name: &str) -> Option<&NamedPos> {
@@ -543,7 +544,7 @@ mod tests {
     }
 
     fn read(text: &str) -> ReadSheet {
-        ReadSheet { file: "/t/lol.codj".into(), text: text.into(), sheet: check_text("lol.codj", text, None), others: vec![] }
+        ReadSheet { file: "/t/lol.codj".into(), sheet: check_text("lol.codj", text, None), others: vec![] }
     }
 
     #[test]

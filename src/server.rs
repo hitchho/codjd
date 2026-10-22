@@ -95,6 +95,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     {
         codjd.tell(move |e| e.set_record_dir(record_dir));
     }
+    let tracks = crate::tracks::Tracks::new(
+        Arc::clone(&analysis),
+        crate::tracks::Tracks::dir_for(sets.dir()),
+        // the file is small and changes with every DjGridScale
+        Box::new(|p| crate::gridfix::GridFixes::open_default().factor(p)),
+    );
     let bus = Bus {
         codjd: codjd.clone(),
         slsk,
@@ -102,6 +108,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         sets: Arc::clone(&sets),
         editor,
         patches,
+        tracks,
     };
     let connection = connection::Builder::session()?
         .max_queued(1000)

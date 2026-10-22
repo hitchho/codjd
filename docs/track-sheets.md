@@ -364,6 +364,12 @@ D-Bus, and the same as MCP tools:
 
 No interface writes observations (I1). Writing a sheet never changes what plays (as for sets).
 
+**v1 implemented**: the D-Bus methods (`src/dbus.rs`, documented in `dj-api.md`) and the MCP
+tools `track_view`, `track_find`, `sheet_source`, `sheet_check`, `sheet_write` in codj (`codj
+mcp`; `sheet_write` is not a LIVE tool, like `set_write`). v1 notes: `SheetSource` and
+`SheetWrite` take a path as well as an id; `TrackFind` gives at most 25 hits; a successful
+`SheetWrite` makes the sets with errors try again (one may have been waiting for a cue).
+
 ## 8. Not in v1
 
 - A vocal detector (the `vocals` kind is reserved and always `Unknown` until one is chosen).

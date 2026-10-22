@@ -35,7 +35,6 @@ pub struct SheetInfo {
 #[derive(Debug, Clone)]
 pub struct ReadSheet {
     pub file: PathBuf,
-    pub text: String,
     /// Err: the errors (`file:line:col: message`), and the sheet is set aside (I8)
     pub sheet: Result<Sheet, Vec<String>>,
     /// other files that claim the same audio (set aside, the first by file name wins)
@@ -93,10 +92,6 @@ impl SheetStore {
         Self { dir, index: Mutex::new(Index::default()), write_lock: Mutex::new(()) }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Reads the folder again if it changed since the last time (or `force`)
     fn refresh(&self, force: bool) {
         let stamp = dir_stamp(&self.dir);
@@ -139,19 +134,14 @@ impl SheetStore {
         let text = std::fs::read(&file).ok().and_then(|b| String::from_utf8(b).ok());
         let label = file_label(&file);
         let others: Vec<PathBuf> = files.collect();
-        let (text, sheet) = match text {
-            Some(t) => {
-                let mut sheet = check_text(&label, &t, current);
-                if let Ok(s) = &sheet {
-                    if s.audio != id {
-                        sheet = Err(vec![format!("{label}:1:1: the sheet is about {} now", s.audio)]);
-                    }
-                }
-                (t, sheet)
-            }
-            None => (String::new(), Err(vec![format!("{label}:1:1: can't read the file as UTF-8 text")])),
+        let sheet = match text {
+            Some(t) => match check_text(&label, &t, current) {
+                Ok(s) if s.audio != id => Err(vec![format!("{label}:1:1: the sheet is about {} now", s.audio)]),
+                other => other,
+            },
+            None => Err(vec![format!("{label}:1:1: can't read the file as UTF-8 text")]),
         };
-        Some(ReadSheet { file, text, sheet, others })
+        Some(ReadSheet { file, sheet, others })
     }
 
     /// `SheetSource`: the text and its hash, `("", "")` when there is no sheet yet
