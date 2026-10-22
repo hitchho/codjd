@@ -739,7 +739,10 @@ impl Engine {
             .map_err(|_| "other deck has no beat grid".to_string())?;
         let states = self.audio.deck_states();
         // a deck still waiting for its quantized start is not a master yet
-        if !states[other].playing || states[other].waiting {
+        if states[other].waiting {
+            return Err("other deck is waiting for its beat (quantize): sync again in a moment".into());
+        }
+        if !states[other].playing {
             return Err("other deck is not playing".into());
         }
         let master_bpm = theirs.bpm * states[other].rate;
