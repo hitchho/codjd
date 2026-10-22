@@ -146,9 +146,11 @@ impl Tracks {
         Ok(self.view_with(&id, (!path_or_id.trim().starts_with("a1:")).then_some(asked)))
     }
 
-    /// The view of the file at `path`, for the set compiler; None when it has no AudioId
-    pub fn view_of_path(&self, path: &Path) -> Option<TrackView> {
-        let id = self.analyzer.audio_id(path)?;
+    /// The view of the file at `path` for the set compiler, when its AudioId is already known.
+    /// Never hashes (sets load on the async runtime): a file not hashed yet has no view until
+    /// the analysis gave it an id, and a set that needs its names is tried again then.
+    pub fn known_view_of_path(&self, path: &Path) -> Option<TrackView> {
+        let id = self.analyzer.known_audio_id(path)?;
         Some(self.view_with(&id, Some(path)))
     }
 
@@ -241,8 +243,11 @@ mod tests {
         write_wav(&wav, &noise(22050 * 3, 3), None);
         let path = wav.to_string_lossy().into_owned();
 
-        // never analyzed: the view is all Unknown, but it has an id
+        // the set compiler's lookup never hashes a file
+        assert!(tracks.known_view_of_path(&wav).is_none());
+        // never analyzed: the view is all Unknown, but it has an id (hashed now)
         let v = tracks.view(&path).unwrap();
+        assert_eq!(tracks.known_view_of_path(&wav).unwrap().id, v.id);
         assert!(is_audio_id(&v.id));
         assert_eq!(v.paths, [wav.clone()]);
         assert_eq!(v.sections_measured, Value::Unknown);

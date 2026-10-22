@@ -84,7 +84,7 @@ impl Env for LiveEnv {
     }
 
     fn track_view(&self, path: &std::path::Path) -> Option<crate::tracks::view::TrackView> {
-        self.tracks.as_ref()?.view_of_path(path)
+        self.tracks.as_ref()?.known_view_of_path(path)
     }
 
     fn grid_factor(&self, path: &std::path::Path) -> f64 {

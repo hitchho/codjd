@@ -343,6 +343,11 @@ confidence under 0.5.
   first beat and before its last.
 - The sets are reloaded after a `SheetWrite`; a sheet edited by hand is seen at the next reload
   of the set (there is no sheet folder watcher).
+- Loading a set never hashes a file: a track whose AudioId isn't known yet resolves without its
+  sheet and measured sections. A set that needs one of its names fails ("unknown cue") and loads
+  once the analysis has hashed the file (sets with errors are tried again every 5 s), as for a
+  missing grid. A set that loaded without them picks up the sheet's grid and gain at its next
+  reload (a save, a `SheetWrite`, a restart).
 
 ## 6. Writes
 

@@ -309,7 +309,6 @@ impl Analyzer {
     /// The AudioId of the file at `path`, hashed now (a demux of the whole file, so call it off
     /// the async executor) if the index doesn't have it for the file as it is. None when the
     /// file can't be read or demuxed.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn audio_id(&self, path: &Path) -> Option<String> {
         let st = stat(path)?;
         if let Some(id) = self.ids.lock().unwrap().get(path, st) {
@@ -322,7 +321,6 @@ impl Analyzer {
     }
 
     /// The id of `path` if it is known for the file as it is, without hashing
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn known_audio_id(&self, path: &Path) -> Option<String> {
         let st = stat(path)?;
         self.ids.lock().unwrap().get(path, st).map(str::to_string)
@@ -330,7 +328,6 @@ impl Analyzer {
 
     /// The files known to hold the audio `id`, as they are now (a file changed since it was
     /// hashed is left out)
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn paths_of(&self, id: &str) -> Vec<PathBuf> {
         let ids = self.ids.lock().unwrap();
         ids.paths(id)
