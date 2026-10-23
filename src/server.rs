@@ -69,6 +69,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         // the file is small and changes with every DjGridScale
         Box::new(|p| crate::gridfix::GridFixes::open_default().factor(p)),
     );
+    {
+        let tracks = Arc::clone(&tracks);
+        codjd.tell(move |e| e.set_tracks(tracks));
+    }
     let sets = crate::sets::store::Store::new(
         sets_dir.clone(),
         Arc::new(

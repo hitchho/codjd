@@ -90,7 +90,7 @@ exact frame, so a mix plays identically every time and never depends on the call
 Engine API (Rust, `Audio` / `Engine`; not D-Bus):
 
 ```rust
-pub enum Control { Fader, Low, Mid, High, Filter, Gain /* dB, relative */, Crossfader }
+pub enum Control { Fader, Low, Mid, High, Filter, Gain /* dB, relative */, Crossfader, Knob { slot, knob }, Rate /* 0..4, this deck only */ }
 pub enum Curve { Linear, Smooth /* S-curve */, Exp }
 
 pub struct AutoItem {
@@ -123,6 +123,10 @@ Rules:
   position, so tempo changes stretch it correctly). `from: None` starts from the control's value
   at `at_beat`.
 - A ramp and a later manual change: manual wins, the ramp is dropped (`cancel_control`).
+- `Rate` is a track deck's tempo as a multiple of the track's own (0 = standing still, for a
+  brake). It moves only that deck: a deck synced to it does not follow. A ramp that slows its own
+  clock deck would never reach its end, so a mix times it on the other deck (`clock`); `DjSet
+  rate` and `DjSync` cancel it.
 - The audio thread holds a fixed-size pool of items (e.g. 512); `schedule` beyond it returns an
   error instead of allocating.
 - Items whose time is already past when scheduled fire immediately (`Set`, `Swap`, `Play`...) or
@@ -259,26 +263,71 @@ The player's beat-matched transitions, and the same thing between two decks in D
 |---|---|---|
 | `DjAutoMix` | `u from, u to` | mixes from `from` (playing) into the track loaded paused on `to`, starting on `from`'s next 8 bar phrase line. Replies `ok <what> · bar <n>` (`ok blend · 32 bars · bar 97`; `· now` for a crossfade in seconds) and then, on the next lines, the mix as set text (`set "automix"`, two `track` lines with absolute paths, `mix a -> b at bar N recipe R over M bars`), which compiles as is if pasted into a set file. Errors: a deck not loaded, `from` not playing, `to` playing, a set's mix armed |
 | `Automix` | `b on` | the player's automix on or off (default on, `[player] automix`; a config reload applies the config's value). Off drops a transition that has not started; one that has plays to its end |
-| `AutomixState` | — | `(b on, s next_title, d seconds_to_mix, s recipe)`: the coming (or running) transition: seconds of playback until it starts (0 while it runs, -1 and empty strings when none is coming), `blend · 32 bars`, `filter-blend · 16 bars`, `crossfade · 8 bars` (unsynced), `crossfade · 8 s` (no grid) |
+| `AutomixState` | — | `(b on, s next_title, d seconds_to_mix, s recipe)`: the coming (or running) transition: seconds of playback until it starts (0 while it runs, -1 and empty strings when none is coming), `blend · 32 bars`, `loop-roll · 8 bars`, `drop-swap cut · 1 bar`, `crossfade · 8 bars` (unsynced), `crossfade · 8 s` (no grid) |
 | `Autoplay` | `b on` | autoplay on or off (default off, `[player] autoplay`): while the player plays and fewer than 2 tracks are queued, the library track that blends best after the last one is queued (tempo within 4 % and a compatible Camelot key, else the closest tempo within 8 %; a steady grid; not played among the last 200 songs, copies counting as one; at least 2 minutes long). A pick is tried at most every 10 s |
 | `AutoplayState` | — | `(b on, s last)`: the last pick and why (`Defuse: 155 BPM, 5A after 152 BPM, 5A`), or why nothing fit |
 
-**What it picks.** The tempo gap is the rate change sync would need (as `DjSync` measures it,
-half/double time counts as close), against the outgoing deck's current tempo:
+**What it picks.** The transition is chosen from the music: the two tracks' tempos, their
+sections and energy (the track model, `track-sheets.md`: a sheet's sections, else the measured
+ones with confidence 0.5 or more), their keys, and the last few transitions. The same inputs
+always give the same choice. First the tempo safety rule; the tempo gap is the rate change sync
+would need (as `DjSync` measures it, half/double time counts as close), against the outgoing
+deck's current tempo:
 
 | both tracks have a steady grid, gap | transition |
 |---|---|
-| up to 6 % | `blend`, 32 bars, synced |
-| up to 12 % | `filter-blend`, 16 bars, synced |
-| more | `filter-blend`, 8 bars, the new track `play unsynced` (a crossfade on the beat clock, no beatmatching) |
+| more than 12 % | `filter-blend`, 8 bars, the new track `play unsynced` (a crossfade on the beat clock, no beatmatching) |
 | a track without a grid, or a variable one | a crossfade in seconds (8 s, equal power), driven from the engine's tick: no grid is made up |
+| up to 12 % | synced, chosen by the rules below |
 
-If sync refuses the synced kind (a lowered `sync_range`) the same place gets the unsynced one.
+Then the rules, in this order; each puts its recipes on a list, and the first one on the list
+that the variety rule allows and that fits in what is left of the track is played:
 
-**Where.** The player's mix starts 32 bars before the end of the outgoing track (8 for the
-unsynced crossfade), rounded down to its phrase line: bar 1, 17, 33 ... counted from the first
-downbeat. A short track gets a shorter mix (not below the recipe's least bars, else the crossfade
-in seconds). `DjAutoMix` starts at the next 8 bar line at least a beat away.
+| when | recipe |
+|---|---|
+| the outgoing track's last section (an outro aside) is a `breakdown`, and the new one has a `drop` | **drop swap**: `cut` on the phrase line after the breakdown (where the old track would drop), the new track `play from` its first drop. A breakdown that runs to the end of the track: its last 8 bar line with a bar after it. Only the player's mixes, not `DjAutoMix` |
+| the keys clash (Camelot: not the same, not ±1 in the same letter, not the same number in the other letter; an unknown key never clashes) | `echo-out` 8, else `loop-roll` 8: the melodies never overlap for long |
+| the new track starts with a quiet intro (its first section's low band 2/9 or less) before its energy arrives (the first section with a low band of 5/9 or more) | **aligned**: the energy goes where the outgoing track's outro starts (no outro: 16 bars into the usual place), and the bass swaps there: a `blend` (else `bassswap`) twice as long as the stretch of intro played under the old track, with `play from` that bar of the intro. The stretch is at most 16 bars, no longer than what is left after the alignment point (an outro too short for the intro: the new track plays from later in its intro), in 4 bar steps, and never starts inside a drop of the old track (it then starts where the drop ends). Only the player's mixes |
+| tempos 6-12 % apart | `brake` 2 if the new track starts with a strong drop (its first section is a `drop`, or not an intro with a low band of 7/9 or more), then `filter-blend` 16, then `echo-out` 8 |
+| both tracks high energy where they meet (the outgoing track's section at the mix start and the new one's first section, low band 7/9 or more) | `bassswap` 16, else `eq-swap` 24 |
+| the outgoing track has a long low-energy outro (16 bars or more, low band 4/9 or less) | `blend` 32 |
+| otherwise | `blend` 32 or `eq-swap` 24, taking turns (`blend` first) |
+
+After them come `bassswap` 16, `filter-blend` 16, `echo-out` 8 and `loop-roll` 8 as a last
+resort; when nothing fits, the crossfade in seconds.
+
+**One voice at a time.** When the new track's vocals are known (a sheet's `vocals` line,
+`track-sheets.md`), a recipe where both tracks sound together (`blend`, `bassswap`, `eq-swap`,
+`filter-blend`) may have the new track sing for at most 2 bars over the old one singing, or over
+an energetic or melodic part of it (a section with a low or mid band of 5/9 or more): a vocal
+intro never runs under the old track's drop. A place that breaks this is tried a phrase later or
+earlier (8 or 16 bars, still ahead) and shorter (halves, not below the recipe's least bars nor
+8 bars),
+preferring a place where the new track's first vocal comes after the mix; when none passes the
+next candidate is tried, down to the ones that hand over on one beat (`echo-out`, `loop-roll`,
+the drop swap's `cut`). Unknown vocals: no vocal rule.
+
+**Variety.** The engine keeps the last 4 transitions that started (`DjAutoMix`'s too; a drop
+swap counts as `drop-swap`). The same one never plays three times in a row, and the dramatic
+ones (`brake`, `loop-roll`, the drop swap) at most once in four transitions, unless the
+structure clearly calls for it: a drop swap whose breakdown and drop were both measured with
+confidence 0.7 or more (or come from a sheet) is allowed after another dramatic one (still not
+a third in a row).
+
+If sync refuses the synced kind (a lowered `sync_range`) the unsynced crossfade is played
+instead.
+
+**Where.** The player's mix starts on the outgoing track's `outro` when it has one that is still
+ahead, rounded to the nearest 8 bar phrase line, however short the track; else 32 bars before its
+end (16 for the short ones, under 16 bars: `echo-out`, `loop-roll`, `brake`), rounded down to its
+16 bar phrase line: bar 1, 17, 33 ... counted from the first downbeat; 8 bars before the end for
+the unsynced crossfade. A start that falls inside a `drop` (or the track's loudest section) moves
+to the phrase line of the next quieter section when the mix still fits there. A drop swap and an
+aligned intro have places of their own (above). A `brake` lands at its end: it ends on that line instead of starting there. A short
+track gets a shorter mix (not below the recipe's least bars, else the next choice, else the
+crossfade in seconds). `DjAutoMix` starts at the next 8 bar line at least a beat away (a `brake`
+ends on it). Sections are read from the track model when a transition is planned and kept for 5
+minutes (20 s while a track has none yet, its analysis may still be running).
 
 **The player.** About 20 s before the mix start the engine works out the next track exactly as
 `PlayNext` would (the queue first, then the list; repeat one and repeat off never mix: the track

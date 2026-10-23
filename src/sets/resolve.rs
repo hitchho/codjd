@@ -610,6 +610,7 @@ fn resolve_patch_item(
 
 // ---- mixes ----
 
+/// A channel strip control: what a track deck and a patch deck both have
 fn control_of(name: &str) -> Option<Control> {
     Some(match name {
         "fader" => Control::Fader,
@@ -622,10 +623,24 @@ fn control_of(name: &str) -> Option<Control> {
     })
 }
 
+/// A control of a track deck: the strip, and its tempo (`rate`; a patch deck has none, so
+/// `<patch>.rate` stays a knob of the patch)
+fn deck_control_of(name: &str) -> Option<Control> {
+    match name {
+        "rate" => Some(Control::Rate),
+        _ => control_of(name),
+    }
+}
+
+/// A deck's rate: standing still .. four times the track's own tempo (the hand's pitch range
+/// is 0.25..4; automation may go down to 0 for a brake)
+const RATE: (f64, f64) = (0., 4.);
+
 fn range_of(c: Control) -> (f64, f64) {
     match c {
         Control::Fader => (0., 1.),
         Control::Gain => GAIN_DB,
+        Control::Rate => RATE,
         _ => (-1., 1.),
     }
 }
@@ -639,6 +654,7 @@ fn control_name(c: Control) -> &'static str {
         Control::Filter => "filter",
         Control::Gain => "gain",
         Control::Crossfader => "crossfader",
+        Control::Rate => "rate",
     }
 }
 
@@ -850,7 +866,7 @@ fn resolve_mix(
 
     // a recipe mix should start where a phrase starts
     if let (Some(r), Some(start)) = (recipe, start_beat) {
-        if let Some(w) = phrase_warning(a, start, &m.at, r.name) {
+        if let Some(w) = phrase_warning(a, start, &m.at, r, length) {
             warnings.push(w);
         }
     }
@@ -987,30 +1003,28 @@ pub fn merge(recipe: Vec<MixItem>, own: Vec<MixItem>) -> Vec<MixItem> {
 }
 
 /// Phrases are 8 bars from bar 1 (bar 1, 9, 17, ...) and a mix should start on one, on the
-/// first beat. None if it does
-fn phrase_warning(a: &Track, start_beat: f64, at: &MixAt, recipe: &str) -> Option<Diag> {
+/// first beat (a recipe that lands at its end, `brake`, should end on one). None if it does
+fn phrase_warning(a: &Track, start_beat: f64, at: &MixAt, recipe: &recipes::Recipe, length: f64) -> Option<Diag> {
     let g = a.grid.as_ref()?;
     let bpb = g.beats_per_bar as f64;
+    let (beat, what) = if recipe.lands_at_end { (start_beat + length * bpb, "ends") } else { (start_beat, "starts") };
     // bars after bar 1 beat 1
-    let bars = (start_beat - g.downbeat_offset as f64) / bpb;
+    let bars = (beat - g.downbeat_offset as f64) / bpb;
     if (bars / 8. - (bars / 8.).round()).abs() < 1e-6 {
         return None;
     }
-    let p = super::model::pos_of_beat(g, start_beat)?;
+    let p = super::model::pos_of_beat(g, beat)?;
     let (line, col) = match at {
         MixAt::Pos(p) => (p.bar.line, p.bar.col),
         MixAt::Cue { track, .. } => (track.line, track.col),
     };
     let lo = 1. + 8. * (bars / 8.).floor();
     let shown = if (p.beat - 1.).abs() < 1e-6 { format!("bar {}", p.bar) } else { format!("bar {} beat {}", p.bar, fmt_num(p.beat)) };
+    let name = recipe.name;
     Some(Diag::new(
         line,
         col,
-        format!(
-            "recipe {recipe} starts at {shown}: mixes usually start on a phrase (bar {} or {})",
-            fmt_num(lo),
-            fmt_num(lo + 8.)
-        ),
+        format!("recipe {name} {what} at {shown}: mixes usually {} on a phrase (bar {} or {})", &what[..what.len() - 1], fmt_num(lo), fmt_num(lo + 8.)),
     ))
 }
 
@@ -1086,9 +1100,9 @@ fn resolve_item(
         }
         ItemKind::Ctl { track, control, op } => {
             let (deck, _) = side(track, diags)?;
-            let Some(c) = control_of(&control.v) else {
+            let Some(c) = deck_control_of(&control.v) else {
                 diags.push(control.diag(format!(
-                    "unknown control \"{}\" (fader, low, mid, high, filter, gain)",
+                    "unknown control \"{}\" (fader, low, mid, high, filter, gain, rate)",
                     control.v
                 )));
                 return None;

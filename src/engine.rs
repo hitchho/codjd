@@ -194,6 +194,8 @@ pub struct Engine {
     /// `[record] dir`, where `RecordAudio` writes
     record_dir: Option<std::path::PathBuf>,
     analyzer: Option<Arc<Analyzer>>,
+    /// the track model (sections, sheets): what automix chooses its transitions from
+    tracks: Option<Arc<crate::tracks::Tracks>>,
     meta: [DeckMeta; crate::audio::DECKS],
     knobs: [DeckKnobs; crate::audio::DECKS],
     /// what the audio thread has in each patch slot (`rt_patch_*`)
@@ -261,6 +263,7 @@ impl Engine {
             audio,
             record_dir: None,
             analyzer: None,
+            tracks: None,
             meta: Default::default(),
             knobs: Default::default(),
             patch_rt: Default::default(),
@@ -390,6 +393,7 @@ impl Engine {
     }
 
     fn track_ended(&mut self, deck: usize, generation: u64) {
+        tracing::debug!(deck, generation, player_deck = self.player_deck, current = self.generation, pos = self.audio.deck_states()[deck].position, "track ended");
         if deck != self.player_deck || generation != self.generation || self.transport != Transport::Playing {
             return;
         }
@@ -660,6 +664,10 @@ impl Engine {
     }
 
     /// The analyzer, to read grids, keys and gains from; set once it has started
+    pub fn set_tracks(&mut self, tracks: Arc<crate::tracks::Tracks>) {
+        self.tracks = Some(tracks);
+    }
+
     pub fn set_analyzer(&mut self, analyzer: Arc<Analyzer>) {
         self.analyzer = Some(analyzer);
         for deck in 0..crate::audio::DECKS {
@@ -830,6 +838,8 @@ impl Engine {
                 master_bpm,
             ));
         }
+        // a hand on sync ends the automation of the deck's tempo (a brake), as a hand on the pitch does
+        self.audio.cancel_control(deck, Control::Rate);
         self.audio.sync(deck);
         self.rec_synced(deck, true);
         Ok(())
@@ -1705,6 +1715,7 @@ fn auto_control(name: &str) -> Option<Control> {
         "filter" => Control::Filter,
         "gain" => Control::Gain,
         "crossfader" => Control::Crossfader,
+        "rate" => Control::Rate,
         _ => return None,
     })
 }

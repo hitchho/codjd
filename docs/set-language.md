@@ -98,10 +98,13 @@ Items:
 | `xfade <from> -> <to>` / `xfade = <v>` | crossfader (−1 = the deck `a` is on … +1), in `bars`/`bar` lines |
 
 Controls: `fader` (0..1), `low`, `mid`, `high` (−1 kill … 0 unity … +1 = +6 dB), `filter`
-(−1 low-pass … 0 off … +1 high-pass), `gain` (dB, relative to the track's gain).
+(−1 low-pass … 0 off … +1 high-pass), `gain` (dB, relative to the track's gain), `rate` (the
+deck's tempo as a multiple of the track's own: 1 = its own tempo, 0 = standing still, up to 4;
+`aft.rate _ -> 0` is a turntable brake). `rate` is for track decks only (on a patch, `.rate` is a
+knob of the patch), and moves only that deck: a deck synced to it keeps its tempo.
 
-Curves: `linear` (default for faders and the crossfader), `smooth` (S-curve; default for EQ and
-filter), `exp`.
+Curves: `linear` (default for faders, the crossfader, `gain` and `rate`), `smooth` (S-curve;
+default for EQ and filter), `exp`.
 
 ## Recipes
 
@@ -125,17 +128,27 @@ recipes only write what they change.
 | `echo-out` | 8 / 4 | **The old track stutters away in shrinking loops while it turns thin, then the new one hits.** The new track runs silently from the start; the old one loops 4 beats, then 2, then 1, while a high-pass sweep and a fade thin it out. At the end the old track stops and the new one jumps to its `drop` cue (or, with no cue called `drop`, back to its first downbeat) at full volume. |
 | `cut` | 1 / 1 | **Hard cut: works on a big drop.** The new track starts at full volume exactly at the mix start and the old one stops on the same beat. |
 | `filter-blend` | 16 / 8 | **Muffle the old track while the new one opens up from thin to full.** The old track's low-pass filter closes (0 to -0.7) while the new track's high-pass opens (+0.7 to 0), and the faders crossfade; the old track stops at the end. |
+| `loop-roll` | 8 / 4 | **The old track rolls: a loop of its last bar halves again and again while it turns thin, and the new one starts on the beat it stops.** The new track runs silently from the start. Two bars before the end the old track loops 4 beats, then (all from the same start) 2 beats a bar before the end, 1 beat half a bar before, half a beat on the last beat, while a high-pass filter rises from the middle of the mix (0 to 0.7, exp). The loop ends half a beat before the end, and on the last downbeat the old track stops and the new one jumps back to its first downbeat at full volume. Unlike `echo-out` nothing fades: the roll keeps its energy and the new track lands on its own "one". |
+| `brake` | 2 / 1 | **A turntable stop: the old track slows down to nothing, then the new one starts clean.** The new track runs silently from the start. Over the last two beats the old deck's `rate` ramps from wherever it is to 0 (linear in time, like a turntable switched off); at the end the old track stops, its rate goes back to 1 for whatever plays on that deck next, and the new track jumps back to its first downbeat at full volume. The new track comes in at the **end** of this mix, so it is the end that should sit on a phrase line (`at bar 127` for a drop at bar 129). |
+| `eq-swap` | 24 / 12 | **Both tracks at full volume while the sound changes hands band by band: the highs first, then the mids, the bass last.** The new track starts with its bass and mids killed. Over the first third the highs cross (the new track's from kill to 0, the old one's from 0 to kill), over the second third the mids, and on the last phrase line (the end) the bass swaps on one beat and the old track stops. The faders never move. |
 
 There is **no echo effect yet**: `echo-out` fakes it with a shrinking loop (4, 2, 1 beats, all from
 the same start, so they repeat the same bit tighter and tighter), a high-pass sweep and a fade.
 A real echo will replace the loops later, the recipe's name stays. Because the old deck loops,
-the runtime times the end of that mix on the new deck (see Semantics).
+the runtime times the end of that mix on the new deck (see Semantics); `loop-roll` and `brake`
+work the same way.
+
+**Drop swap.** A `cut` placed where the outgoing track would drop after its breakdown, with the
+incoming track starting on its own drop, swaps one drop for the other: `mix aft -> smk at
+aft.drop2 recipe cut` with `smk play from drop` (measured section names, see
+`track-sheets.md`). Automix does this by itself when the structure is there (`docs/dj-api.md`).
 
 **Phrases.** Dance music is built in blocks of 8 bars (a phrase): things start and change on bar
 1, 9, 17, 25 ... A mix started anywhere else sounds like it falls over. Put a recipe on a phrase
 start: a cue (`at aft.outro`) or `at bar 33`. If a recipe mix starts elsewhere, codjd still loads
 the set but warns: `recipe blend starts at bar 37: mixes usually start on a phrase (bar 33 or 41)`
-(`SetWarnings`, see Warnings).
+(`SetWarnings`, see Warnings). `brake` lands at its end, so its end is held to it instead:
+`recipe brake ends at bar 131: mixes usually end on a phrase (bar 129 or 137)`.
 
 **Learning from a recipe.** `SetRecipeText` (D-Bus; `:mix new <recipe>` in codj) gives the recipe
 fully written out in this language, one comment per group of lines saying why it is there, e.g.
@@ -185,9 +198,10 @@ and `SetCheck` list errors only.
   the audio engine at the exact frame (see `docs/dj-api.md`, automation).
 - **Manual control wins**: touching a control by hand (key, MCP, D-Bus `DjSet`) cancels that
   control's remaining automation in the running mix; the rest of the mix continues.
-- **Loops and stops on the outgoing deck**: the outgoing deck times the mix, but a loop makes its
-  beat position wrap and a `stop` makes it stand still, so after the first `a loop ...` or
-  `a stop` it can't time anything. If the mix goes on after that, every later item (and every ramp
+- **Loops, stops and rate on the outgoing deck**: the outgoing deck times the mix, but a loop
+  makes its beat position wrap, a `stop` makes it stand still and an `a.rate` item changes how
+  fast it moves (a brake to 0 would never reach its own end), so from the first `a loop ...`,
+  `a stop` or `a.rate` item on it can't time anything. If the mix goes on after that, every later item (and every ramp
   that ends later) is timed on the incoming deck's beats instead (it has played since mix bar 0);
   you write nothing different, and `swap` there becomes two plain sets. Put `a loop off` at least
   a beat before `a stop`: a loop-off on the very beat of the stop can be left waiting for a wrap
@@ -276,8 +290,12 @@ Choices the sections above leave open; this is what the parser and the compiler 
 
 ### Values
 - Ranges: `fader` 0..1; `low`/`mid`/`high`/`filter` and `xfade` -1..1; `gain` (track and mix)
-  -48..12 dB. Out of range is an error, never clamped.
-- Default curve: `smooth` for `low`, `mid`, `high` and `filter`, else `linear` (including `gain`).
+  -48..12 dB; `rate` 0..4. Out of range is an error, never clamped.
+- Default curve: `smooth` for `low`, `mid`, `high` and `filter`, else `linear` (including `gain`
+  and `rate`).
+- `rate` is a multiple of the track's own tempo, not of where sync put it: `= 1` is the track's
+  own tempo. A rate item on the incoming deck takes it off the outgoing deck's tempo (its beats
+  drift); a hand on the deck's pitch or sync cancels the rate automation of that deck.
 - `xfade` values are passed on as written (-1 = the side of `a`).
 - `kill` is `= -1`, only for `low`, `mid`, `high`.
 

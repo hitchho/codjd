@@ -557,7 +557,7 @@ fn the_header_forms_and_their_errors() {
     let e = errors(&recipe_mix(HEAD, "", ""));
     assert_eq!(e, ["9:35: expected a recipe name after `recipe`, found end of line"]);
     let e = errors(&recipe_mix(HEAD, "blnd", ""));
-    assert_eq!(e, ["9:36: unknown recipe \"blnd\" (recipes: blend, bassswap, echo-out, cut, filter-blend)"]);
+    assert_eq!(e, ["9:36: unknown recipe \"blnd\" (recipes: blend, bassswap, echo-out, cut, filter-blend, loop-roll, brake, eq-swap)"]);
     let e = errors(&recipe_mix(HEAD, "blend over 16", ""));
     assert!(e[0].contains("expected `bars` after `over 16`"), "{e:?}");
     // `at bar` works as well
@@ -579,7 +579,7 @@ fn a_length_override_scales_the_recipe_and_minimums_apply() {
     assert!(items.contains(&PlanItem::Swap { band: Low, at_beat_rel: 16. }));
     let e = errors(&recipe_mix(HEAD, "blend over 7 bars", ""));
     assert_eq!(e, ["9:47: recipe blend needs at least 8 bars (got 7)"]);
-    for (name, min) in [("bassswap", 4), ("echo-out", 4), ("cut", 1), ("filter-blend", 8)] {
+    for (name, min) in [("bassswap", 4), ("echo-out", 4), ("cut", 1), ("filter-blend", 8), ("loop-roll", 4), ("brake", 1), ("eq-swap", 12)] {
         let ok = errors(&recipe_mix(HEAD, &format!("{name} over {min} bars"), ""));
         assert!(ok.is_empty(), "{name} at its minimum: {ok:?}");
         if min > 1 {
@@ -720,6 +720,9 @@ fn recipes_are_described_for_a_beginner() {
         ("echo-out", 8),
         ("cut", 1),
         ("filter-blend", 16),
+        ("loop-roll", 8),
+        ("brake", 2),
+        ("eq-swap", 24),
     ]);
     for r in recipes::RECIPES {
         assert!(!r.explain.contains('\n') && r.explain.ends_with('.'), "{}", r.name);
@@ -868,6 +871,15 @@ fn patches_need_a_patch_folder_and_warn_about_shadowed_knobs() {
     let l = load(Path::new("/sets/x.codj"), "patch acid \"acid\" slot 1\n", &env);
     assert!(l.diags.is_empty());
     assert!(l.warnings[0].msg.contains("knob `gain` of patch \"acid\" has the name of a mixer control"), "{:?}", l.warnings);
+
+    // `rate` is a track deck's tempo, not a patch deck's: a knob called rate (an LFO's) stays a knob
+    let mut env = spec_env();
+    env.patches.insert("acid".into(), super::PatchInfo { knobs: vec![("rate".into(), 0., 10.)], sequencers: vec![] });
+    let src = format!("patch acid \"acid\" slot 1\n{HEAD}mix aft -> smk at aft.outro over 8 bars\n  bars 0..4 acid.rate 1 -> 8\n");
+    let l = load(Path::new("/sets/x.codj"), &src, &env);
+    assert!(l.diags.is_empty() && l.warnings.is_empty(), "{:?} {:?}", l.diags, l.warnings);
+    let items = &l.compiled.unwrap().plans[0].items;
+    assert!(items.iter().any(|i| matches!(i, PlanItem::KnobRamp { name, to, .. } if name == "rate" && *to == 8.)), "{items:?}");
 }
 
 #[test]
@@ -1088,4 +1100,106 @@ mod track_model {
         let e = env(Some("vocals @ 75s..90s\n"), None);
         assert!(ok(&e, &format!("{TRACKS}mix aft -> smk at aft.drop over 16 bars\n")).1.is_empty());
     }
+}
+
+#[test]
+fn loop_roll_halves_one_loop_down_to_half_a_beat_and_lands_on_the_downbeat() {
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "loop-roll", ""));
+    assert_eq!(p.length_beats, 32.);
+    // the loops: 4, 2, 1, 1/2 beats, two bars, one bar, half a bar and a beat before the end,
+    // all from the start of the first one (a resize keeps the start)
+    let loops: Vec<(f64, f64, f64)> = p
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PlanItem::Loop { deck: Out, start_beat, beats, at_beat_rel } => Some((*at_beat_rel, *beats, *start_beat)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(loops.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), [(24., 4.), (28., 2.), (30., 1.), (31., 0.5)]);
+    assert!(loops.iter().all(|l| l.2 == loops[0].2), "{loops:?}");
+    // the loop ends half a beat before the stop, the clock moves to the incoming deck at the
+    // first loop, the filter rises from the middle
+    assert!(p.items.contains(&PlanItem::LoopOff { deck: Out, at_beat_rel: 31.5 }));
+    assert!(p.items.contains(&PlanItem::Pause { deck: Out, at_beat_rel: 32. }));
+    assert_eq!(p.in_clock.as_ref().map(|c| c.after), Some(24.));
+    assert!(p.items.contains(&ramp(Out, Control::Filter, Some(0.), 0.7, 16., 31.5, Curve::Exp)));
+    // the new track runs silently and jumps back to its first downbeat at full volume
+    assert!(p.items.contains(&PlanItem::Set { deck: In, control: Control::Fader, value: 0., at_beat_rel: 0. }));
+    assert!(p.items.contains(&PlanItem::Jump { deck: In, to_beat: SMK0, at_beat_rel: 32. }));
+    assert!(p.items.contains(&PlanItem::Set { deck: In, control: Control::Fader, value: 1., at_beat_rel: 32. }));
+    // no fade: the roll keeps its volume
+    assert!(!p.items.iter().any(|i| matches!(i, PlanItem::Ramp { deck: Out, control: Control::Fader, .. })));
+}
+
+#[test]
+fn brake_slows_the_old_deck_to_a_standstill_timed_on_the_new_one() {
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "brake", ""));
+    assert_eq!(p.length_beats, 8.);
+    // the last two beats: the rate from wherever it is down to 0, linear in time
+    assert!(p.items.contains(&ramp(Out, Control::Rate, None, 0., 6., 8., Curve::Linear)));
+    // the outgoing clock can't time a ramp that slows it: from the ramp on, the incoming deck does
+    assert_eq!(p.in_clock.as_ref().map(|c| c.after), Some(6.));
+    let at8: Vec<_> = p.items.iter().filter(|i| i.start_beat_rel() == 8.).collect();
+    assert_eq!(at8, [
+        &PlanItem::Pause { deck: Out, at_beat_rel: 8. },
+        &PlanItem::Set { deck: Out, control: Control::Rate, value: 1., at_beat_rel: 8. },
+        &PlanItem::Jump { deck: In, to_beat: SMK0, at_beat_rel: 8. },
+        &PlanItem::Set { deck: In, control: Control::Fader, value: 1., at_beat_rel: 8. },
+    ]);
+    // mapped to the decks: the brake and all after it run on the incoming deck's beats
+    let items = super::runtime::map_plan(&p, 0, 1, 7);
+    let brake = items.iter().find(|i| matches!(i.kind, crate::audio::AutoKind::Ramp { control: crate::audio::Control::Rate, .. })).unwrap();
+    assert_eq!(brake.clock, 1);
+    assert!(matches!(brake.kind, crate::audio::AutoKind::Ramp { deck: 0, from: None, to, .. } if to == 0.));
+    assert!(items.iter().all(|i| i.is_sane(crate::audio::DECKS)));
+    // a brake lands at its end: that is what should sit on a phrase line
+    let warn = |at: &str| {
+        let l = run(&format!("{HEAD}mix aft -> smk at {at} recipe brake\n"));
+        assert!(l.diags.is_empty(), "{:?}", l.diags);
+        l.warnings.iter().map(|d| d.msg.clone()).collect::<Vec<_>>()
+    };
+    assert!(warn("bar 127").is_empty());
+    assert_eq!(warn("bar 129"), ["recipe brake ends at bar 131: mixes usually end on a phrase (bar 129 or 137)"]);
+}
+
+#[test]
+fn eq_swap_hands_over_highs_then_mids_then_the_bass() {
+    use Control::*;
+    use Deck::*;
+    let p = plan_of(&recipe_mix(HEAD, "eq-swap", ""));
+    assert_eq!(p.length_beats, 96.);
+    assert!(p.items.contains(&PlanItem::Set { deck: In, control: Low, value: -1., at_beat_rel: 0. }));
+    assert!(p.items.contains(&PlanItem::Set { deck: In, control: Mid, value: -1., at_beat_rel: 0. }));
+    assert!(p.items.contains(&ramp(In, High, Some(-1.), 0., 0., 32., Curve::Smooth)));
+    assert!(p.items.contains(&ramp(Out, High, Some(0.), -1., 0., 32., Curve::Smooth)));
+    assert!(p.items.contains(&ramp(In, Mid, Some(-1.), 0., 32., 64., Curve::Smooth)));
+    assert!(p.items.contains(&ramp(Out, Mid, Some(0.), -1., 32., 64., Curve::Smooth)));
+    assert!(p.items.contains(&PlanItem::Swap { band: Low, at_beat_rel: 96. }));
+    assert!(p.items.contains(&PlanItem::Pause { deck: Out, at_beat_rel: 96. }));
+    // faders full: nothing moves them
+    assert!(!p.items.iter().any(|i| matches!(i, PlanItem::Ramp { control: Fader, .. } | PlanItem::Set { control: Fader, .. })));
+    assert!(p.in_clock.is_none());
+}
+
+#[test]
+fn rate_is_a_deck_control_and_a_patch_knob_name() {
+    // in range, with or without a start value; a set; out of range and on the crossfader line
+    let body = "  bars 0..1 aft.rate _ -> 0.5 exp\n  bar 2 smk.rate = 1.02\n";
+    let items = plan_of(&mix(body)).items;
+    assert!(items.contains(&ramp(Deck::Out, Control::Rate, None, 0.5, 0., 4., Curve::Exp)));
+    assert!(items.contains(&PlanItem::Set { deck: Deck::In, control: Control::Rate, value: 1.02, at_beat_rel: 8. }));
+    // linear unless a curve is named
+    let items = plan_of(&mix("  bars 0..1 aft.rate 1 -> 0\n")).items;
+    assert!(items.contains(&ramp(Deck::Out, Control::Rate, Some(1.), 0., 0., 4., Curve::Linear)));
+    let e = errors(&mix("  bar 1 aft.rate = 5\n"));
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("rate"), "{e:?}");
+    let e = errors(&mix("  bar 1 aft.pitch = 1\n"));
+    assert!(e[0].contains("(fader, low, mid, high, filter, gain, rate)"), "{e:?}");
+    // the incoming deck's rate does not move the clock
+    assert!(plan_of(&mix("  bar 1 smk.rate = 1\n")).in_clock.is_none());
+    assert_eq!(plan_of(&mix("  bar 1 aft.rate = 1\n")).in_clock.map(|c| c.after), Some(4.));
 }

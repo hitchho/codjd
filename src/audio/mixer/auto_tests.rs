@@ -638,3 +638,51 @@ fn back_to_back_ramps_hand_over_at_the_shared_beat() {
     assert_eq!(r.d(1).fader.current, 0.);
     assert!(r.m.auto.is_empty());
 }
+
+#[test]
+fn a_rate_ramp_brakes_one_deck_and_not_the_deck_synced_to_it() {
+    // deck 1 starts synced to deck 0 (124 -> 120: rate 120/124), then deck 0 brakes over beats
+    // 8..10 of deck 1, the deck that keeps time while the clock slows down
+    let mut r = rig2(120., 124.);
+    sched(&mut r, item(2., AutoKind::Play { deck: 1, from_beat: 0., synced: true }));
+    while !r.d(1).running() {
+        step(&mut r);
+    }
+    let synced = r.d(1).rate;
+    assert!((synced - 120. / 124.).abs() < 1e-9, "{synced}");
+    let on1 = |at: f64, kind| AutoItem { group: 1, clock: 1, at_beat: at, kind };
+    let brake = AutoKind::Ramp { deck: 0, control: Control::Rate, from: None, to: 0., end_beat: 10., curve: Curve::Linear };
+    sched(&mut r, on1(8., brake));
+    let b1 = |r: &Rig| r.d(1).grid.unwrap().beats_at(r.d(1).last_pos);
+    while b1(&r) < 9. {
+        step(&mut r);
+    }
+    // half way: half the speed, read back as the control's value
+    assert!((r.d(0).rate - 0.5).abs() < 0.01, "{}", r.d(0).rate);
+    assert!((val(&r, 0, Control::Rate) - 0.5).abs() < 0.01);
+    assert_eq!(r.d(1).rate, synced, "the synced deck keeps its tempo");
+    while b1(&r) < 10.1 {
+        step(&mut r);
+    }
+    assert_eq!(r.d(0).rate, 0.);
+    assert_eq!(r.d(1).rate, synced);
+    assert!(r.m.auto.is_empty());
+
+    // a set puts it back; a hand on the pitch cancels a running brake
+    sched(&mut r, on1(11., AutoKind::Set { deck: 0, control: Control::Rate, value: 1. }));
+    while b1(&r) < 11.1 {
+        step(&mut r);
+    }
+    assert_eq!(r.d(0).rate, 1.);
+    sched(&mut r, on1(12., AutoKind::Ramp { deck: 0, control: Control::Rate, from: Some(1.), to: 0., end_beat: 20., curve: Curve::Linear }));
+    while b1(&r) < 13. {
+        step(&mut r);
+    }
+    r.send(Cmd::AutoCancelControl(0, Control::Rate));
+    r.send(Cmd::Rate(0, 1.));
+    r.run(2000);
+    assert_eq!(r.d(0).rate, 1.);
+    assert!(r.m.auto.is_empty());
+    // never on a patch slot
+    assert!(!on1(1., AutoKind::Set { deck: DECKS, control: Control::Rate, value: 1. }).is_sane(DECKS));
+}
