@@ -463,6 +463,16 @@ impl Runtime {
         self.active.as_ref().map(|a| a.file.as_path())
     }
 
+    /// A set is in use (`SetUse`)
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// A mix is armed or running, or a preview waits to start
+    pub fn is_armed(&self) -> bool {
+        self.armed.is_some() || self.pending.is_some()
+    }
+
     fn active(&self) -> Result<&Active, String> {
         self.active.as_ref().ok_or_else(|| "no active set: SetUse first".to_string())
     }

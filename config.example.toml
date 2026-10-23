@@ -29,3 +29,8 @@ second = ""
 
 # [record]
 # dir = "~/Music/codj-mixes"     # where :rec audio writes the recorded mixes (WAV)
+
+# The player blends each track into the next on the beat (automix); false plays every track to
+# its end, as before. This is the default:
+# [player]
+# automix = true

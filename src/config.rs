@@ -30,6 +30,26 @@ pub struct Config {
     /// where `RecordAudio` writes the mixes (`[record]`)
     #[serde(default)]
     pub record: RecordConfig,
+    /// the player (`[player]`)
+    #[serde(default)]
+    pub player: PlayerConfig,
+}
+
+/// `[player]`: `automix = false` turns off the beat-matched transitions between tracks
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct PlayerConfig {
+    #[serde(default = "yes")]
+    pub automix: bool,
+}
+
+impl Default for PlayerConfig {
+    fn default() -> Self {
+        Self { automix: true }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// `[record]`: the folder of recorded mixes, `~/Music/codj-mixes` unless `dir` is given
@@ -89,6 +109,7 @@ impl Default for Config {
             sets: SetsConfig::default(),
             patches: Default::default(),
             record: RecordConfig::default(),
+            player: PlayerConfig::default(),
         }
     }
 }
@@ -194,5 +215,13 @@ mod config_tests {
         )
         .unwrap();
         assert_eq!(cfg.sets.dir, PathBuf::from("/tmp/sets"));
+    }
+
+    #[test]
+    fn automix_is_on_unless_turned_off() {
+        let cfg: Config = toml::from_str("path = \"/m\"\n").unwrap();
+        assert!(cfg.player.automix);
+        let cfg: Config = toml::from_str("path = \"/m\"\n[player]\nautomix = false\n").unwrap();
+        assert!(!cfg.player.automix);
     }
 }
