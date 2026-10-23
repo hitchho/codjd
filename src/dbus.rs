@@ -936,6 +936,20 @@ impl Bus {
         self.ask(|e| e.automix_state()).await
     }
 
+    /// autoplay on or off: with it on, codjd queues the library track that blends best whenever
+    /// fewer than two are queued while the player plays (`[player] autoplay`, default off)
+    async fn autoplay(&self, on: bool) -> String {
+        reply(self.codjd.call(move |e| {
+            e.set_autoplay(on);
+            Ok(())
+        }).await)
+    }
+
+    /// (on, the last pick and why: "Defuse: 155 BPM, 5A after 152 BPM, 5A")
+    async fn autoplay_state(&self) -> (bool, String) {
+        self.ask(|e| e.autoplay_state()).await
+    }
+
     // ---- soulseek ----
 
     /// connect to soulseek in the background; poll slsk_state / slsk_status

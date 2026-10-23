@@ -35,16 +35,19 @@ pub struct Config {
     pub player: PlayerConfig,
 }
 
-/// `[player]`: `automix = false` turns off the beat-matched transitions between tracks
+/// `[player]`: `automix = false` turns off the beat-matched transitions between tracks;
+/// `autoplay = true` keeps the queue topped up with tracks that blend, so the music never stops
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PlayerConfig {
     #[serde(default = "yes")]
     pub automix: bool,
+    #[serde(default)]
+    pub autoplay: bool,
 }
 
 impl Default for PlayerConfig {
     fn default() -> Self {
-        Self { automix: true }
+        Self { automix: true, autoplay: false }
     }
 }
 

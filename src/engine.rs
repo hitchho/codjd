@@ -59,6 +59,7 @@ pub enum Event {
 }
 
 mod automix;
+mod autoplay;
 mod edits;
 
 pub use automix::Owner;
@@ -213,6 +214,8 @@ pub struct Engine {
     loading_as: Owner,
     /// automix: the player's beat-matched transitions and `DjAutoMix`, see `engine/automix.rs`
     amix: automix::State,
+    /// autoplay: queues the next track that blends when the queue runs low, see `engine/autoplay.rs`
+    ap: autoplay::State,
     /// the player's state; the audio thread's own view lags by a callback
     transport: Transport,
     /// tags the playing track, so a late end event from a replaced one is ignored
@@ -270,6 +273,7 @@ impl Engine {
             deck_gen: [0; crate::audio::DECKS],
             loading_as: Owner::Dj,
             amix: automix::State::new(config.player.automix),
+            ap: autoplay::State::new(config.player.autoplay),
             transport: Transport::Stopped,
             generation: 0,
             volume,
@@ -1136,6 +1140,7 @@ impl Engine {
     pub fn set_tick(&mut self) {
         self.with_runtime(|rt, h| rt.tick(h));
         self.automix_tick();
+        self.autoplay_tick();
     }
 
     // ---- patch decks (docs/patches.md) ----
