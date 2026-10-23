@@ -441,9 +441,16 @@ impl Engine {
     }
 
     pub fn resume(&mut self) {
-        if self.transport == Transport::Paused {
-            self.audio.play(self.player_deck);
-            self.transport = Transport::Playing;
+        match self.transport {
+            Transport::Paused => {
+                self.audio.play(self.player_deck);
+                self.transport = Transport::Playing;
+            }
+            // stopped (the list ran out, a set ended): resume means play, like the toggle
+            Transport::Stopped if !self.playlist.musics.is_empty() => {
+                self.start(self.playlist.playing_index);
+            }
+            _ => {}
         }
         self.emit(Event::Resumed);
     }
