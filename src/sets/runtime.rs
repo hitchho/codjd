@@ -177,6 +177,7 @@ fn control(c: model::Control) -> crate::audio::Control {
         model::Control::Filter => A::Filter,
         model::Control::Gain => A::Gain,
         model::Control::Crossfader => A::Crossfader,
+        model::Control::Rate => A::Rate,
     }
 }
 
@@ -322,6 +323,7 @@ fn control_name(c: model::Control) -> &'static str {
         model::Control::Filter => "filter",
         model::Control::Gain => "gain",
         model::Control::Crossfader => "xfade",
+        model::Control::Rate => "rate",
     }
 }
 

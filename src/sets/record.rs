@@ -54,6 +54,7 @@ pub fn range_of(c: Control) -> f64 {
     match c {
         Control::Fader => 1.,
         Control::Gain => 60.,
+        Control::Rate => 4.,
         _ => 2.,
     }
 }
@@ -61,7 +62,7 @@ pub fn range_of(c: Control) -> f64 {
 /// What a deck starts a mix with (see the runtime: tracks come in on a neutral deck)
 pub fn neutral(c: Control) -> f64 {
     match c {
-        Control::Fader => 1.,
+        Control::Fader | Control::Rate => 1.,
         _ => 0.,
     }
 }
@@ -70,6 +71,7 @@ fn bounds(c: Control) -> Option<(f64, f64)> {
     match c {
         Control::Fader => Some((0., 1.)),
         Control::Gain => None,
+        Control::Rate => Some((0., 4.)),
         _ => Some((-1., 1.)),
     }
 }
@@ -87,6 +89,7 @@ fn name_of(c: Control) -> &'static str {
         Control::Filter => "filter",
         Control::Gain => "gain",
         Control::Crossfader => "xfade",
+        Control::Rate => "rate",
     }
 }
 
@@ -470,6 +473,7 @@ fn control_order(c: Control) -> u8 {
         Control::Filter => 4,
         Control::Gain => 5,
         Control::Crossfader => 6,
+        Control::Rate => 7,
     }
 }
 

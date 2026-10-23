@@ -826,6 +826,8 @@ impl Engine {
                 master_bpm,
             ));
         }
+        // a hand on sync ends the automation of the deck's tempo (a brake), as a hand on the pitch does
+        self.audio.cancel_control(deck, Control::Rate);
         self.audio.sync(deck);
         self.rec_synced(deck, true);
         Ok(())
@@ -1700,6 +1702,7 @@ fn auto_control(name: &str) -> Option<Control> {
         "filter" => Control::Filter,
         "gain" => Control::Gain,
         "crossfader" => Control::Crossfader,
+        "rate" => Control::Rate,
         _ => return None,
     })
 }

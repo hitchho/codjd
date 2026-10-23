@@ -11,7 +11,10 @@
 /// relative to the deck's auto-gain (on top of it, -60..+12), `Crossfader` is mixer-wide (-1 A
 /// .. 1 B; the deck of an item that moves it does not matter). `Knob` is a patch knob (`slot` 0..3,
 /// `knob` its index in the patch's knob list), in the knob's own units; the deck of an item that
-/// moves it is `2 + slot` by convention but the control carries the slot itself.
+/// moves it is `2 + slot` by convention but the control carries the slot itself. `Rate` is a
+/// track deck's tempo as a multiple of the track's own (0 = standing still .. 4); automation
+/// moves only that deck (a deck synced to it does not follow: a brake must not drag the other
+/// deck down), never a patch slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Fader,
@@ -22,10 +25,12 @@ pub enum Control {
     Gain,
     Crossfader,
     Knob { slot: usize, knob: usize },
+    Rate,
 }
 
 impl Control {
-    /// Index into a deck's six values (not for the crossfader or a knob)
+    /// Index into a deck's six values (not for the crossfader, a knob or the rate: the mixer
+    /// reads and writes the deck's own rate)
     pub(super) fn index(self) -> usize {
         match self {
             Control::Fader => 0,
@@ -33,7 +38,7 @@ impl Control {
             Control::Mid => 2,
             Control::High => 3,
             Control::Filter => 4,
-            Control::Gain | Control::Crossfader | Control::Knob { .. } => 5,
+            Control::Gain | Control::Crossfader | Control::Knob { .. } | Control::Rate => 5,
         }
     }
 
@@ -55,7 +60,7 @@ impl Control {
     pub fn clamp(self, v: f32) -> f32 {
         let (lo, hi) = self.range();
         if v.is_nan() {
-            return if self == Control::Fader { 1. } else { 0. };
+            return if matches!(self, Control::Fader | Control::Rate) { 1. } else { 0. };
         }
         v.clamp(lo, hi)
     }
@@ -64,12 +69,17 @@ impl Control {
         match self {
             Control::Fader => (0., 1.),
             Control::Gain => (GAIN_MIN_DB, GAIN_MAX_DB),
+            Control::Rate => (RATE_MIN, RATE_MAX),
             // the program clamps a knob to its own range
             Control::Knob { .. } => (f32::MIN, f32::MAX),
             _ => (-1., 1.),
         }
     }
 }
+
+/// Range of [`Control::Rate`]: down to standing still (a brake), up to the pitch fader's top
+pub const RATE_MIN: f32 = 0.;
+pub const RATE_MAX: f32 = 4.;
 
 /// Range of [`Control::Gain`] in dB
 pub const GAIN_MIN_DB: f32 = -60.;
@@ -167,7 +177,7 @@ impl AutoItem {
         let deck_ok = |d: usize| d < decks;
         let strip_ok = |d: usize, c: Control| match c {
             Control::Knob { slot, .. } => slot < crate::patch::SLOTS,
-            Control::Crossfader => d < decks,
+            Control::Crossfader | Control::Rate => d < decks,
             _ => d < decks + crate::patch::SLOTS,
         };
         let kind_ok = match self.kind {

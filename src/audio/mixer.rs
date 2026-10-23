@@ -1157,6 +1157,7 @@ impl Mixer {
                 .and_then(|s| s.program.as_deref())
                 .and_then(|p| p.knob_value(knob))
                 .unwrap_or(0.),
+            Control::Rate => self.decks.get(deck).map_or(1., |d| d.rate as f32),
             _ => self.ctl[deck.min(CHANNELS - 1)][c.index()],
         }
     }
@@ -1175,6 +1176,13 @@ impl Mixer {
             }
             return;
         }
+        if c == Control::Rate {
+            // this deck only: a deck synced to it keeps its own tempo (see `Control`)
+            if let Some(d) = self.decks.get_mut(deck) {
+                d.rate = v as f64;
+            }
+            return;
+        }
         if deck >= DECKS {
             self.set_strip(deck, c, v, how);
             return;
@@ -1189,7 +1197,7 @@ impl Mixer {
             }
             Control::Filter => d.fx.filter_smooth().drive(v, how),
             Control::Gain => d.gain.drive(10f32.powf(v / 20.), how),
-            Control::Crossfader | Control::Knob { .. } => {}
+            Control::Crossfader | Control::Knob { .. } | Control::Rate => {}
         }
         self.ctl[deck][c.index()] = v;
     }
@@ -1206,7 +1214,7 @@ impl Mixer {
             }
             Control::Filter => s.fx.filter_smooth().drive(v, how),
             Control::Gain => s.gain.drive(10f32.powf(v / 20.), how),
-            Control::Crossfader | Control::Knob { .. } => return,
+            Control::Crossfader | Control::Knob { .. } | Control::Rate => return,
         }
         self.ctl[deck][c.index()] = v;
     }

@@ -90,7 +90,7 @@ exact frame, so a mix plays identically every time and never depends on the call
 Engine API (Rust, `Audio` / `Engine`; not D-Bus):
 
 ```rust
-pub enum Control { Fader, Low, Mid, High, Filter, Gain /* dB, relative */, Crossfader }
+pub enum Control { Fader, Low, Mid, High, Filter, Gain /* dB, relative */, Crossfader, Knob { slot, knob }, Rate /* 0..4, this deck only */ }
 pub enum Curve { Linear, Smooth /* S-curve */, Exp }
 
 pub struct AutoItem {
@@ -123,6 +123,10 @@ Rules:
   position, so tempo changes stretch it correctly). `from: None` starts from the control's value
   at `at_beat`.
 - A ramp and a later manual change: manual wins, the ramp is dropped (`cancel_control`).
+- `Rate` is a track deck's tempo as a multiple of the track's own (0 = standing still, for a
+  brake). It moves only that deck: a deck synced to it does not follow. A ramp that slows its own
+  clock deck would never reach its end, so a mix times it on the other deck (`clock`); `DjSet
+  rate` and `DjSync` cancel it.
 - The audio thread holds a fixed-size pool of items (e.g. 512); `schedule` beyond it returns an
   error instead of allocating.
 - Items whose time is already past when scheduled fire immediately (`Set`, `Swap`, `Play`...) or

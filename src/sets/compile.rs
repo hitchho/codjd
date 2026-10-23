@@ -17,8 +17,9 @@ pub struct MixPlan {
     pub length_beats: f64,
     /// sorted by time; items at the same beat keep file order
     pub items: Vec<PlanItem>,
-    /// Set when the outgoing deck loops or stops before the mix is over: its beat position then
-    /// wraps or stands still, so it can't time what follows. Items from then on are timed on the
+    /// Set when the outgoing deck loops, stops or has its rate moved (a brake) before the mix is
+    /// over: its beat position then wraps, stands still or slows down, so it can't time what
+    /// follows. Items from then on are timed on the
     /// incoming deck's grid instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_clock: Option<InClock>,
@@ -29,7 +30,7 @@ pub struct MixPlan {
 /// trusted any more (its first loop or stop)
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InClock {
-    /// mix beat of the outgoing deck's first loop or stop
+    /// mix beat of the outgoing deck's first loop, stop or rate item
     pub after: f64,
     /// by mix beat; the first starts at 0
     pub segs: Vec<InSeg>,
@@ -278,15 +279,17 @@ fn compile_mix(set: &Set, m: &Mix) -> Option<MixPlan> {
             }
         });
     }
-    // the outgoing deck's clock stops at its first loop (the position wraps) or stop (it is
-    // paused); if the mix goes on after that, the incoming deck keeps time
+    // the outgoing deck's clock stops at its first loop (the position wraps), stop (it is
+    // paused) or rate item (a brake: a ramp to 0 timed on the deck it slows would never end);
+    // if the mix goes on after that, the incoming deck keeps time
     let length_beats = m.length_bars * bpb;
     let stalls = items
         .iter()
         .filter_map(|i| match i {
-            PlanItem::Loop { deck: Deck::Out, at_beat_rel, .. } | PlanItem::Pause { deck: Deck::Out, at_beat_rel } => {
-                Some(*at_beat_rel)
-            }
+            PlanItem::Loop { deck: Deck::Out, at_beat_rel, .. }
+            | PlanItem::Pause { deck: Deck::Out, at_beat_rel }
+            | PlanItem::Set { deck: Deck::Out, control: Control::Rate, at_beat_rel, .. } => Some(*at_beat_rel),
+            PlanItem::Ramp { deck: Deck::Out, control: Control::Rate, start_beat_rel, .. } => Some(*start_beat_rel),
             _ => None,
         })
         .min_by(f64::total_cmp)

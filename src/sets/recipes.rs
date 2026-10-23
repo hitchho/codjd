@@ -13,38 +13,67 @@ pub struct Recipe {
     pub default_bars: u32,
     /// shorter than this and the recipe's parts don't fit
     pub min_bars: u32,
+    /// the new track comes in at the end of the mix, not at its start: the end is what should
+    /// sit on a phrase line (`brake`)
+    pub lands_at_end: bool,
 }
 
-pub const RECIPES: [Recipe; 5] = [
+pub const RECIPES: [Recipe; 8] = [
     Recipe {
         name: "blend",
         explain: "A long, smooth overlap: never two basslines at once.",
         default_bars: 32,
         min_bars: 8,
+        lands_at_end: false,
     },
     Recipe {
         name: "bassswap",
         explain: "A short overlap where the bass changes hands on one beat, so the groove never loses its low end.",
         default_bars: 16,
         min_bars: 4,
+        lands_at_end: false,
     },
     Recipe {
         name: "echo-out",
         explain: "The old track stutters away in shrinking loops while it turns thin, then the new one hits.",
         default_bars: 8,
         min_bars: 4,
+        lands_at_end: false,
     },
     Recipe {
         name: "cut",
         explain: "Hard cut: works on a big drop.",
         default_bars: 1,
         min_bars: 1,
+        lands_at_end: false,
     },
     Recipe {
         name: "filter-blend",
         explain: "Muffle the old track while the new one opens up from thin to full.",
         default_bars: 16,
         min_bars: 8,
+        lands_at_end: false,
+    },
+    Recipe {
+        name: "loop-roll",
+        explain: "The old track rolls: a loop of its last bar halves again and again while it turns thin, and the new one starts on the beat it stops.",
+        default_bars: 8,
+        min_bars: 4,
+        lands_at_end: false,
+    },
+    Recipe {
+        name: "brake",
+        explain: "A turntable stop: the old track slows down to nothing, then the new one starts clean.",
+        default_bars: 2,
+        min_bars: 1,
+        lands_at_end: true,
+    },
+    Recipe {
+        name: "eq-swap",
+        explain: "Both tracks at full volume while the sound changes hands band by band: the highs first, then the mids, the bass last.",
+        default_bars: 24,
+        min_bars: 12,
+        lands_at_end: false,
     },
 ];
 
@@ -75,9 +104,9 @@ pub struct Ctx<'a> {
     pub beats_per_bar: f64,
 }
 
-/// A bar number the way a person writes it: `8`, `7.5`, `0.25`
+/// A bar number the way a person writes it: `8`, `7.5`, `0.25`, `7.875`
 pub fn n(v: f64) -> String {
-    let s = format!("{:.2}", (v * 100.).round() / 100.);
+    let s = format!("{:.3}", (v * 1000.).round() / 1000.);
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
@@ -165,6 +194,79 @@ pub fn groups(recipe: &Recipe, c: &Ctx, bars: f64) -> Vec<Group> {
                 one("the old track is muffled (low-pass) more and more", format!("bars 0..{end} {a}.filter 0 -> -0.7 smooth")),
                 one("while the faders crossfade", format!("bars 0..{end} {b}.fader 0 -> 1; {a}.fader 1 -> 0")),
                 one("the old track is done", format!("bar {end} {a} stop")),
+            ]
+        }
+        "loop-roll" => {
+            // like echo-out, the outgoing deck's clock stands still in the loop and the tail is
+            // timed on the incoming deck; the roll keeps its volume, the filter thins it
+            let end = bars;
+            let bar = |beats: f64| beats / c.beats_per_bar;
+            let (l4, l2, l1, lh, off) = (end - bar(8.), end - bar(4.), end - bar(2.), end - bar(1.), end - bar(0.5));
+            let sweep = (bars / 2.).floor().min(l4);
+            vec![
+                g(
+                    "the new track runs silently from its start; it comes in when the roll ends",
+                    vec![format!("{b} play"), format!("bar 0 {b}.fader = 0")],
+                ),
+                one("a high-pass filter rises on the old track: it gets thinner and thinner", format!("bars {}..{} {a}.filter 0 -> 0.7 exp", n(sweep), n(off))),
+                one("the roll: loop the last bar (4 beats) ...", format!("bar {} {a} loop 4 beats", n(l4))),
+                one("... then half of it", format!("bar {} {a} loop 2 beats", n(l2))),
+                one("... half again", format!("bar {} {a} loop 1 beat", n(l1))),
+                one("... and half a beat: the roll", format!("bar {} {a} loop 0.5 beats", n(lh))),
+                one("end the loop half a beat before the stop (a loop-off on the stop's beat can get stuck)", format!("bar {} {a} loop off", n(off))),
+                one("the old track stops dead on the downbeat", format!("bar {} {a} stop", n(end))),
+                g(
+                    "and the new track starts from its first downbeat at full volume on that beat",
+                    vec![format!("bar {} {b} jump -{} beats", n(end), n(end * c.beats_per_bar)), format!("bar {} {b}.fader = 1", n(end))],
+                ),
+            ]
+        }
+        "brake" => {
+            // the brake slows the outgoing deck's clock down to nothing: from its start the mix is
+            // timed on the incoming deck (see docs), which runs silently from bar 0
+            let end = bars;
+            let from = end - 2. / c.beats_per_bar;
+            vec![
+                g(
+                    "the new track runs silently from its start; it comes in when the old one has stopped",
+                    vec![format!("{b} play"), format!("bar 0 {b}.fader = 0")],
+                ),
+                one(
+                    "the brake: over the last two beats the old track slows down to a standstill, like a turntable switched off",
+                    format!("bars {}..{} {a}.rate _ -> 0 linear", n(from), n(end)),
+                ),
+                g(
+                    "the old track is done: pause it and put its tempo back for whatever plays on that deck next",
+                    vec![format!("bar {} {a} stop", n(end)), format!("bar {} {a}.rate = 1", n(end))],
+                ),
+                g(
+                    "the new track starts clean from its first downbeat, at full volume",
+                    vec![format!("bar {} {b} jump -{} beats", n(end), n(end * c.beats_per_bar)), format!("bar {} {b}.fader = 1", n(end))],
+                ),
+            ]
+        }
+        "eq-swap" => {
+            let third = (bars / 3.).floor().max(1.);
+            let (t1, t2) = (third, 2. * third);
+            vec![
+                play(),
+                one(
+                    "the new track plays at full volume with its bass and mids killed: only its highs will come in first",
+                    format!("bar 0 {b}.low kill; {b}.mid kill"),
+                ),
+                one(
+                    "first phrase: the highs change hands (hats and cymbals of the new track, out with the old ones)",
+                    format!("bars 0..{} {b}.high -1 -> 0; {a}.high 0 -> -1", n(t1)),
+                ),
+                one(
+                    "second phrase: the mids change hands (chords, melodies, vocals)",
+                    format!("bars {}..{} {b}.mid -1 -> 0; {a}.mid 0 -> -1", n(t1), n(t2)),
+                ),
+                one(
+                    "third phrase line: the bass swaps on one beat, two basslines at once turn to mud",
+                    format!("bar {} swap low", n(bars)),
+                ),
+                one("the old track is done", format!("bar {} {a} stop", n(bars))),
             ]
         }
         other => unreachable!("recipe {other}"),

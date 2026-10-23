@@ -189,6 +189,9 @@ pub enum Control {
     /// dB, relative to the track's gain
     Gain,
     Crossfader,
+    /// the deck's tempo as a multiple of the track's own (1 = its own tempo, 0 = standing
+    /// still): `brake`
+    Rate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
