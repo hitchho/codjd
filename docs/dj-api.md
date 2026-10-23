@@ -285,6 +285,7 @@ that the variety rule allows and that fits in what is left of the track is playe
 |---|---|
 | the outgoing track's last section (an outro aside) is a `breakdown`, and the new one has a `drop` | **drop swap**: `cut` on the phrase line after the breakdown (where the old track would drop), the new track `play from` its first drop. A breakdown that runs to the end of the track: its last 8 bar line with a bar after it. Only the player's mixes, not `DjAutoMix` |
 | the keys clash (Camelot: not the same, not ±1 in the same letter, not the same number in the other letter; an unknown key never clashes) | `echo-out` 8, else `loop-roll` 8: the melodies never overlap for long |
+| the new track starts with a quiet intro (its first section's low band 2/9 or less) before its energy arrives (the first section with a low band of 5/9 or more) | **aligned**: the energy goes where the outgoing track's outro starts (no outro: 16 bars into the usual place), and the bass swaps there: a `blend` (else `bassswap`) twice as long as the stretch of intro played under the old track, with `play from` that bar of the intro. The stretch is at most 16 bars, no longer than what is left after the alignment point (an outro too short for the intro: the new track plays from later in its intro), in 4 bar steps, and never starts inside a drop of the old track (it then starts where the drop ends). Only the player's mixes |
 | tempos 6-12 % apart | `brake` 2 if the new track starts with a strong drop (its first section is a `drop`, or not an intro with a low band of 7/9 or more), then `filter-blend` 16, then `echo-out` 8 |
 | both tracks high energy where they meet (the outgoing track's section at the mix start and the new one's first section, low band 7/9 or more) | `bassswap` 16, else `eq-swap` 24 |
 | the outgoing track has a long low-energy outro (16 bars or more, low band 4/9 or less) | `blend` 32 |
@@ -304,10 +305,12 @@ If sync refuses the synced kind (a lowered `sync_range`) the unsynced crossfade 
 instead.
 
 **Where.** The player's mix starts on the outgoing track's `outro` when it has one that is still
-ahead, rounded to the nearest 8 bar phrase line; else 32 bars before its end (16 for the short
-ones, under 16 bars: `echo-out`, `loop-roll`, `brake`), rounded down to its 16 bar phrase line:
-bar 1, 17, 33 ... counted from the first downbeat; 8 bars before the end for the unsynced
-crossfade. A `brake` lands at its end: it ends on that line instead of starting there. A short
+ahead, rounded to the nearest 8 bar phrase line, however short the track; else 32 bars before its
+end (16 for the short ones, under 16 bars: `echo-out`, `loop-roll`, `brake`), rounded down to its
+16 bar phrase line: bar 1, 17, 33 ... counted from the first downbeat; 8 bars before the end for
+the unsynced crossfade. A start that falls inside a `drop` (or the track's loudest section) moves
+to the phrase line of the next quieter section when the mix still fits there. A drop swap and an
+aligned intro have places of their own (above). A `brake` lands at its end: it ends on that line instead of starting there. A short
 track gets a shorter mix (not below the recipe's least bars, else the next choice, else the
 crossfade in seconds). `DjAutoMix` starts at the next 8 bar line at least a beat away (a `brake`
 ends on it). Sections are read from the track model when a transition is planned and kept for 5

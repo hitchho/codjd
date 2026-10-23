@@ -77,7 +77,8 @@ const SHAPE_RETRY_S: u64 = 20;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Choice {
     /// a recipe on the outgoing track's beat grid; `from_bar`: the new track starts at that bar
-    /// of its own grid (its drop: a drop swap) instead of its first downbeat
+    /// of its own grid instead of its first downbeat (a `cut` into its drop: a drop swap; a
+    /// blend later into a quiet intro)
     Recipe { recipe: &'static str, bars: u32, synced: bool, from_bar: Option<u32> },
     /// no steady grid on one side: a crossfade in seconds
     Fade { secs: f64 },
@@ -89,7 +90,7 @@ impl Choice {
     pub fn label(&self) -> String {
         let bars = |n: u32| if n == 1 { "1 bar".to_string() } else { format!("{n} bars") };
         match *self {
-            Choice::Recipe { recipe, bars: n, synced: true, from_bar: Some(_) } => format!("drop-swap {recipe} · {}", bars(n)),
+            Choice::Recipe { recipe: "cut", bars: n, synced: true, from_bar: Some(_) } => format!("drop-swap cut · {}", bars(n)),
             Choice::Recipe { recipe, bars: n, synced: true, .. } => format!("{recipe} · {}", bars(n)),
             Choice::Recipe { bars: n, synced: false, .. } => format!("crossfade · {}", bars(n)),
             Choice::Fade { secs } => format!("crossfade · {secs:.0} s"),
@@ -99,7 +100,7 @@ impl Choice {
     /// What the variety rule counts: the recipe, `drop-swap` or `crossfade`
     pub fn style(&self) -> &'static str {
         match *self {
-            Choice::Recipe { from_bar: Some(_), .. } => "drop-swap",
+            Choice::Recipe { recipe: "cut", from_bar: Some(_), .. } => "drop-swap",
             Choice::Recipe { recipe, synced: true, .. } => recipe,
             _ => "crossfade",
         }

@@ -15,6 +15,12 @@ const HIGH_LOW: u8 = 7;
 /// An outro at least this long (bars) with its low band at most `LOW_OUTRO` is a long low one
 const LONG_OUTRO_BARS: f64 = 16.;
 const LOW_OUTRO: u8 = 4;
+/// A first section whose low band is at most this is a quiet intro ...
+const QUIET_LOW: u8 = 2;
+/// ... until the first section whose low band is at least this: where the energy arrives
+const ENERGETIC_LOW: u8 = 5;
+/// The longest stretch of the new track's quiet intro played under the old track, in bars
+const MAX_LEAD_BARS: f64 = 16.;
 /// Short transitions start this many bars before the end (then down to a phrase line)
 const SHORT_LEAD_BARS: u32 = 16;
 /// How many recent transitions the variety rule looks at
@@ -132,10 +138,13 @@ struct Cand {
     bars: u32,
     clear: bool,
     why: &'static str,
+    /// a place of its own: the start bar on the outgoing track and the new track's `play from`
+    /// bar (a drop swap, an aligned intro); None: placed by `place_for`
+    at: Option<(u32, u32)>,
 }
 
 fn cand(recipe: &'static str, bars: u32, why: &'static str) -> Cand {
-    Cand { recipe, bars, clear: false, why }
+    Cand { recipe, bars, clear: false, why, at: None }
 }
 
 /// The variety rule: never three of a kind in a row, and the dramatic ones at most once in the
@@ -179,13 +188,22 @@ pub fn pick(ask: &Ask) -> Pick {
     let mut cands: Vec<Cand> = vec![];
     // 1. a breakdown at the end of the outgoing track and a drop in the new one: swap the drops
     let drop_swap = if ask.now_s.is_none() { drop_swap(ask, og, end_bar).filter(|d| bar_secs(og, d.0) >= ask.pos_s) } else { None };
-    if let Some((_, _, clear)) = drop_swap {
-        cands.push(Cand { recipe: "cut", bars: 1, clear, why: "breakdown into the new track's drop" });
+    if let Some((start, from, clear)) = drop_swap {
+        cands.push(Cand { recipe: "cut", bars: 1, clear, why: "breakdown into the new track's drop", at: Some((start, from)) });
     }
     // 2. keys that clash: melodies must not overlap for long
     if keys_clash(out.key.as_deref(), inn.key.as_deref()) {
         cands.push(cand("echo-out", 8, "keys clash"));
         cands.push(cand("loop-roll", 8, "keys clash"));
+    }
+    // 2b. a quiet intro on the new track: its energy arrives where the old track's outro starts,
+    // and the bass swaps there (the middle of a blend or a bass swap)
+    if ask.now_s.is_none() {
+        if let Some((start, bars, from)) = aligned(ask, og, end_bar, anchor_bar) {
+            let why = "the new track's quiet intro ends where the old track's outro starts";
+            cands.push(Cand { recipe: "blend", bars, clear: false, why, at: Some((start, from)) });
+            cands.push(Cand { recipe: "bassswap", bars, clear: false, why, at: Some((start, from)) });
+        }
     }
     // 3. 6-12 % apart: a filter blend, or a brake into a track that starts with a bang
     if gap {
@@ -220,14 +238,14 @@ pub fn pick(ask: &Ask) -> Pick {
     cands.extend([cand("bassswap", 16, "variety"), cand("filter-blend", 16, "variety"), cand("echo-out", 8, "variety")]);
 
     for c in cands {
-        let from_bar = (c.recipe == "cut").then(|| drop_swap.map(|d| d.1)).flatten();
+        let from_bar = c.at.map(|a| a.1);
         let choice = Choice::Recipe { recipe: c.recipe, bars: c.bars, synced: true, from_bar };
         if !varied(choice.style(), c.clear, ask.recent) {
             continue;
         }
-        let place = match (from_bar, drop_swap) {
-            (Some(_), Some((start, _, _))) => fit(og, ask.length_s, start, 1, 1),
-            _ => place_for(ask, og, c.recipe, c.bars, anchor_bar),
+        let place = match c.at {
+            Some((start, _)) => fit(og, ask.length_s, start, c.bars, c.bars),
+            None => place_for(ask, og, c.recipe, c.bars, anchor_bar),
         };
         if let Some(place) = place {
             let choice = Choice::Recipe { recipe: c.recipe, bars: place.bars, synced: true, from_bar };
@@ -274,8 +292,58 @@ fn place_for(ask: &Ask, g: &Grid, recipe: &str, bars: u32, anchor_bar: f64) -> O
         }
     }
     let lead = if bars >= 16 { LEAD_BARS } else { SHORT_LEAD_BARS };
-    let p = place_at_end(g, ask.length_s, lead, if r.lands_at_end { 1 } else { bars }, if r.lands_at_end { 1 } else { r.min_bars })?;
-    back(p)
+    let (want, min) = if r.lands_at_end { (1, 1) } else { (bars, r.min_bars) };
+    let p = place_at_end(g, ask.length_s, lead, want, min)?;
+    // never inside a drop when a later, quieter section can take the mix
+    let quieter = out_of_drop(ask.out.shape, g, p.start_s).and_then(|line| fit(g, ask.length_s, line, want, min)).and_then(back);
+    quieter.or_else(|| back(p))
+}
+
+/// When `secs` on the outgoing track is inside a drop (or its loudest section) and a later
+/// section is quieter: the phrase line where that one starts
+fn out_of_drop(out: &Shape, g: &Grid, secs: f64) -> Option<u32> {
+    let here = out.at(secs)?;
+    let loudest = out.trusted().filter_map(|p| p.low()).max()?;
+    let low = here.low()?;
+    if here.kind != Kind::Drop && low < loudest {
+        return None;
+    }
+    let later = out.trusted().find(|p| p.start_s >= here.end_s - 1e-6 && p.low().is_some_and(|l| l < low))?;
+    Some(line_near(bar_at(g, later.start_s)) as u32)
+}
+
+/// The new track starts with a quiet intro (its first section's low band at most `QUIET_LOW`):
+/// line its energy (the first section with a low band of `ENERGETIC_LOW` or more) up with the
+/// old track's outro start (or, with no outro, the middle of the usual 32 bar place), and swap
+/// the bass there: a blend or bass swap twice as long as the stretch of intro played under the
+/// old track. That stretch is at most 16 bars, no longer than what follows the alignment (an
+/// outro too short for the intro: the new track plays from later in its intro), in whole 4 bar
+/// steps, and it does not start inside a drop of the old track. (start bar, bars, the new
+/// track's `play from` bar)
+fn aligned(ask: &Ask, og: &Grid, end_bar: f64, anchor_bar: f64) -> Option<(u32, u32, u32)> {
+    let ig = ask.inn.grid?;
+    let (out, inn) = (ask.out.shape, ask.inn.shape);
+    if inn.first()?.low()? > QUIET_LOW {
+        return None;
+    }
+    let energy = inn.trusted().find(|p| p.low().is_some_and(|l| l >= ENERGETIC_LOW))?;
+    let energy_bar = bar_at(ig, energy.start_s).round();
+    let quiet = energy_bar - 1.;
+    let align = if out.outro().is_some() { anchor_bar } else { anchor_bar + MAX_LEAD_BARS };
+    let room = (end_bar - align).floor();
+    let steps = |bars: f64| (bars / 4.).floor() * 4.;
+    let mut lead = steps(quiet.min(room).min(MAX_LEAD_BARS));
+    if let Some(d) = out.at(bar_secs(og, (align - lead).max(1.) as u32)).filter(|p| p.kind == Kind::Drop) {
+        let after = line_near(bar_at(og, d.end_s));
+        if after > align - lead && after <= align - 4. {
+            lead = steps(align - after);
+        }
+    }
+    let start = align - lead;
+    if lead < 4. || start < 1. || bar_secs(og, start as u32) < ask.pos_s {
+        return None;
+    }
+    Some((start as u32, (2. * lead) as u32, (energy_bar - lead) as u32))
 }
 
 /// The drop swap, if the structure is there: (the mix's start bar on the outgoing track: the
@@ -562,5 +630,100 @@ mod tests {
         let mut a = ask(&s, &s, &g, &g, &[]);
         a.now_s = Some(19.);
         assert_eq!(pick(&a).place.unwrap().start_bar, 17);
+    }
+
+    /// A section from bar `from` to bar `to` (exclusive) on grid `g`
+    fn at(g: &Grid, kind: Kind, from: u32, to: u32, energy: [u8; 3]) -> Part {
+        Part { kind, start_s: bar_secs(g, from), end_s: bar_secs(g, to), energy: Some(energy), confidence: Some(0.8) }
+    }
+
+    /// Heard live: Cadillac into Hola Sensei. The old rule put a 32 bar blend 32 bars before the
+    /// end, inside Cadillac's drop2, under Hola's nearly silent intro, and swapped the bass while
+    /// Cadillac was still at full energy and Hola had barely started.
+    #[test]
+    fn a_quiet_intro_ends_where_the_outro_starts_and_the_bass_swaps_there() {
+        // Cadillac: 198 s at 160 BPM (a bar is 1.5 s): 132 bars
+        let cg = grid(160., 0., 0);
+        let cadillac = Shape {
+            parts: vec![
+                at(&cg, Kind::Intro, 1, 17, [0, 2, 1]),
+                at(&cg, Kind::Body, 17, 25, [6, 5, 4]),
+                at(&cg, Kind::Build, 25, 33, [6, 6, 6]),
+                at(&cg, Kind::Drop, 33, 65, [8, 6, 6]),
+                at(&cg, Kind::Build, 65, 81, [6, 6, 6]),
+                at(&cg, Kind::Drop, 81, 113, [8, 7, 7]),
+                at(&cg, Kind::Body, 113, 121, [8, 6, 5]),
+                Part { end_s: 198., ..at(&cg, Kind::Outro, 121, 132, [3, 2, 1]) },
+            ],
+            key: Some("10A".into()),
+        };
+        // Hola Sensei: 159 BPM, a nearly silent 16 bar intro, the energy arrives at bar 17
+        let hg = grid(159., 0., 0);
+        let hola = Shape {
+            parts: vec![
+                at(&hg, Kind::Intro, 1, 17, [0, 1, 0]),
+                at(&hg, Kind::Body, 17, 33, [6, 7, 6]),
+                at(&hg, Kind::Body, 33, 97, [6, 6, 6]),
+                at(&hg, Kind::Drop, 97, 113, [8, 7, 7]),
+            ],
+            key: Some("10A".into()),
+        };
+        let mut a = ask(&cadillac, &hola, &cg, &hg, &[]);
+        a.length_s = 198.;
+        let p = pick(&a);
+        // the outro starts at bar 121: Hola's bar 17 goes there, and the bass swaps there, in
+        // the middle of a 16 bar blend from bar 113 (where drop2 has ended: never inside it).
+        // Cadillac's outro has 12 bars, so 8 bars of Hola's intro play under it: from its bar 9.
+        assert_eq!(p.choice, Choice::Recipe { recipe: "blend", bars: 16, synced: true, from_bar: Some(9) });
+        assert_eq!(p.place.unwrap().start_bar, 113);
+        assert_eq!(p.choice.label(), "blend · 16 bars");
+        assert_eq!(p.choice.style(), "blend");
+        // the mix as set text: Hola from its bar 9, the swap at mix bar 8 = Cadillac bar 121
+        let mut env = crate::sets::testenv::FakeEnv { root: "/music".into(), ..Default::default() };
+        let pa = env.add("Aasi & Swooh", "Cadillac", "/music/05-aasi_and_swooh-cadillac.mp3", Some(cg.clone()));
+        let pb = env.add("X", "Hola Sensei", "/music/hola.mp3", Some(hg.clone()));
+        let text = super::super::set_text(&pa, &pb, &p.place.unwrap(), &p.choice);
+        assert!(text.contains("b play from bar 9\n"), "{text}");
+        let l = crate::sets::load(std::path::Path::new("automix.codj"), &text, &env);
+        assert!(l.diags.is_empty() && l.warnings.is_empty(), "{text}\n{:?} {:?}", l.diags, l.warnings);
+        let plan = &l.compiled.unwrap().plans[0];
+        assert_eq!(plan.start_beat, 112. * 4.);
+        assert!(plan.items.contains(&crate::sets::compile::PlanItem::Swap { band: crate::sets::compile::Control::Low, at_beat_rel: 32. }));
+        assert!(plan.items.iter().any(|i| matches!(i, crate::sets::compile::PlanItem::Play { from_beat, .. } if *from_beat == 32.)));
+        // after two blends: the same alignment as a bass swap
+        let mut a = ask(&cadillac, &hola, &cg, &hg, &["blend", "blend"]);
+        a.length_s = 198.;
+        let p = pick(&a);
+        assert_eq!(p.choice, Choice::Recipe { recipe: "bassswap", bars: 16, synced: true, from_bar: Some(9) });
+        assert_eq!(p.place.unwrap().start_bar, 113);
+        // the same with a long outro: 16 bars of intro would start at bar 105, inside drop2,
+        // so it is still bar 113
+        let mut long = cadillac.clone();
+        long.parts.last_mut().unwrap().end_s = 1.5 * 160.;
+        let mut a = ask(&long, &hola, &cg, &hg, &[]);
+        a.length_s = 1.5 * 160.;
+        assert_eq!(pick(&a).place.unwrap().start_bar, 113);
+        // with drop2 over by bar 97, the long outro covers the whole quiet intro: Hola from its
+        // first bar at bar 105, the bass swap at 121
+        long.parts[5] = at(&cg, Kind::Drop, 81, 97, [8, 7, 7]);
+        long.parts[6] = at(&cg, Kind::Body, 97, 121, [8, 6, 5]);
+        let mut a = ask(&long, &hola, &cg, &hg, &[]);
+        a.length_s = 1.5 * 160.;
+        let p = pick(&a);
+        assert_eq!(p.choice, Choice::Recipe { recipe: "blend", bars: 32, synced: true, from_bar: Some(1) });
+        assert_eq!(p.place.unwrap().start_bar, 105);
+    }
+
+    #[test]
+    fn a_mix_never_starts_inside_a_drop_when_a_quieter_section_follows() {
+        let g = g120();
+        // no outro: the usual place (bar 161) is inside the drop; the quieter body from 169 takes it
+        let out = Shape {
+            parts: vec![part(Kind::Intro, 1, 17, 2), part(Kind::Drop, 17, 169, 8), part(Kind::Body, 169, 201, 5)],
+            key: None,
+        };
+        let p = pick(&ask(&out, &Shape::default(), &g, &g, &[]));
+        assert_eq!(label(&p), "blend · 32 bars");
+        assert_eq!(p.place.unwrap().start_bar, 169);
     }
 }
