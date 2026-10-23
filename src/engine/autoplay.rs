@@ -22,6 +22,9 @@ const HISTORY: usize = 200;
 const MIN_LENGTH: Duration = Duration::from_secs(120);
 /// A pick is tried at most this often (the library is scanned for it)
 const PICK_EVERY: Duration = Duration::from_secs(10);
+/// Picks stay within this share of the set's tempo (the tempo when autoplay made its first pick):
+/// small steps that each blend must not add up to another genre over an evening
+const BAND: f64 = 0.10;
 
 pub struct State {
     pub on: bool,
@@ -30,11 +33,13 @@ pub struct State {
     last_try: Option<Instant>,
     /// why the last pick was made, for `AutoplayState`
     pub last: String,
+    /// the set's tempo: the track's when autoplay first picked; cleared when autoplay is turned on
+    anchor: Option<f64>,
 }
 
 impl State {
     pub fn new(on: bool) -> State {
-        State { on, recent: VecDeque::new(), last_try: None, last: String::new() }
+        State { on, recent: VecDeque::new(), last_try: None, last: String::new(), anchor: None }
     }
 
     fn remember(&mut self, key: SongKey) {
@@ -89,13 +94,14 @@ pub fn keys_blend(a: &str, b: &str) -> bool {
     }
 }
 
-/// The best next track after one at `bpm` in `camelot`, and why. Pure: the same inputs always give
-/// the same pick (ties go to the earlier track in the list).
-pub fn pick(bpm: f64, camelot: &str, candidates: &[Candidate], recent: &[SongKey]) -> Option<(u32, String)> {
-    if bpm <= 0. {
+/// The best next track after one at `bpm` in `camelot`, and why, keeping to `anchor`'s tempo band.
+/// Pure: the same inputs always give the same pick (ties go to the earlier track in the list).
+pub fn pick(bpm: f64, camelot: &str, anchor: f64, candidates: &[Candidate], recent: &[SongKey]) -> Option<(u32, String)> {
+    if bpm <= 0. || anchor <= 0. {
         return None;
     }
-    let fresh = |c: &&Candidate| c.steady && c.bpm > 0. && c.length >= MIN_LENGTH && !recent.contains(&c.key);
+    let in_band = |b: f64| (b - anchor).abs() / anchor <= BAND;
+    let fresh = |c: &&Candidate| c.steady && c.bpm > 0. && c.length >= MIN_LENGTH && !recent.contains(&c.key) && in_band(c.bpm);
     let gap = |c: &Candidate| (c.bpm - bpm).abs() / bpm;
     // a small lift beats a drop, the same key beats a neighbour
     let score = |c: &Candidate| gap(c) + if c.bpm >= bpm { 0. } else { 0.01 } + if c.camelot == camelot { 0. } else { 0.005 };
@@ -107,12 +113,18 @@ pub fn pick(bpm: f64, camelot: &str, candidates: &[Candidate], recent: &[SongKey
     if let Some(c) = strict {
         return Some((c.index, format!("{:.0} BPM, {} after {:.0} BPM, {}", c.bpm, c.camelot, bpm, camelot)));
     }
-    // nothing blends strictly: the closest tempo within 8 %, any key (automix keeps such a mix short)
+    // nothing blends strictly (or the last track is outside the set's band): the closest tempo in
+    // the band, a compatible key first; automix keeps a far jump short
+    let target = if in_band(bpm) { bpm } else { anchor };
     candidates
         .iter()
         .filter(fresh)
-        .filter(|c| gap(c) <= 0.08)
-        .min_by(|a, b| gap(a).total_cmp(&gap(b)))
+        .min_by(|a, b| {
+            let rank = |c: &Candidate| (!keys_blend(camelot, &c.camelot), (c.bpm - target).abs());
+            let (ka, da) = rank(a);
+            let (kb, db) = rank(b);
+            ka.cmp(&kb).then(da.total_cmp(&db))
+        })
         .map(|c| (c.index, format!("{:.0} BPM, {} after {:.0} BPM, {} (nothing closer)", c.bpm, c.camelot, bpm, camelot)))
 }
 
@@ -133,6 +145,10 @@ impl Engine {
 
     /// `Autoplay(on)`
     pub fn set_autoplay(&mut self, on: bool) {
+        if on && !self.ap.on {
+            // a new session: the set's tempo is taken from what plays when the first pick is made
+            self.ap.anchor = None;
+        }
         self.ap.on = on;
         info!(on, "autoplay");
     }
@@ -168,7 +184,8 @@ impl Engine {
         let candidates: Vec<Candidate> =
             self.playlist.musics.iter().enumerate().filter_map(|(i, m)| self.candidate(i as u32, m)).collect();
         let recent: Vec<SongKey> = self.ap.recent.iter().cloned().collect();
-        match pick(after.bpm, &after.camelot, &candidates, &recent) {
+        let anchor = *self.ap.anchor.get_or_insert(after.bpm);
+        match pick(after.bpm, &after.camelot, anchor, &candidates, &recent) {
             Some((index, why)) => {
                 let title = self.playlist.musics[index as usize].title.clone();
                 info!(%title, %why, "autoplay queued");
@@ -201,20 +218,39 @@ mod tests {
     fn picks_close_tempo_and_compatible_key_and_skips_what_played() {
         let lib = [c(0, "far key", 160., "10A"), c(1, "drop", 156., "5A"), c(2, "lift", 162., "5B"), c(3, "same", 160., "5A")];
         // the same key at the same tempo wins
-        assert_eq!(pick(160., "5A", &lib, &[]).unwrap().0, 3);
+        assert_eq!(pick(160., "5A", 160., &lib, &[]).unwrap().0, 3);
         // played: next best is a small lift in the relative major, not a drop or a far key
         let played = [lib[3].key.clone()];
-        assert_eq!(pick(160., "5A", &lib, &played).unwrap().0, 2);
+        assert_eq!(pick(160., "5A", 160., &lib, &played).unwrap().0, 2);
         // unsteady grids, short tracks and too far tempos are never picked
         let mut odd = c(4, "odd", 160., "5A");
         odd.steady = false;
         let mut short = c(5, "short", 160., "5A");
         short.length = Duration::from_secs(60);
-        assert!(pick(160., "5A", &[odd, short, c(6, "far", 190., "5A")], &[]).is_none());
+        assert!(pick(160., "5A", 160., &[odd, short, c(6, "far", 190., "5A")], &[]).is_none());
         // nothing blends strictly: the closest tempo within 8 % in any key
-        let (i, why) = pick(160., "5A", &[c(7, "b", 170., "9B"), c(8, "a", 166., "2A")], &[]).unwrap();
+        let (i, why) = pick(160., "5A", 160., &[c(7, "b", 170., "9B"), c(8, "a", 166., "2A")], &[]).unwrap();
         assert_eq!(i, 8);
         assert!(why.contains("nothing closer"), "{why}");
-        assert!(pick(0., "5A", &lib, &[]).is_none());
+        assert!(pick(0., "5A", 160., &lib, &[]).is_none());
+    }
+
+    #[test]
+    fn the_set_keeps_its_tempo_and_comes_back_after_a_drift() {
+        // a ladder of small drops, each within 4 % of the last: without the anchor it walks the
+        // set from 150 down to hip hop over an evening
+        let lib = [c(0, "a", 146., "5A"), c(1, "b", 141., "5A"), c(2, "c", 136., "5A"), c(3, "d", 131., "5A"), c(4, "e", 126., "5A")];
+        let mut played = Vec::new();
+        let mut bpm = 150.;
+        let mut picks = Vec::new();
+        while let Some((i, _)) = pick(bpm, "5A", 150., &lib, &played) {
+            picks.push(lib[i as usize].bpm);
+            played.push(lib[i as usize].key.clone());
+            bpm = lib[i as usize].bpm;
+        }
+        assert!(picks.iter().all(|b| (b - 150.).abs() / 150. <= BAND), "{picks:?}");
+        // a track far outside the band (94 BPM after a drift): the pick steers back into it
+        let lib = [c(0, "hiphop", 92., "3A"), c(1, "back", 150., "3A"), c(2, "other", 148., "9B")];
+        assert_eq!(pick(94., "3A", 150., &lib, &[]).unwrap().0, 1);
     }
 }
