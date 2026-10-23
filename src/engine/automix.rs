@@ -356,9 +356,17 @@ impl Engine {
     /// length (0: the recipe's own) and where it starts: the next 8 bar line, or with `at_outro`
     /// the outgoing track's outro. The new track starts where the DJ cued it (its deck moved
     /// off the start), else at its hot spot.
-    pub fn dj_transition(&mut self, from: usize, to: usize, recipe: &str, bars: u32, at_outro: bool) -> Result<String, String> {
+    pub fn dj_transition(&mut self, from: usize, to: usize, recipe: &str, bars: u32, at_outro: bool, path: &str) -> Result<String, String> {
         super::check_deck(from)?;
         super::check_deck(to)?;
+        // a track to bring in that `to` does not hold yet: load it there first (from its start,
+        // so it comes in at its hot spot)
+        if !path.is_empty() && self.meta[to].path.as_deref() != Some(Path::new(path)) {
+            if self.audio.deck_states()[to].playing {
+                return Err(format!("deck {} is playing: the new track needs the other deck", ["A", "B"][to]));
+            }
+            self.deck_load(to, Path::new(path))?;
+        }
         let recipe: Option<&'static str> = match recipe {
             "" | "auto" => None,
             name => Some(crate::sets::recipes::find(name).ok_or_else(|| format!("no technique \"{name}\": {}", crate::sets::recipes::names()))?.name),

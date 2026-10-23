@@ -925,10 +925,11 @@ impl Bus {
     /// the DJ's transition from the playing deck `from` into `to` (loaded, paused): `recipe` a
     /// technique (blend, bassswap, eq-swap, filter-blend, echo-out, loop-roll, cut, brake) or
     /// "auto"; `bars` its length, 0 for the recipe's own; `at_outro` starts it at the outgoing
-    /// track's outro instead of its next 8 bar line. The new track starts where its deck is cued,
-    /// else at its hot spot. Replies like `DjAutoMix`.
-    async fn dj_transition(&self, from: u32, to: u32, recipe: String, bars: u32, at_outro: bool) -> String {
-        match self.codjd.call(move |e| e.dj_transition(from as usize, to as usize, &recipe, bars, at_outro)).await {
+    /// track's outro instead of its next 8 bar line. `path`: a track to load onto `to` first
+    /// ("" = what `to` holds). The new track starts where its deck is cued, else at its hot spot.
+    /// Replies like `DjAutoMix`.
+    async fn dj_transition(&self, from: u32, to: u32, recipe: String, bars: u32, at_outro: bool, path: String) -> String {
+        match self.codjd.call(move |e| e.dj_transition(from as usize, to as usize, &recipe, bars, at_outro, &path)).await {
             Some(Ok(s)) => s,
             Some(Err(e)) => e,
             None => "engine not running".to_string(),
