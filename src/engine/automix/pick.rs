@@ -130,6 +130,19 @@ pub struct Ask<'a> {
     /// `DjAutoMix`: the outgoing deck's position; the mix goes on its next 8 bar line. None:
     /// the player's mix near the end of the track
     pub now_s: Option<f64>,
+    /// the DJ's own choice (`DjTransition`): what wins over the rules
+    pub force: Option<Force>,
+}
+
+/// What the DJ chose for a transition; what is None the rules decide
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Force {
+    /// the technique, by recipe name
+    pub recipe: Option<&'static str>,
+    /// its length in bars
+    pub bars: Option<u32>,
+    /// where the new track starts, a bar of its grid (the DJ cued it there)
+    pub from_bar: Option<u32>,
 }
 
 /// The choice and where it goes (None: a crossfade in seconds, placed by the caller)
@@ -196,6 +209,19 @@ pub fn pick(ask: &Ask) -> Pick {
     };
     let anchor_s = bar_secs(og, anchor_bar.max(1.) as u32);
 
+    // the DJ chose the technique: that one, placed and landed by the same rules, the variety and
+    // vocal rules waived (it is their call)
+    if let Some(Force { recipe: Some(recipe), bars, from_bar }) = ask.force {
+        let r = recipes::find(recipe);
+        let bars = bars.unwrap_or(r.map_or(16, |r| r.default_bars)).max(r.map_or(1, |r| r.min_bars));
+        let lands = matches!(recipe, "loop-roll" | "brake" | "echo-out");
+        let from_bar = from_bar.or_else(|| if lands { landing(ask) } else { cue_in(ask, recipe, bars) });
+        return match place_for(ask, og, recipe, bars, anchor_bar) {
+            Some(place) => Pick { choice: Choice::Recipe { recipe, bars: place.bars, synced: true, from_bar }, place: Some(place), why: "the DJ's choice" },
+            None => Pick { choice: Choice::Fade { secs: FADE_S }, place: None, why: "too short" },
+        };
+    }
+
     let mut cands: Vec<Cand> = vec![];
     // 1. a breakdown at the end of the outgoing track and a drop in the new one: swap the drops
     let drop_swap = if ask.now_s.is_none() { drop_swap(ask, og, end_bar).filter(|d| bar_secs(og, d.0) >= ask.pos_s) } else { None };
@@ -254,7 +280,8 @@ pub fn pick(ask: &Ask) -> Pick {
         let lands = matches!(c.recipe, "loop-roll" | "brake" | "echo-out");
         // an overlap cues the new track so its first strong part arrives on the bass swap, not
         // its first downbeat (many tracks open with ambience or a voice, made for listening)
-        let from_bar = c.at.map(|a| a.1).or_else(|| if lands { landing(ask) } else { cue_in(ask, c.recipe, c.bars) });
+        let cued = ask.force.and_then(|f| f.from_bar);
+        let from_bar = cued.or(c.at.map(|a| a.1)).or_else(|| if lands { landing(ask) } else { cue_in(ask, c.recipe, c.bars) });
         let choice = Choice::Recipe { recipe: c.recipe, bars: c.bars, synced: true, from_bar };
         if !varied(choice.style(), c.clear, ask.recent) {
             continue;
@@ -544,11 +571,31 @@ mod tests {
             recent,
             pos_s: 0.,
             now_s: None,
+            force: None,
         }
     }
 
     fn label(p: &Pick) -> String {
         p.choice.label()
+    }
+
+    #[test]
+    fn the_djs_choice_wins_and_keeps_the_placement() {
+        let g = grid(120., 0., 0);
+        let (out, inn) = (usual(3), usual(3));
+        let mut a = ask(&out, &inn, &g, &g, &["echo-out", "echo-out"]);
+        a.now_s = Some(19.);
+        // echo-out twice in a row would be refused by the variety rule: the DJ asked, it plays
+        a.force = Some(Force { recipe: Some("echo-out"), bars: Some(8), from_bar: None });
+        let p = pick(&a);
+        assert_eq!(label(&p), "echo-out · 8 bars");
+        assert!(p.place.is_some(), "placed on the next phrase line like DjAutoMix");
+        // the DJ's cue point is where the new track starts
+        a.force = Some(Force { recipe: Some("blend"), bars: Some(16), from_bar: Some(33) });
+        assert!(matches!(pick(&a).choice, Choice::Recipe { recipe: "blend", bars: 16, from_bar: Some(33), .. }));
+        // only a cue: the rules pick the technique, the cue still holds
+        a.force = Some(Force { recipe: None, bars: None, from_bar: Some(41) });
+        assert!(matches!(pick(&a).choice, Choice::Recipe { from_bar: Some(41), .. }), "{:?}", pick(&a).choice);
     }
 
     #[test]

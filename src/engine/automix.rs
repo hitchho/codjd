@@ -352,10 +352,64 @@ impl Engine {
         Ok(format!("ok {label} · {at}\n{text}"))
     }
 
+    /// `DjTransition`: the DJ picks the technique (a recipe name, or "auto" for codj's choice), its
+    /// length (0: the recipe's own) and where it starts: the next 8 bar line, or with `at_outro`
+    /// the outgoing track's outro. The new track starts where the DJ cued it (its deck moved
+    /// off the start), else at its hot spot.
+    pub fn dj_transition(&mut self, from: usize, to: usize, recipe: &str, bars: u32, at_outro: bool) -> Result<String, String> {
+        super::check_deck(from)?;
+        super::check_deck(to)?;
+        let recipe: Option<&'static str> = match recipe {
+            "" | "auto" => None,
+            name => Some(crate::sets::recipes::find(name).ok_or_else(|| format!("no technique \"{name}\": {}", crate::sets::recipes::names()))?.name),
+        };
+        let names = ["A", "B"];
+        let path = self.loaded(to)?.path.clone().ok_or("nothing loaded")?;
+        self.loaded(from).map_err(|e| format!("deck {}: {e}", names[from]))?;
+        let states = self.audio.deck_states();
+        if !states[from].playing {
+            return Err(format!("deck {} is not playing", names[from]));
+        }
+        if states[to].playing {
+            return Err(format!("deck {} is playing: pause it first", names[to]));
+        }
+        if self.setrt.is_armed() {
+            return Err("a set's mix is armed: SetDisarm first".into());
+        }
+        // the DJ's cue: the incoming deck moved off its start (jog, a mark, a cue) is where it plays from
+        let cued = states[to].position;
+        let from_bar = self.effective_grid(&path).filter(|_| cued > 0.5).map(|g| (bar_at(&g, cued).floor() as u32).max(1));
+        if let Some(m) = self.amix.mix.take() {
+            self.with_automix(|rt, h| rt.disarm(h));
+            if m.player_driven {
+                info!("DjTransition replaces the player's transition");
+            }
+        }
+        let force = pick::Force { recipe, bars: (bars > 0).then_some(bars), from_bar };
+        let (label, start_bar, text) = self.automix_forced(from, to, &path, at_outro, None, Some(force))?;
+        let at = start_bar.map_or("now".to_string(), |b| format!("bar {b}"));
+        let cue = from_bar.map_or(String::new(), |b| format!(" · from its bar {b}"));
+        Ok(format!("ok {label} · {at}{cue}\n{text}"))
+    }
+
+    /// Drops a planned transition that has not started yet (`SetDisarm`, F8 in codj)
+    pub(crate) fn automix_cancel_pending(&mut self) {
+        if self.amix.mix.as_ref().is_some_and(|m| !m.started) {
+            self.amix.mix = None;
+            self.with_automix(|rt, h| rt.disarm(h));
+            info!("the planned transition was cancelled");
+        }
+    }
+
     /// The primitive: plans the mix from `from` into `to_path` (loaded on `to` here), and arms it.
     /// `at_end`: the player's place near the end of the track, else the next phrase. Returns the
     /// label, the start bar (None for a crossfade in seconds) and the set text.
     fn automix(&mut self, from: usize, to: usize, to_path: &Path, at_end: bool, pick: Option<Pick>) -> Result<(String, Option<u32>, String), String> {
+        self.automix_forced(from, to, to_path, at_end, pick, None)
+    }
+
+    /// [`Self::automix`] with the DJ's own choice of technique, length or cue point
+    fn automix_forced(&mut self, from: usize, to: usize, to_path: &Path, at_end: bool, pick: Option<Pick>, force: Option<pick::Force>) -> Result<(String, Option<u32>, String), String> {
         if to != 1 - from {
             return Err("automix goes between deck A and B".into());
         }
@@ -364,7 +418,7 @@ impl Engine {
         let st = self.audio.deck_states()[from];
         let length = self.track_length(from);
         let from_path = self.meta[from].path.clone().ok_or("nothing loaded")?;
-        let picked = self.pick_for(from, &from_path, to_path, out.as_ref(), inn.as_ref(), length, !at_end, true);
+        let picked = self.pick_for(from, &from_path, to_path, out.as_ref(), inn.as_ref(), length, !at_end, true, force);
         let mut choice = picked.choice;
         let mut armed = None;
         if let (Choice::Recipe { synced, .. }, Some(place), Some(og), Some(ig)) = (choice, picked.place, &out, &inn) {
@@ -551,7 +605,7 @@ impl Engine {
             return None;
         }
         let inn = self.effective_grid(&path);
-        let picked = self.pick_for(from, &from_path, &path, out.as_ref(), inn.as_ref(), length, false, false);
+        let picked = self.pick_for(from, &from_path, &path, out.as_ref(), inn.as_ref(), length, false, false, None);
         let (choice, start_s) = match picked.place {
             Some(p) => (picked.choice, p.start_s),
             None => (Choice::Fade { secs: FADE_S }, (length - FADE_S - 1.).max(0.)),
@@ -562,7 +616,8 @@ impl Engine {
     /// The transition from deck `from` (its track at `from_path`, `length` s long) into
     /// `to_path`; `manual`: `DjAutoMix` (the next phrase line), else the player's place
     #[allow(clippy::too_many_arguments)]
-    fn pick_for(&mut self, from: usize, from_path: &Path, to_path: &Path, out: Option<&Grid>, inn: Option<&Grid>, length: f64, manual: bool, planning: bool) -> pick::Pick {
+    #[allow(clippy::too_many_arguments)]
+    fn pick_for(&mut self, from: usize, from_path: &Path, to_path: &Path, out: Option<&Grid>, inn: Option<&Grid>, length: f64, manual: bool, planning: bool, force: Option<pick::Force>) -> pick::Pick {
         // planning (not a preview) looks again at a track it has no sections of: a miss cached
         // by a preview must not decide the mix
         let (so, si) = (self.shape(from_path, planning), self.shape(to_path, planning));
@@ -575,6 +630,7 @@ impl Engine {
             recent: &self.amix.recent,
             pos_s: st.position,
             now_s: manual.then_some(st.position),
+            force,
         };
         let picked = pick::pick(&ask);
         tracing::trace!(

@@ -1130,6 +1130,8 @@ impl Engine {
 
     pub fn set_disarm(&mut self) {
         self.with_runtime(|rt, h| rt.disarm(h));
+        // also a planned automix or DJ transition that has not started (a running one plays out)
+        self.automix_cancel_pending();
     }
 
     pub fn set_auto(&mut self, on: bool) {
