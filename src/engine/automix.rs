@@ -7,11 +7,14 @@
 //! user's set is never touched. When the incoming deck starts, the player moves to it: the list
 //! advances and `MusicPlayed` goes out.
 //!
-//! The recipe ("sounds good"): both tracks with a steady grid and tempos within 6 %: `blend`, 32
-//! bars, synced; within 12 %: `filter-blend`, 16 bars, synced; further apart: an 8 bar
-//! `filter-blend` with the new track unsynced. A track without a steady grid gets a crossfade in
-//! seconds, driven from the engine's tick (no grid is made up). A mix starts about 32 bars before
-//! the outgoing track's end, on its phrase line (bar 1, 17, 33 ... from the first downbeat).
+//! The recipe ("sounds good") is chosen from the music (`pick`): tempos further than 12 % apart
+//! get an 8 bar `filter-blend` with the new track unsynced, a track without a steady grid a
+//! crossfade in seconds, driven from the engine's tick (no grid is made up). Otherwise the two
+//! tracks' sections, energy and keys pick the recipe (a drop swap, `bassswap`, `blend`,
+//! `echo-out`, `loop-roll`, `brake`, `filter-blend`, `eq-swap`), with a variety rule over the
+//! last few transitions. A mix starts on the outgoing track's outro (on a phrase line) when it
+//! has one, else about 32 bars before its end, on its phrase line (bar 1, 17, 33 ... from the
+//! first downbeat).
 //!
 //! Automix only replaces decks the player or automix loaded, never one loaded in DJ mode, and does
 //! nothing while a set is in use.
@@ -28,8 +31,11 @@ use super::{Engine, Event, Pick, Transport};
 use crate::{
     analysis::Grid,
     audio::{sync_plan, Mode, DECKS},
-    sets::{recipes, runtime::Runtime, Env, LibTrack},
+    sets::{runtime::Runtime, Env, LibTrack},
 };
+
+mod pick;
+pub use pick::{Part, Shape};
 
 /// The player starts planning (loads the next track, arms the mix) this long before the mix
 const LOOKAHEAD_S: f64 = 20.;
@@ -62,22 +68,40 @@ pub enum Owner {
     Dj,
 }
 
+/// How long a shape (sections, key) of a track is kept before it is looked at again; one that
+/// is not known yet (the analysis is running) is looked at again sooner
+const SHAPE_KEEP_S: u64 = 300;
+const SHAPE_RETRY_S: u64 = 20;
+
 /// What kind of transition two tracks get
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Choice {
-    /// a recipe on the outgoing track's beat grid
-    Recipe { recipe: &'static str, bars: u32, synced: bool },
+    /// a recipe on the outgoing track's beat grid; `from_bar`: the new track starts at that bar
+    /// of its own grid (its drop: a drop swap) instead of its first downbeat
+    Recipe { recipe: &'static str, bars: u32, synced: bool, from_bar: Option<u32> },
     /// no steady grid on one side: a crossfade in seconds
     Fade { secs: f64 },
 }
 
 impl Choice {
-    /// "blend · 32 bars", "crossfade · 8 bars" (unsynced), "crossfade · 8 s"
+    /// "blend · 32 bars", "drop-swap cut · 1 bar", "crossfade · 8 bars" (unsynced),
+    /// "crossfade · 8 s"
     pub fn label(&self) -> String {
+        let bars = |n: u32| if n == 1 { "1 bar".to_string() } else { format!("{n} bars") };
         match *self {
-            Choice::Recipe { recipe, bars, synced: true } => format!("{recipe} · {bars} bars"),
-            Choice::Recipe { bars, synced: false, .. } => format!("crossfade · {bars} bars"),
+            Choice::Recipe { recipe, bars: n, synced: true, from_bar: Some(_) } => format!("drop-swap {recipe} · {}", bars(n)),
+            Choice::Recipe { recipe, bars: n, synced: true, .. } => format!("{recipe} · {}", bars(n)),
+            Choice::Recipe { bars: n, synced: false, .. } => format!("crossfade · {}", bars(n)),
             Choice::Fade { secs } => format!("crossfade · {secs:.0} s"),
+        }
+    }
+
+    /// What the variety rule counts: the recipe, `drop-swap` or `crossfade`
+    pub fn style(&self) -> &'static str {
+        match *self {
+            Choice::Recipe { from_bar: Some(_), .. } => "drop-swap",
+            Choice::Recipe { recipe, synced: true, .. } => recipe,
+            _ => "crossfade",
         }
     }
 }
@@ -94,9 +118,9 @@ pub fn choose(out_tempo: f64, out: Option<&Grid>, inn: Option<&Grid>) -> Choice 
         return Choice::Fade { secs: FADE_S };
     };
     match sync_plan(out_tempo, i.bpm).map(|p| (p.rate - 1.).abs()) {
-        Some(gap) if gap <= BLEND_GAP + 1e-9 => Choice::Recipe { recipe: "blend", bars: 32, synced: true },
-        Some(gap) if gap <= FILTER_GAP + 1e-9 => Choice::Recipe { recipe: "filter-blend", bars: 16, synced: true },
-        _ => Choice::Recipe { recipe: "filter-blend", bars: UNSYNCED_BARS, synced: false },
+        Some(gap) if gap <= BLEND_GAP + 1e-9 => Choice::Recipe { recipe: "blend", bars: 32, synced: true, from_bar: None },
+        Some(gap) if gap <= FILTER_GAP + 1e-9 => Choice::Recipe { recipe: "filter-blend", bars: 16, synced: true, from_bar: None },
+        _ => Choice::Recipe { recipe: "filter-blend", bars: UNSYNCED_BARS, synced: false, from_bar: None },
     }
 }
 
@@ -154,9 +178,9 @@ fn quote(path: &Path) -> String {
 
 /// The mix as set text: what runs, and what a user could save into a set
 pub fn set_text(a: &Path, b: &Path, place: &Place, choice: &Choice) -> String {
-    let (recipe, synced) = match *choice {
-        Choice::Recipe { recipe, synced, .. } => (recipe, synced),
-        Choice::Fade { .. } => ("filter-blend", false),
+    let (recipe, synced, from_bar) = match *choice {
+        Choice::Recipe { recipe, synced, from_bar, .. } => (recipe, synced, from_bar),
+        Choice::Fade { .. } => ("filter-blend", false, None),
     };
     let mut t = format!(
         "# automix: {}\nset \"automix\"\ntrack a {}\ntrack b {}\n\nmix a -> b at bar {} recipe {recipe} over {} bars\n",
@@ -166,8 +190,11 @@ pub fn set_text(a: &Path, b: &Path, place: &Place, choice: &Choice) -> String {
         place.start_bar,
         place.bars,
     );
-    if !synced {
-        t.push_str("  b play unsynced\n");
+    match (from_bar, synced) {
+        (Some(bar), true) => t.push_str(&format!("  b play from bar {bar}\n")),
+        (Some(bar), false) => t.push_str(&format!("  b play from bar {bar} unsynced\n")),
+        (None, false) => t.push_str("  b play unsynced\n"),
+        (None, true) => {}
     }
     t
 }
@@ -219,11 +246,24 @@ pub(super) struct State {
     pub glide: [bool; DECKS],
     /// decks a mix moved the controls of: the player resets them before its next track
     touched: [bool; DECKS],
+    /// the styles of the last transitions that started (`Choice::style`), the newest last
+    recent: Vec<&'static str>,
+    /// the tracks' shapes as last looked at
+    shapes: Vec<(PathBuf, Instant, Arc<Shape>)>,
 }
 
 impl State {
     pub fn new(on: bool) -> Self {
-        Self { on, rt: Runtime::default(), mix: None, failed_gen: 0, glide: [false; DECKS], touched: [false; DECKS] }
+        Self {
+            on,
+            rt: Runtime::default(),
+            mix: None,
+            failed_gen: 0,
+            glide: [false; DECKS],
+            touched: [false; DECKS],
+            recent: Vec::new(),
+            shapes: Vec::new(),
+        }
     }
 }
 
@@ -321,38 +361,37 @@ impl Engine {
         let out = self.meta[from].grid.clone().or_else(|| self.gridded(from).ok());
         let inn = self.effective_grid(to_path);
         let st = self.audio.deck_states()[from];
-        let tempo = out.as_ref().map_or(0., |g| g.bpm * st.rate);
         let length = self.track_length(from);
-        let mut choice = choose(tempo, out.as_ref(), inn.as_ref());
         let from_path = self.meta[from].path.clone().ok_or("nothing loaded")?;
+        let picked = self.pick_for(from, &from_path, to_path, out.as_ref(), inn.as_ref(), length, !at_end);
+        let mut choice = picked.choice;
         let mut armed = None;
-        while let (Choice::Recipe { recipe, bars, synced }, Some(og), Some(ig)) = (choice, &out, &inn) {
-            let min = recipes::find(recipe).map_or(1, |r| r.min_bars);
-            let lead = if synced { LEAD_BARS } else { bars };
-            let place = if at_end {
-                place_at_end(og, length, lead, bars, min)
-            } else {
-                place_next(og, length, st.position, MANUAL_PHRASE_BARS, bars, min)
-            };
-            let Some(place) = place else {
-                // the track is too short for the recipe
-                choice = Choice::Fade { secs: FADE_S };
-                break;
-            };
+        if let (Choice::Recipe { synced, .. }, Some(place), Some(og), Some(ig)) = (choice, picked.place, &out, &inn) {
             let text = set_text(&from_path, to_path, &place, &choice);
             match self.arm_text(&text, &from_path, og, to_path, ig) {
-                Ok(()) => {
-                    armed = Some((place, text));
-                    break;
-                }
+                Ok(()) => armed = Some((place, text)),
                 Err(e) if synced => {
-                    // sync refused (sync_range): the same place, unsynced
+                    // sync refused (sync_range): unsynced, where the unsynced crossfade goes
                     warn!(error = %e, "automix: synced mix refused, crossfading instead");
-                    choice = Choice::Recipe { recipe: "filter-blend", bars: UNSYNCED_BARS, synced: false };
+                    choice = Choice::Recipe { recipe: "filter-blend", bars: UNSYNCED_BARS, synced: false, from_bar: None };
+                    let min = UNSYNCED_BARS;
+                    let place = if at_end {
+                        place_at_end(og, length, UNSYNCED_BARS, UNSYNCED_BARS, min)
+                    } else {
+                        place_next(og, length, st.position, MANUAL_PHRASE_BARS, UNSYNCED_BARS, min)
+                    };
+                    if let Some(place) = place {
+                        let text = set_text(&from_path, to_path, &place, &choice);
+                        self.arm_text(&text, &from_path, og, to_path, ig)?;
+                        armed = Some((place, text));
+                    }
                 }
                 Err(e) => return Err(e),
             }
+        } else if picked.place.is_none() {
+            choice = Choice::Fade { secs: FADE_S };
         }
+        info!(why = picked.why, what = %choice.label(), "automix chose");
         let (start_s, start_bar, text) = match armed {
             Some((place, text)) => (place.start_s, Some(place.start_bar), text),
             None => {
@@ -511,17 +550,65 @@ impl Engine {
             return None;
         }
         let inn = self.effective_grid(&path);
-        let rate = self.audio.deck_states()[from].rate;
-        let choice = choose(out.as_ref().map_or(0., |g| g.bpm * rate), out.as_ref(), inn.as_ref());
-        let placed = match (choice, &out) {
-            (Choice::Recipe { recipe, bars, synced }, Some(g)) => {
-                let min = recipes::find(recipe).map_or(1, |r| r.min_bars);
-                place_at_end(g, length, if synced { LEAD_BARS } else { bars }, bars, min).map(|p| (choice, p.start_s))
-            }
-            _ => None,
+        let picked = self.pick_for(from, &from_path, &path, out.as_ref(), inn.as_ref(), length, false);
+        let (choice, start_s) = match picked.place {
+            Some(p) => (picked.choice, p.start_s),
+            None => (Choice::Fade { secs: FADE_S }, (length - FADE_S - 1.).max(0.)),
         };
-        let (choice, start_s) = placed.unwrap_or((Choice::Fade { secs: FADE_S }, (length - FADE_S - 1.).max(0.)));
         Some(Preview { pick, path, choice, start_s })
+    }
+
+    /// The transition from deck `from` (its track at `from_path`, `length` s long) into
+    /// `to_path`; `manual`: `DjAutoMix` (the next phrase line), else the player's place
+    #[allow(clippy::too_many_arguments)]
+    fn pick_for(&mut self, from: usize, from_path: &Path, to_path: &Path, out: Option<&Grid>, inn: Option<&Grid>, length: f64, manual: bool) -> pick::Pick {
+        let (so, si) = (self.shape(from_path), self.shape(to_path));
+        let st = self.audio.deck_states()[from];
+        let ask = pick::Ask {
+            out_tempo: out.map_or(0., |g| g.bpm * st.rate),
+            out: pick::Side { grid: out, shape: &so },
+            inn: pick::Side { grid: inn, shape: &si },
+            length_s: length,
+            recent: &self.amix.recent,
+            pos_s: st.position,
+            now_s: manual.then_some(st.position),
+        };
+        pick::pick(&ask)
+    }
+
+    /// A track's sections and key, from the track model (its sheet and the measured sections),
+    /// kept a while: `preview` asks about ten times a second
+    fn shape(&mut self, path: &Path) -> Arc<Shape> {
+        let fresh = |t: &Instant, s: &Shape| {
+            let keep = if s.parts.is_empty() { SHAPE_RETRY_S } else { SHAPE_KEEP_S };
+            t.elapsed().as_secs() < keep
+        };
+        if let Some((_, t, s)) = self.amix.shapes.iter().find(|(p, _, _)| p == path) {
+            if fresh(t, s) {
+                return Arc::clone(s);
+            }
+        }
+        let shape = Arc::new(self.look_at(path));
+        self.amix.shapes.retain(|(p, _, _)| p != path);
+        // the two decks' tracks and the next one are all it needs
+        if self.amix.shapes.len() >= 4 {
+            self.amix.shapes.remove(0);
+        }
+        self.amix.shapes.push((path.to_path_buf(), Instant::now(), Arc::clone(&shape)));
+        shape
+    }
+
+    fn look_at(&self, path: &Path) -> Shape {
+        let analyzed_key = || self.analyzer.as_ref().and_then(|a| a.features(path)).and_then(|f| f.key().map(|k| k.camelot.clone()));
+        let Some(view) = self.tracks.as_ref().and_then(|t| t.known_view_of_path(path)) else {
+            return Shape { parts: vec![], key: analyzed_key() };
+        };
+        let parts = view
+            .sections
+            .iter()
+            .map(|s| Part { kind: s.kind, start_s: s.start.seconds, end_s: s.end_s, energy: s.energy, confidence: s.confidence })
+            .collect();
+        Shape { parts, key: view.key.map(|k| k.value.camelot).or_else(analyzed_key) }
     }
 
     /// About ten times a second, after the set runtime's tick
@@ -638,6 +725,12 @@ impl Engine {
     fn automix_started(&mut self) {
         let Some(m) = &mut self.amix.mix else { return };
         m.started = true;
+        let style = m.choice.style();
+        let recent = &mut self.amix.recent;
+        recent.push(style);
+        if recent.len() > pick::RECENT {
+            recent.remove(0);
+        }
         let (from, to, pick) = (m.from, m.to, m.pick.take());
         match pick {
             Some(pick) if self.player_deck == from && self.transport == Transport::Playing => {
@@ -703,13 +796,24 @@ mod tests {
     }
 
     #[test]
+    fn labels_say_the_recipe_and_its_length() {
+        let r = |recipe, bars, from_bar| Choice::Recipe { recipe, bars, synced: true, from_bar };
+        assert_eq!(r("loop-roll", 8, None).label(), "loop-roll · 8 bars");
+        assert_eq!(r("cut", 1, None).label(), "cut · 1 bar");
+        assert_eq!(r("cut", 1, Some(33)).label(), "drop-swap cut · 1 bar");
+        assert_eq!(r("cut", 1, Some(33)).style(), "drop-swap");
+        assert_eq!(r("brake", 2, None).style(), "brake");
+        assert_eq!(Choice::Fade { secs: 8. }.style(), "crossfade");
+    }
+
+    #[test]
     fn close_tempos_blend_long_and_synced() {
         let a = g(124., 0., 0);
-        assert_eq!(choose(124., Some(&a), Some(&g(128., 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true });
+        assert_eq!(choose(124., Some(&a), Some(&g(128., 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true, from_bar: None });
         // the gap is what sync would change the incoming deck by, here 6 % exactly
-        assert_eq!(choose(106., Some(&a), Some(&g(100., 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true });
+        assert_eq!(choose(106., Some(&a), Some(&g(100., 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true, from_bar: None });
         // half/double time is close
-        assert_eq!(choose(128., Some(&a), Some(&g(64.5, 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true });
+        assert_eq!(choose(128., Some(&a), Some(&g(64.5, 0., 0))), Choice::Recipe { recipe: "blend", bars: 32, synced: true, from_bar: None });
         // the outgoing deck's tempo is what counts, not its grid's
         assert_eq!(choose(124. * 1.1, Some(&a), Some(&g(124., 0., 0))).label(), "filter-blend · 16 bars");
     }
@@ -717,8 +821,8 @@ mod tests {
     #[test]
     fn further_apart_filter_blend_then_unsynced() {
         let a = g(120., 0., 0);
-        assert_eq!(choose(120., Some(&a), Some(&g(130., 0., 0))), Choice::Recipe { recipe: "filter-blend", bars: 16, synced: true });
-        assert_eq!(choose(120., Some(&a), Some(&g(140., 0., 0))), Choice::Recipe { recipe: "filter-blend", bars: 8, synced: false });
+        assert_eq!(choose(120., Some(&a), Some(&g(130., 0., 0))), Choice::Recipe { recipe: "filter-blend", bars: 16, synced: true, from_bar: None });
+        assert_eq!(choose(120., Some(&a), Some(&g(140., 0., 0))), Choice::Recipe { recipe: "filter-blend", bars: 8, synced: false, from_bar: None });
         assert_eq!(choose(120., Some(&a), Some(&g(140., 0., 0))).label(), "crossfade · 8 bars");
     }
 
@@ -786,13 +890,22 @@ mod tests {
         let mut env = FakeEnv { root: "/music".into(), ..Default::default() };
         let a = env.add("X", "Out", "/music/x/Out \"1\".flac", Some(g(124., 0.2, 1)));
         let b = env.add("Y", "In", "/music/In.flac", Some(g(126., 0.1, 0)));
-        let place = Place { start_bar: 161, bars: 32, start_s: 0. };
+        let recipe = |recipe, bars| Choice::Recipe { recipe, bars, synced: true, from_bar: None };
         for choice in [
-            Choice::Recipe { recipe: "blend", bars: 32, synced: true },
-            Choice::Recipe { recipe: "filter-blend", bars: 16, synced: true },
-            Choice::Recipe { recipe: "filter-blend", bars: 8, synced: false },
+            recipe("blend", 32),
+            recipe("filter-blend", 16),
+            Choice::Recipe { recipe: "filter-blend", bars: 8, synced: false, from_bar: None },
+            recipe("bassswap", 16),
+            recipe("eq-swap", 24),
+            recipe("echo-out", 8),
+            recipe("loop-roll", 8),
+            recipe("brake", 2),
+            Choice::Recipe { recipe: "cut", bars: 1, synced: true, from_bar: Some(33) },
         ] {
-            let place = Place { bars: match choice { Choice::Recipe { bars, .. } => bars, _ => 0 }, ..place };
+            let Choice::Recipe { recipe: name, bars, from_bar, .. } = choice else { unreachable!() };
+            // a brake lands on the phrase line: it starts two bars before it
+            let start_bar = if name == "brake" { 159 } else { 161 };
+            let place = Place { start_bar, bars, start_s: 0. };
             let text = set_text(&a, &b, &place, &choice);
             let l = crate::sets::load(Path::new("automix.codj"), &text, &env);
             assert!(l.diags.is_empty(), "{text}\n{:?}", l.diags);
@@ -801,13 +914,15 @@ mod tests {
             assert_eq!(c.plans.len(), 1);
             let plan = &c.plans[0];
             // bar 161 on a grid whose first downbeat is grid beat 1
-            assert_eq!(plan.start_beat, 1. + 160. * 4.);
+            assert_eq!(plan.start_beat, 1. + (start_bar - 1) as f64 * 4., "{text}");
             assert_eq!(plan.length_beats, place.bars as f64 * 4.);
-            let synced = plan.items.iter().find_map(|i| match i {
-                crate::sets::compile::PlanItem::Play { synced, .. } => Some(*synced),
+            let play = plan.items.iter().find_map(|i| match i {
+                crate::sets::compile::PlanItem::Play { synced, from_beat, .. } => Some((*synced, *from_beat)),
                 _ => None,
             });
-            assert_eq!(synced, Some(matches!(choice, Choice::Recipe { synced: true, .. })), "{text}");
+            assert_eq!(play.map(|p| p.0), Some(matches!(choice, Choice::Recipe { synced: true, .. })), "{text}");
+            // the drop swap starts the new track at its drop: bar 33 of its grid (downbeat 0)
+            assert_eq!(play.map(|p| p.1), Some(from_bar.map_or(0., |b| (b - 1) as f64 * 4.)), "{text}");
         }
     }
 }

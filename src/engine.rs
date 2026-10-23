@@ -193,6 +193,8 @@ pub struct Engine {
     /// `[record] dir`, where `RecordAudio` writes
     record_dir: Option<std::path::PathBuf>,
     analyzer: Option<Arc<Analyzer>>,
+    /// the track model (sections, sheets): what automix chooses its transitions from
+    tracks: Option<Arc<crate::tracks::Tracks>>,
     meta: [DeckMeta; crate::audio::DECKS],
     knobs: [DeckKnobs; crate::audio::DECKS],
     /// what the audio thread has in each patch slot (`rt_patch_*`)
@@ -258,6 +260,7 @@ impl Engine {
             audio,
             record_dir: None,
             analyzer: None,
+            tracks: None,
             meta: Default::default(),
             knobs: Default::default(),
             patch_rt: Default::default(),
@@ -656,6 +659,10 @@ impl Engine {
     }
 
     /// The analyzer, to read grids, keys and gains from; set once it has started
+    pub fn set_tracks(&mut self, tracks: Arc<crate::tracks::Tracks>) {
+        self.tracks = Some(tracks);
+    }
+
     pub fn set_analyzer(&mut self, analyzer: Arc<Analyzer>) {
         self.analyzer = Some(analyzer);
         for deck in 0..crate::audio::DECKS {
