@@ -525,7 +525,8 @@ impl Engine {
 
     // ---- decks (DJ mode) ----
 
-    /// Puts `path` on `deck`, paused at the start. Deck A is also the player's deck.
+    /// Puts `path` on `deck`, paused at the start. The player's deck (A, or B after an automix)
+    /// stops being the player's.
     pub fn deck_load(&mut self, deck: usize, path: &std::path::Path) -> Result<(), String> {
         self.deck_load_with(deck, path, 0., None, None)
     }
@@ -964,7 +965,11 @@ impl Engine {
             self.audio.cancel_control(deck, c);
         }
         match control {
-            "rate" => self.audio.set_rate(deck, value),
+            "rate" => {
+                // a hand on the pitch ends automix's glide back to the track's tempo
+                self.amix.glide[deck] = false;
+                self.audio.set_rate(deck, value)
+            }
             "gain" => self.audio.set_gain(deck, v),
             "low" | "mid" | "high" => {
                 let band = ["low", "mid", "high"].iter().position(|b| *b == control).unwrap_or(0);

@@ -216,7 +216,7 @@ pub(super) struct State {
     /// the player generation a plan failed for: not tried again for that track
     failed_gen: u64,
     /// decks whose tempo glides back to the track's own after a mix
-    glide: [bool; DECKS],
+    pub glide: [bool; DECKS],
     /// decks a mix moved the controls of: the player resets them before its next track
     touched: [bool; DECKS],
 }
@@ -593,7 +593,8 @@ impl Engine {
         match m.fade_from {
             None => {
                 let st = self.audio.deck_states()[from];
-                if st.position < start_s && st.playing {
+                // the old track must be playing to fade from it (a paused player waits)
+                if !st.playing || st.position < start_s {
                     return;
                 }
                 if self.owner[to] == Owner::Dj || self.meta[to].path.as_deref() != Some(m.to_path.as_path()) {
