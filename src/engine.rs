@@ -58,7 +58,10 @@ pub enum Event {
     PlaylistCreated(String),
 }
 
+mod automix;
 mod edits;
+
+pub use automix::Owner;
 
 type Job = Box<dyn FnOnce(&mut Engine) + Send>;
 
@@ -127,8 +130,15 @@ impl Codjd {
     }
 }
 
-/// Normal playback uses deck A
-const PLAYER_DECK: usize = 0;
+/// What `play_next` would do: the track, and how much of the queue it uses up
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Pick {
+    pub index: u32,
+    /// queue entries taken off the front (stale ones included)
+    pub pop: usize,
+    /// the track comes from the queue (the list continues after the queue)
+    pub queued: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
@@ -193,6 +203,16 @@ pub struct Engine {
     gridfix: crate::gridfix::GridFixes,
     /// largest tempo change sync may make, as a fraction (0.16 = ±16 %, the usual pitch range)
     sync_range: f64,
+    /// the deck normal playback uses: A, until automix hands the player over to the other deck
+    player_deck: usize,
+    /// who loaded each deck: automix only replaces what the player or automix loaded
+    owner: [Owner; crate::audio::DECKS],
+    /// the generation of each deck's last load
+    deck_gen: [u64; crate::audio::DECKS],
+    /// who a load through the set runtime's host counts as (automix while its runtime runs)
+    loading_as: Owner,
+    /// automix: the player's beat-matched transitions and `DjAutoMix`, see `engine/automix.rs`
+    amix: automix::State,
     /// the player's state; the audio thread's own view lags by a callback
     transport: Transport,
     /// tags the playing track, so a late end event from a replaced one is ignored
@@ -224,14 +244,11 @@ impl Engine {
     fn new(config: Config, handle: Codjd) -> std::io::Result<Self> {
         let events = handle.clone();
         let mut audio = Audio::start(&config.audio, move |event| match event {
-            AudioEvent::Ended { deck, generation } if deck == PLAYER_DECK => {
-                events.tell(move |e| e.track_ended(generation))
-            }
-            AudioEvent::Ended { .. } => {}
+            AudioEvent::Ended { deck, generation } => events.tell(move |e| e.track_ended(deck, generation)),
         })
         .map_err(|e| std::io::Error::other(format!("can't open the audio output: {e}")))?;
         let volume = config.volume.clamp(0., 1.);
-        apply_volume(&mut audio, volume);
+        apply_volume(&mut audio, 0, volume);
         let master = if audio.mode() == Mode::Internal { volume as f64 } else { 1. };
         audio.set_patch_external_out(match config.patches.external_out {
             crate::patch::ExternalOut::A => 0,
@@ -248,6 +265,11 @@ impl Engine {
             hotcues: HotcueStore::open_default(),
             gridfix: crate::gridfix::GridFixes::open_default(),
             sync_range: 0.16,
+            player_deck: 0,
+            owner: Default::default(),
+            deck_gen: [0; crate::audio::DECKS],
+            loading_as: Owner::Dj,
+            amix: automix::State::new(config.player.automix),
             transport: Transport::Stopped,
             generation: 0,
             volume,
@@ -285,15 +307,23 @@ impl Engine {
             return;
         };
         let path = <&std::path::Path>::from(&music.path).to_path_buf();
-        match self.audio.load(PLAYER_DECK, &path, 0., true) {
-            Ok(generation) => self.generation = generation,
+        // a track picked by hand (or the list moving on by itself) ends a transition in progress
+        self.automix_abort();
+        let deck = self.player_deck;
+        self.automix_untouch(deck);
+        match self.audio.load(deck, &path, 0., true) {
+            Ok(generation) => {
+                self.generation = generation;
+                self.deck_gen[deck] = generation;
+            }
             Err(e) => {
                 error!(path = %path.display(), error = %e, "can't play");
                 return;
             }
         }
         info!("playing {}", path.display());
-        self.attach(PLAYER_DECK, &path, false);
+        self.owner[deck] = Owner::Player;
+        self.attach(deck, &path, self.amix.on);
         self.playlist.playing_index = index;
         self.transport = Transport::Playing;
         self.emit(Event::MusicPlayed);
@@ -313,35 +343,56 @@ impl Engine {
 
     /// The queue first, then the list continues where it was before the queue
     pub fn play_next(&mut self) {
-        if let Some(index) = self.pop_queued_index() {
-            self.resume_after_queue.get_or_insert(self.playlist.playing_index);
-            self.start(index);
-            return;
+        let pick = self.peek_next();
+        self.take_next(pick);
+        self.start(pick.index);
+    }
+
+    /// What [`Self::play_next`] would play, without playing it: the first queued track still in
+    /// the playlist, else the track after the one the list continues from
+    pub(crate) fn peek_next(&self) -> Pick {
+        for (i, music) in self.queue.iter().enumerate() {
+            if let Some(index) = self.playlist_index_of(music) {
+                return Pick { index, pop: i + 1, queued: true };
+            }
         }
-        if let Some(resume) = self.resume_after_queue.take() {
+        let base = self.resume_after_queue.unwrap_or(self.playlist.playing_index);
+        Pick { index: self.playlist.index_after(base), pop: self.queue.len(), queued: false }
+    }
+
+    /// The queue and list bookkeeping of moving on to `pick` (from [`Self::peek_next`])
+    pub(crate) fn take_next(&mut self, pick: Pick) {
+        for _ in 0..pick.pop {
+            self.queue.pop_front();
+        }
+        if pick.queued {
+            self.resume_after_queue.get_or_insert(self.playlist.playing_index);
+        } else if let Some(resume) = self.resume_after_queue.take() {
             self.playlist.playing_index = resume;
         }
-        self.start(self.playlist.next_music_index());
+    }
+
+    /// What plays when the current track ends by itself: `None` stops or (repeat one) plays it
+    /// again
+    pub(crate) fn auto_next(&self) -> Option<Pick> {
+        // queued tracks play even with repeat off / repeat one, and the list continues after
+        let queue_pending = !self.queue.is_empty()
+            || (self.resume_after_queue.is_some() && !matches!(self.playlist.repeat, Repeat::Dont));
+        (queue_pending || matches!(self.playlist.repeat, Repeat::AllMusics)).then(|| self.peek_next())
     }
 
     pub fn play_previous(&mut self) {
         self.start(self.playlist.previous_music_index());
     }
 
-    fn track_ended(&mut self, generation: u64) {
-        if generation != self.generation || self.transport != Transport::Playing {
+    fn track_ended(&mut self, deck: usize, generation: u64) {
+        if deck != self.player_deck || generation != self.generation || self.transport != Transport::Playing {
             return;
         }
-        // queued tracks play even with repeat off / repeat one, and the list continues after
-        let queue_pending = !self.queue.is_empty()
-            || (self.resume_after_queue.is_some() && !matches!(self.playlist.repeat, Repeat::Dont));
-        if queue_pending {
-            return self.play_next();
-        }
-        match self.playlist.repeat {
-            Repeat::SameMusic => self.start(self.playlist.playing_index),
-            Repeat::AllMusics => self.play_next(),
-            Repeat::Dont => self.emit(Event::Ended),
+        match (self.auto_next(), self.playlist.repeat) {
+            (Some(_), _) => self.play_next(),
+            (None, Repeat::SameMusic) => self.start(self.playlist.playing_index),
+            (None, _) => self.emit(Event::Ended),
         }
     }
 
@@ -354,12 +405,13 @@ impl Engine {
                 }
             }
             PlayingStatus::Playing => {
-                self.audio.pause(PLAYER_DECK);
+                self.automix_land();
+                self.audio.pause(self.player_deck);
                 self.transport = Transport::Paused;
                 self.emit(Event::Paused);
             }
             PlayingStatus::Pausing => {
-                self.audio.play(PLAYER_DECK);
+                self.audio.play(self.player_deck);
                 self.transport = Transport::Playing;
                 self.emit(Event::MusicPlayed);
             }
@@ -368,7 +420,8 @@ impl Engine {
 
     pub fn pause(&mut self) {
         if self.transport == Transport::Playing {
-            self.audio.pause(PLAYER_DECK);
+            self.automix_land();
+            self.audio.pause(self.player_deck);
             self.transport = Transport::Paused;
         }
         self.emit(Event::Paused);
@@ -376,21 +429,24 @@ impl Engine {
 
     pub fn resume(&mut self) {
         if self.transport == Transport::Paused {
-            self.audio.play(PLAYER_DECK);
+            self.audio.play(self.player_deck);
             self.transport = Transport::Playing;
         }
         self.emit(Event::Resumed);
     }
 
     pub fn stop(&mut self) {
-        self.audio.pause(PLAYER_DECK);
-        self.audio.seek(PLAYER_DECK, 0.);
+        self.automix_abort();
+        self.audio.pause(self.player_deck);
+        self.audio.seek(self.player_deck, 0.);
         self.transport = Transport::Stopped;
         self.emit(Event::Ended);
     }
 
     pub fn seek(&mut self, seconds: f64) {
-        self.audio.seek(PLAYER_DECK, seconds.max(0.));
+        // a transition timed on the old position is off: it is planned again from the new one
+        self.automix_abort();
+        self.audio.seek(self.player_deck, seconds.max(0.));
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -431,7 +487,7 @@ impl Engine {
     }
 
     pub fn position(&self) -> Duration {
-        Duration::from_secs_f64(self.audio.position(PLAYER_DECK).max(0.))
+        Duration::from_secs_f64(self.audio.position(self.player_deck).max(0.))
     }
 
     pub fn volume(&self) -> f32 {
@@ -469,7 +525,8 @@ impl Engine {
 
     // ---- decks (DJ mode) ----
 
-    /// Puts `path` on `deck`, paused at the start. Deck A is also the player's deck.
+    /// Puts `path` on `deck`, paused at the start. The player's deck (A, or B after an automix)
+    /// stops being the player's.
     pub fn deck_load(&mut self, deck: usize, path: &std::path::Path) -> Result<(), String> {
         self.deck_load_with(deck, path, 0., None, None)
     }
@@ -488,8 +545,10 @@ impl Engine {
         check_deck(deck)?;
         let generation = self.audio.load(deck, path, at.max(0.), false)?;
         self.rec_loaded(deck);
-        if deck == PLAYER_DECK {
-            // the player no longer owns what's on deck A
+        self.deck_gen[deck] = generation;
+        self.owner[deck] = self.loading_as;
+        if deck == self.player_deck && self.loading_as != Owner::Automix {
+            // the player no longer owns what's on its deck
             self.generation = generation;
             self.transport = Transport::Stopped;
         }
@@ -542,6 +601,7 @@ impl Engine {
         self.bind_analysis(deck, dj);
         // a track loaded by hand under an armed mix breaks the mix
         self.with_runtime(|rt, host| rt.deck_replaced(host, deck));
+        self.with_automix(|rt, host| rt.deck_replaced(host, deck));
     }
 
     /// Takes grid, key and (`gain`) suggested gain for the track on `deck` from the analysis
@@ -787,6 +847,7 @@ impl Engine {
         self.meta[deck].grid_locked = false;
         self.bind_analysis(deck, false);
         self.with_runtime(|rt, host| rt.deck_replaced(host, deck));
+        self.with_automix(|rt, host| rt.deck_replaced(host, deck));
         Ok(self.meta[deck].grid.as_ref().map_or(0., |g| g.bpm))
     }
 
@@ -904,7 +965,11 @@ impl Engine {
             self.audio.cancel_control(deck, c);
         }
         match control {
-            "rate" => self.audio.set_rate(deck, value),
+            "rate" => {
+                // a hand on the pitch ends automix's glide back to the track's tempo
+                self.amix.glide[deck] = false;
+                self.audio.set_rate(deck, value)
+            }
             "gain" => self.audio.set_gain(deck, v),
             "low" | "mid" | "high" => {
                 let band = ["low", "mid", "high"].iter().position(|b| *b == control).unwrap_or(0);
@@ -1016,7 +1081,7 @@ impl Engine {
 
     /// The player volume goes to the audio thread, and the mixer knob mirror follows
     fn push_volume(&mut self) {
-        apply_volume(&mut self.audio, self.volume);
+        apply_volume(&mut self.audio, self.player_deck, self.volume);
         self.mixer.master = if self.audio.mode() == Mode::Internal { self.volume as f64 } else { 1. };
     }
 
@@ -1070,6 +1135,7 @@ impl Engine {
     /// Called about ten times a second: follows the armed mix, auto mode, hot reload
     pub fn set_tick(&mut self) {
         self.with_runtime(|rt, h| rt.tick(h));
+        self.automix_tick();
     }
 
     // ---- patch decks (docs/patches.md) ----
@@ -1245,16 +1311,6 @@ impl Engine {
             .map(|i| i as u32)
     }
 
-    /// Takes queued tracks off the front until one is still in the playlist
-    fn pop_queued_index(&mut self) -> Option<u32> {
-        while let Some(music) = self.queue.pop_front() {
-            if let Some(index) = self.playlist_index_of(&music) {
-                return Some(index);
-            }
-        }
-        None
-    }
-
     // ---- library ----
 
     /// Adds a new file in the music folder to the library playlist; false if it was already
@@ -1283,6 +1339,7 @@ impl Engine {
         self.allow_formats = config.allow_formats.clone();
         self.music_dir = PathBuf::from(&config.path);
         self.store = PlaylistStore::new(&config.playlist_save_path);
+        self.set_automix(config.player.automix);
         self.emit(Event::ConfigReloaded);
     }
 
@@ -1303,7 +1360,8 @@ impl Engine {
                 self.playlist.playing_index = 0;
                 self.queue.clear();
                 self.resume_after_queue = None;
-                self.audio.pause(PLAYER_DECK);
+                self.automix_abort();
+                self.audio.pause(self.player_deck);
                 self.transport = Transport::Stopped;
                 self.emit(Event::PlaylistLoaded(name.to_string()));
             }
@@ -1609,11 +1667,11 @@ fn log_err(result: std::io::Result<()>) {
 }
 
 /// The player volume is the master level in internal mode; in external mode there is no master
-/// (the club mixer has it), so it trims deck A
-fn apply_volume(audio: &mut Audio, volume: f32) {
+/// (the club mixer has it), so it trims the player's deck
+fn apply_volume(audio: &mut Audio, player_deck: usize, volume: f32) {
     match audio.mode() {
         Mode::Internal => audio.set_master(volume),
-        Mode::External => audio.set_gain(PLAYER_DECK, volume),
+        Mode::External => audio.set_gain(player_deck, volume),
     }
 }
 

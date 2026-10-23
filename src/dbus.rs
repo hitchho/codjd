@@ -909,6 +909,33 @@ impl Bus {
             .unwrap_or_default()
     }
 
+    // ---- automix (engine/automix.rs) ----
+
+    /// mix from `from` (playing) into the track loaded paused on `to`, on the next 8 bar phrase,
+    /// with the transition automix picks for the two tempos; "ok <what> · bar <n>" and then the
+    /// mix as set text (empty for a crossfade without a grid), or the reason it can't
+    async fn dj_auto_mix(&self, from: u32, to: u32) -> String {
+        match self.codjd.call(move |e| e.dj_automix(from as usize, to as usize)).await {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => e,
+            None => "engine not running".to_string(),
+        }
+    }
+
+    /// the player's beat-matched transitions between tracks on or off (`[player] automix`)
+    async fn automix(&self, on: bool) -> String {
+        reply(self.codjd.call(move |e| {
+            e.set_automix(on);
+            Ok(())
+        }).await)
+    }
+
+    /// (on, next track's title, seconds until the transition starts: 0 while it runs, -1 when
+    /// none is coming, what it will be: "blend · 32 bars")
+    async fn automix_state(&self) -> (bool, String, f64, String) {
+        self.ask(|e| e.automix_state()).await
+    }
+
     // ---- soulseek ----
 
     /// connect to soulseek in the background; poll slsk_state / slsk_status

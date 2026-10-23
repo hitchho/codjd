@@ -138,7 +138,12 @@ impl Playlist {
 
     /// Wraps around to the first track
     pub fn next_music_index(&self) -> u32 {
-        let next = self.playing_index as usize + 1;
+        self.index_after(self.playing_index)
+    }
+
+    /// The track after `index`, the first one after the last
+    pub fn index_after(&self, index: u32) -> u32 {
+        let next = index as usize + 1;
         if next >= self.musics.len() {
             0
         } else {

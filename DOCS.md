@@ -32,6 +32,8 @@ This is the output of `busctl --user introspect net.rotko.Codj /net/rotko/Codj n
 | .TogglePlay           | method   | -                                | (su)                  | -      |
 | .Volume               | method   | d                                | (su)                  | -      |
 | .ToggleMute           | method   | -                                | (su)                  |  -     |
+| .Automix              | method   | b                                | s                     | -      |
+| .AutomixState         | method   | -                                | (bsds)                | -      |
 | .ConfigReloaded       | signal   | -                                | -                     | -      |
 | .Ended                | signal   | -                                | -                     | -      |
 | .MusicPlayed          | signal   | -                                | -                     | -      |
@@ -72,6 +74,8 @@ bellow is a list of the method name and it's description (what it does)
 | Sort                 | Sets `sort` of playlist, takes value between 0 and 2, check table bellow                       |
 | Timer                | Gets current seeker timer of playing music and the total length of that music in secons (float)|
 | TogglePlay           | Toggle the play state of this music player                                                     |
+| Automix              | Beat-matched transitions between tracks on (`true`, the default) or off; replies `ok`. See [docs/dj-api.md](./docs/dj-api.md#automix-d-bus) |
+| AutomixState         | (on, next track's title, seconds until the transition starts: 0 while it runs, -1 when none is coming, what it will be: `blend · 32 bars`) |
 | Volume               | Change voume of the playing music with a value between 0 and 1 inclusively                     |
 | ToggleMute           | toggles the `mute` state on and off                                                            |
 | ConfigReloaded       | Signal that music player config (server) has being reloaded                                    |

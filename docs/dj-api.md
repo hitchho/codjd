@@ -3,7 +3,8 @@
 The contract between codjd's engine and codj's live mode. Both sides implement exactly this; the
 client mirrors the structs and a test on each side pins the D-Bus signatures.
 
-Decks are numbered 0 (A) and 1 (B). Deck A is also the normal player's deck. Every method that
+Decks are numbered 0 (A) and 1 (B). Deck A is also the normal player's deck, until automix
+hands the player over to deck B (see Automix below; it moves back and forth). Every method that
 changes something returns a string: `"ok"` or a short error ("no deck 3", "nothing loaded",
 "no beat grid").
 
@@ -249,6 +250,51 @@ a path whose audio was never hashed is hashed on the call.
 | `SheetSource` | `s id` | `(s text, s hash)` of the sheet; `("", "")` when there is none yet. A path works too |
 | `SheetCheck` | `s text` | `as`: errors of `text` as a sheet, `file:line:col: message`, empty = valid; the I5 message quotes the current grid of the `audio` it names |
 | `SheetWrite` | `s id, s text, s base_hash, s author` | save after checking; like `SetWrite` (`ok <new hash>` or the reason, "sheet changed since you read it" on a stale hash). The text's `audio` line must be `id` |
+
+## Automix (D-Bus)
+
+The player's beat-matched transitions, and the same thing between two decks in DJ mode.
+
+| method | args | does |
+|---|---|---|
+| `DjAutoMix` | `u from, u to` | mixes from `from` (playing) into the track loaded paused on `to`, starting on `from`'s next 8 bar phrase line. Replies `ok <what> · bar <n>` (`ok blend · 32 bars · bar 97`; `· now` for a crossfade in seconds) and then, on the next lines, the mix as set text (`set "automix"`, two `track` lines with absolute paths, `mix a -> b at bar N recipe R over M bars`), which compiles as is if pasted into a set file. Errors: a deck not loaded, `from` not playing, `to` playing, a set's mix armed |
+| `Automix` | `b on` | the player's automix on or off (default on, `[player] automix`; a config reload applies the config's value). Off drops a transition that has not started; one that has plays to its end |
+| `AutomixState` | — | `(b on, s next_title, d seconds_to_mix, s recipe)`: the coming (or running) transition: seconds of playback until it starts (0 while it runs, -1 and empty strings when none is coming), `blend · 32 bars`, `filter-blend · 16 bars`, `crossfade · 8 bars` (unsynced), `crossfade · 8 s` (no grid) |
+
+**What it picks.** The tempo gap is the rate change sync would need (as `DjSync` measures it,
+half/double time counts as close), against the outgoing deck's current tempo:
+
+| both tracks have a steady grid, gap | transition |
+|---|---|
+| up to 6 % | `blend`, 32 bars, synced |
+| up to 12 % | `filter-blend`, 16 bars, synced |
+| more | `filter-blend`, 8 bars, the new track `play unsynced` (a crossfade on the beat clock, no beatmatching) |
+| a track without a grid, or a variable one | a crossfade in seconds (8 s, equal power), driven from the engine's tick: no grid is made up |
+
+If sync refuses the synced kind (a lowered `sync_range`) the same place gets the unsynced one.
+
+**Where.** The player's mix starts 32 bars before the end of the outgoing track (8 for the
+unsynced crossfade), rounded down to its phrase line: bar 1, 17, 33 ... counted from the first
+downbeat. A short track gets a shorter mix (not below the recipe's least bars, else the crossfade
+in seconds). `DjAutoMix` starts at the next 8 bar line at least a beat away.
+
+**The player.** About 20 s before the mix start the engine works out the next track exactly as
+`PlayNext` would (the queue first, then the list; repeat one and repeat off never mix: the track
+plays to its end), loads it paused on the other deck through the DJ load path (its grid and
+auto-gain) and arms the mix on a private set runtime of its own, so `SetState` never shows it.
+When the incoming deck starts, the player moves to that deck: the playing index advances,
+`MusicPlayed` is emitted (codj and MPRIS show the new track) and a late end of the old track is
+ignored. After a synced mix the new track's tempo glides back to its own (0.2 % a second). The
+first track the player starts with automix on gets the auto-gain too, so all tracks are levelled
+alike.
+
+- A track picked by hand, `PlayNext`/`PlayPrevious`, `Stop`, `Seek` or another playlist drops the
+  transition; one that has started lands first (the old deck stops, the new one plays on at full
+  level). A pause during a running transition lands it the same way, so the resume is the new
+  track only. A changed queue, repeat mode or playlist before the start plans again.
+- Ownership: every load is tagged player, automix or DJ (`DjLoad`, a set, MCP). Automix replaces
+  only decks the player or automix loaded, never one loaded by hand, and does nothing while a set
+  is in use (`SetUse`) or armed, or in external mode.
 
 ## MCP tools for sets (client, `codj mcp`)
 
