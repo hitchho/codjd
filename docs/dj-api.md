@@ -299,7 +299,8 @@ resort; when nothing fits, the crossfade in seconds.
 `filter-blend`) may have the new track sing for at most 2 bars over the old one singing, or over
 an energetic or melodic part of it (a section with a low or mid band of 5/9 or more): a vocal
 intro never runs under the old track's drop. A place that breaks this is tried a phrase later or
-earlier (8 or 16 bars, still ahead) and shorter (halves, not below the recipe's least bars),
+earlier (8 or 16 bars, still ahead) and shorter (halves, not below the recipe's least bars nor
+8 bars),
 preferring a place where the new track's first vocal comes after the mix; when none passes the
 next candidate is tried, down to the ones that hand over on one beat (`echo-out`, `loop-roll`,
 the drop swap's `cut`). Unknown vocals: no vocal rule.

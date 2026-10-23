@@ -24,6 +24,8 @@ const MAX_LEAD_BARS: f64 = 16.;
 /// At most this many bars of the mix may have the new track singing over the old one singing,
 /// or over an energetic or melodic part of it
 const MAX_CLASH_BARS: f64 = 2.;
+/// Shortening a mix for the vocals stops at this many bars
+const MIN_SHORTENED_BARS: u32 = 8;
 /// A section with a low or mid band of this or more is energetic or melodic: no one sings over it
 const BUSY: u8 = 5;
 /// Short transitions start this many bars before the end (then down to a phrase line)
@@ -302,7 +304,7 @@ fn clash(ask: &Ask, og: &Grid, ig: &Grid, place: &Place, from_bar: Option<u32>, 
 /// One voice at a time: a recipe where both tracks sound may not have the new track sing for
 /// more than `MAX_CLASH_BARS` over the old one singing or over an energetic or melodic part of
 /// it. The place as it is when it passes; else the same recipe a phrase later or earlier (8 or
-/// 16 bars, still ahead) or shorter (halves, not below its least bars), preferring a place where
+/// 16 bars, still ahead) or shorter (halves, not below its least bars nor 8), preferring a place where
 /// the new track's first vocal comes after the mix; None when nothing passes (the next
 /// candidate then, down to the ones that hand over on one beat). Unknown vocals: as it is.
 fn voices(ask: &Ask, og: &Grid, recipe: &str, place: Place, from_bar: Option<u32>) -> Option<Place> {
@@ -312,10 +314,12 @@ fn voices(ask: &Ask, og: &Grid, recipe: &str, place: Place, from_bar: Option<u32
     }
     let min = recipes::find(recipe).map_or(1, |r| r.min_bars);
     let earliest = ask.now_s.unwrap_or(ask.pos_s);
+    // shorter, but not into a rush: an 8 bar overlap at least (one phrase), else hand over on a beat
+    let floor = min.max(MIN_SHORTENED_BARS);
     let mut lengths = vec![place.bars];
     while let Some(&last) = lengths.last() {
         let half = last / 2;
-        if half < min || half == last {
+        if half < floor || half == last {
             break;
         }
         lengths.push(half);
@@ -883,6 +887,11 @@ mod tests {
         assert_eq!(p.why, "variety");
         // after two of those: the loop roll
         assert_eq!(label(&pick(&ask(&out, &inn, &g, &g, &["echo-out", "echo-out"]))), "loop-roll · 8 bars");
+        // shortening stops at a phrase: a 16 bar bass swap is not cut to 4 to dodge a voice
+        let mut tail = out.clone();
+        tail.vocals = sung(&g, &[(169, 201)]);
+        let p = pick(&ask(&tail, &inn, &g, &g, &["blend"]));
+        assert!(p.place.unwrap().bars >= 8 || !overlaps(p.choice.style()), "{p:?}");
         // an instrumental old track: no clash over its quiet outro, the long blend stays
         let quiet = Shape { vocals: Some(vec![]), ..usual(2) };
         assert_eq!(label(&pick(&ask(&quiet, &inn, &g, &g, &[]))), "blend · 32 bars");
