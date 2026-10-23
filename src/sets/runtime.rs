@@ -1109,6 +1109,31 @@ mix smk -> xyz at bar 9 over 4 bars
     }
 
     #[test]
+    fn items_on_the_beat_of_an_incoming_jump_fire_before_it() {
+        // echo-out: the new track runs from bar 0 and jumps back to its start at the end; the
+        // end's items (the stop, the jump, the fader) are on its beat before the jump, not after
+        // it (beat 0 again: they would all fire as the new track starts)
+        let c = compiled(
+            "track aft \"Aftertekno.flac\"\n  cue outro bar 5\ntrack smk \"Smokin.flac\"\n\
+             mix aft -> smk at aft.outro recipe echo-out\n",
+        );
+        let plan = &c.plans[0];
+        let from = plan_play_from(plan);
+        let items = map_plan_late(plan, 0, 1, 7, 0.);
+        let at = |pred: &dyn Fn(&AutoKind) -> bool| items.iter().find(|i| pred(&i.kind)).map(|i| (i.clock, i.at_beat)).unwrap();
+        assert_eq!(at(&|k| matches!(k, AutoKind::Pause { deck: 0 })), (1, from + 32.));
+        assert_eq!(at(&|k| matches!(k, AutoKind::Jump { deck: 1, .. })), (1, from + 32.));
+        assert_eq!(at(&|k| matches!(k, AutoKind::Set { deck: 1, control: AC::Fader, value } if *value == 1.)), (1, from + 32.));
+        let ic = plan.in_clock.as_ref().unwrap();
+        // after the jump the line goes on from the jump's target
+        assert_eq!(ic.beat(32.5, 0.), from + 0.5);
+        assert_eq!(ic.rel(from + 0.5, 0.), 32.5);
+        // before it, the same beats are the stretch before the jump: the mix is not over yet
+        assert_eq!(ic.rel(from + 31., 0.), 31.);
+        assert_eq!(ic.rel(from + 21., 0.), 21.);
+    }
+
+    #[test]
     fn items_after_an_outgoing_loop_are_timed_on_the_incoming_deck() {
         let c = compiled(
             "track aft \"Aftertekno.flac\"\n  cue outro bar 5\ntrack smk \"Smokin.flac\"\n  cue hook bar 3\n\

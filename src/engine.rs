@@ -389,6 +389,7 @@ impl Engine {
     }
 
     fn track_ended(&mut self, deck: usize, generation: u64) {
+        tracing::debug!(deck, generation, player_deck = self.player_deck, current = self.generation, pos = self.audio.deck_states()[deck].position, "track ended");
         if deck != self.player_deck || generation != self.generation || self.transport != Transport::Playing {
             return;
         }

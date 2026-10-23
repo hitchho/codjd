@@ -577,7 +577,7 @@ impl Engine {
             now_s: manual.then_some(st.position),
         };
         let picked = pick::pick(&ask);
-        tracing::debug!(
+        tracing::trace!(
             from = %from_path.display(),
             to = %to_path.display(),
             length,

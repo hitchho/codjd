@@ -48,14 +48,21 @@ pub struct InSeg {
 
 impl InClock {
     /// The incoming deck's grid beat at mix beat `rel`; the incoming deck started `late` whole
-    /// beats into its track (a late arm)
+    /// beats into its track (a late arm). At the mix beat of a jump it is where the deck is
+    /// before the jump: the jump, and what happens with it, fire there
     pub fn beat(&self, rel: f64, late: f64) -> f64 {
-        let (i, s) = self.segs.iter().enumerate().rev().find(|(_, s)| s.rel <= rel + 1e-9).unwrap_or((0, &self.segs[0]));
+        let (i, _) = self.segs.iter().enumerate().rev().find(|(i, s)| *i == 0 || s.rel < rel - 1e-9).unwrap_or((0, &self.segs[0]));
+        self.seg_beat(i, rel, late)
+    }
+
+    /// The beat at mix beat `rel` on the line of segment `i`
+    fn seg_beat(&self, i: usize, rel: f64, late: f64) -> f64 {
+        let s = &self.segs[i];
         s.beat + if i == 0 { late } else { 0. } + (rel - s.rel) * s.rate
     }
 
     /// The mix beat at which the incoming deck is at grid beat `beat`, looking at the part of
-    /// the mix from `after` on
+    /// the mix from `after` on: the first stretch between jumps that has it
     pub fn rel(&self, beat: f64, late: f64) -> f64 {
         let mut best = None;
         for (i, s) in self.segs.iter().enumerate() {
@@ -64,9 +71,15 @@ impl InClock {
                 continue;
             }
             let rel0 = s.rel.max(self.after);
-            let beat0 = self.beat(rel0, late);
+            let beat0 = self.seg_beat(i, rel0, late);
             if beat0 <= beat + 1e-9 {
-                best = Some(rel0 + (beat - beat0) / s.rate);
+                let rel = rel0 + (beat - beat0) / s.rate;
+                // a jump back plays the same beats again: the first stretch they fit in is
+                // where the deck is (before the jump), not the one after it
+                if rel < end - 1e-9 {
+                    return rel;
+                }
+                best = Some(rel);
             }
         }
         best.unwrap_or(self.after)
