@@ -364,7 +364,7 @@ impl Engine {
         let st = self.audio.deck_states()[from];
         let length = self.track_length(from);
         let from_path = self.meta[from].path.clone().ok_or("nothing loaded")?;
-        let picked = self.pick_for(from, &from_path, to_path, out.as_ref(), inn.as_ref(), length, !at_end);
+        let picked = self.pick_for(from, &from_path, to_path, out.as_ref(), inn.as_ref(), length, !at_end, true);
         let mut choice = picked.choice;
         let mut armed = None;
         if let (Choice::Recipe { synced, .. }, Some(place), Some(og), Some(ig)) = (choice, picked.place, &out, &inn) {
@@ -551,7 +551,7 @@ impl Engine {
             return None;
         }
         let inn = self.effective_grid(&path);
-        let picked = self.pick_for(from, &from_path, &path, out.as_ref(), inn.as_ref(), length, false);
+        let picked = self.pick_for(from, &from_path, &path, out.as_ref(), inn.as_ref(), length, false, false);
         let (choice, start_s) = match picked.place {
             Some(p) => (picked.choice, p.start_s),
             None => (Choice::Fade { secs: FADE_S }, (length - FADE_S - 1.).max(0.)),
@@ -562,8 +562,10 @@ impl Engine {
     /// The transition from deck `from` (its track at `from_path`, `length` s long) into
     /// `to_path`; `manual`: `DjAutoMix` (the next phrase line), else the player's place
     #[allow(clippy::too_many_arguments)]
-    fn pick_for(&mut self, from: usize, from_path: &Path, to_path: &Path, out: Option<&Grid>, inn: Option<&Grid>, length: f64, manual: bool) -> pick::Pick {
-        let (so, si) = (self.shape(from_path), self.shape(to_path));
+    fn pick_for(&mut self, from: usize, from_path: &Path, to_path: &Path, out: Option<&Grid>, inn: Option<&Grid>, length: f64, manual: bool, planning: bool) -> pick::Pick {
+        // planning (not a preview) looks again at a track it has no sections of: a miss cached
+        // by a preview must not decide the mix
+        let (so, si) = (self.shape(from_path, planning), self.shape(to_path, planning));
         let st = self.audio.deck_states()[from];
         let ask = pick::Ask {
             out_tempo: out.map_or(0., |g| g.bpm * st.rate),
@@ -574,13 +576,29 @@ impl Engine {
             pos_s: st.position,
             now_s: manual.then_some(st.position),
         };
-        pick::pick(&ask)
+        let picked = pick::pick(&ask);
+        tracing::debug!(
+            from = %from_path.display(),
+            to = %to_path.display(),
+            length,
+            pos = st.position,
+            out_parts = so.parts.len(),
+            in_parts = si.parts.len(),
+            recent = ?self.amix.recent,
+            what = %picked.choice.label(),
+            why = picked.why,
+            "automix pick"
+        );
+        picked
     }
 
     /// A track's sections and key, from the track model (its sheet and the measured sections),
     /// kept a while: `preview` asks about ten times a second
-    fn shape(&mut self, path: &Path) -> Arc<Shape> {
+    fn shape(&mut self, path: &Path, planning: bool) -> Arc<Shape> {
         let fresh = |t: &Instant, s: &Shape| {
+            if planning && s.parts.is_empty() {
+                return false;
+            }
             let keep = if s.parts.is_empty() { SHAPE_RETRY_S } else { SHAPE_KEEP_S };
             t.elapsed().as_secs() < keep
         };
@@ -602,14 +620,19 @@ impl Engine {
     fn look_at(&self, path: &Path) -> Shape {
         let analyzed_key = || self.analyzer.as_ref().and_then(|a| a.features(path)).and_then(|f| f.key().map(|k| k.camelot.clone()));
         let Some(view) = self.tracks.as_ref().and_then(|t| t.known_view_of_path(path)) else {
-            return Shape { parts: vec![], key: analyzed_key() };
+            tracing::debug!(path = %path.display(), tracks = self.tracks.is_some(), "automix: no track view (no AudioId yet?)");
+            return Shape { parts: vec![], key: analyzed_key(), vocals: None };
         };
         let parts = view
             .sections
             .iter()
             .map(|s| Part { kind: s.kind, start_s: s.start.seconds, end_s: s.end_s, energy: s.energy, confidence: s.confidence })
             .collect();
-        Shape { parts, key: view.key.map(|k| k.value.camelot).or_else(analyzed_key) }
+        let vocals = view.vocals.known().map(|v| v.value.clone());
+        if view.sections.is_empty() {
+            tracing::debug!(path = %path.display(), measured = ?view.sections_measured, "automix: a track view without sections");
+        }
+        Shape { parts, key: view.key.map(|k| k.value.camelot).or_else(analyzed_key), vocals }
     }
 
     /// About ten times a second, after the set runtime's tick

@@ -21,6 +21,11 @@ const QUIET_LOW: u8 = 2;
 const ENERGETIC_LOW: u8 = 5;
 /// The longest stretch of the new track's quiet intro played under the old track, in bars
 const MAX_LEAD_BARS: f64 = 16.;
+/// At most this many bars of the mix may have the new track singing over the old one singing,
+/// or over an energetic or melodic part of it
+const MAX_CLASH_BARS: f64 = 2.;
+/// A section with a low or mid band of this or more is energetic or melodic: no one sings over it
+const BUSY: u8 = 5;
 /// Short transitions start this many bars before the end (then down to a phrase line)
 const SHORT_LEAD_BARS: u32 = 16;
 /// How many recent transitions the variety rule looks at
@@ -60,6 +65,8 @@ pub struct Shape {
     pub parts: Vec<Part>,
     /// Camelot, "8A"
     pub key: Option<String>,
+    /// where someone sings, in seconds (a sheet's `vocals`); None: not known, no vocal rules
+    pub vocals: Option<Vec<(f64, f64)>>,
 }
 
 impl Shape {
@@ -235,7 +242,7 @@ pub fn pick(ask: &Ask) -> Pick {
     } else {
         cands.extend([cand("blend", 32, "default"), cand("eq-swap", 24, "default")]);
     }
-    cands.extend([cand("bassswap", 16, "variety"), cand("filter-blend", 16, "variety"), cand("echo-out", 8, "variety")]);
+    cands.extend([cand("bassswap", 16, "variety"), cand("filter-blend", 16, "variety"), cand("echo-out", 8, "variety"), cand("loop-roll", 8, "one voice at a time")]);
 
     for c in cands {
         let from_bar = c.at.map(|a| a.1);
@@ -247,6 +254,7 @@ pub fn pick(ask: &Ask) -> Pick {
             Some((start, _)) => fit(og, ask.length_s, start, c.bars, c.bars),
             None => place_for(ask, og, c.recipe, c.bars, anchor_bar),
         };
+        let place = place.and_then(|p| voices(ask, og, c.recipe, p, from_bar));
         if let Some(place) = place {
             let choice = Choice::Recipe { recipe: c.recipe, bars: place.bars, synced: true, from_bar };
             return Pick { choice, place: Some(place), why: c.why };
@@ -254,6 +262,82 @@ pub fn pick(ask: &Ask) -> Pick {
     }
     // nothing fits in what is left of the track
     Pick { choice: Choice::Fade { secs: FADE_S }, place: None, why: "too short" }
+}
+
+/// Recipes during which both tracks sound together (the others hand over on one beat: `cut`,
+/// and `echo-out`, `loop-roll` and `brake`, whose new track is silent until the old one stops)
+fn overlaps(recipe: &str) -> bool {
+    matches!(recipe, "blend" | "bassswap" | "eq-swap" | "filter-blend")
+}
+
+fn sings(spans: &[(f64, f64)], t: f64) -> bool {
+    spans.iter().any(|&(a, b)| a <= t + 1e-6 && t < b - 1e-6)
+}
+
+/// Over the mix at `place`, with the new track playing from `from_bar` of its grid (its first
+/// downbeat when None): the bars where the new track sings over the old one singing or over an
+/// energetic or melodic part of it, and whether the new track sings at all
+fn clash(ask: &Ask, og: &Grid, ig: &Grid, place: &Place, from_bar: Option<u32>, bv: &[(f64, f64)]) -> (f64, bool) {
+    let out = ask.out.shape;
+    let beat = 60. / og.bpm;
+    let b0 = bar_secs(ig, from_bar.unwrap_or(1));
+    let (mut clashing, mut any) = (0usize, false);
+    let beats = place.bars as usize * og.beats_per_bar as usize;
+    for k in 0..beats {
+        // the middle of the beat; the new track is synced: one of its beats per beat
+        let t = place.start_s + (k as f64 + 0.5) * beat;
+        if !sings(bv, b0 + (k as f64 + 0.5) * 60. / ig.bpm) {
+            continue;
+        }
+        any = true;
+        let a_sings = out.vocals.as_deref().is_some_and(|v| sings(v, t));
+        let busy = out.at(t).and_then(|p| p.energy).is_some_and(|e| e[0] >= BUSY || e[1] >= BUSY);
+        if a_sings || busy {
+            clashing += 1;
+        }
+    }
+    (clashing as f64 / og.beats_per_bar as f64, any)
+}
+
+/// One voice at a time: a recipe where both tracks sound may not have the new track sing for
+/// more than `MAX_CLASH_BARS` over the old one singing or over an energetic or melodic part of
+/// it. The place as it is when it passes; else the same recipe a phrase later or earlier (8 or
+/// 16 bars, still ahead) or shorter (halves, not below its least bars), preferring a place where
+/// the new track's first vocal comes after the mix; None when nothing passes (the next
+/// candidate then, down to the ones that hand over on one beat). Unknown vocals: as it is.
+fn voices(ask: &Ask, og: &Grid, recipe: &str, place: Place, from_bar: Option<u32>) -> Option<Place> {
+    let (Some(bv), Some(ig)) = (ask.inn.shape.vocals.as_deref(), ask.inn.grid) else { return Some(place) };
+    if !overlaps(recipe) || bv.is_empty() {
+        return Some(place);
+    }
+    let min = recipes::find(recipe).map_or(1, |r| r.min_bars);
+    let earliest = ask.now_s.unwrap_or(ask.pos_s);
+    let mut lengths = vec![place.bars];
+    while let Some(&last) = lengths.last() {
+        let half = last / 2;
+        if half < min || half == last {
+            break;
+        }
+        lengths.push(half);
+    }
+    let mut passing = None;
+    for off in [0i64, 8, 16, -8, -16] {
+        let start = place.start_bar as i64 + off;
+        if start < 1 || bar_secs(og, start as u32) < earliest {
+            continue;
+        }
+        for &bars in &lengths {
+            let Some(p) = fit(og, ask.length_s, start as u32, bars, min) else { continue };
+            let (bad, any) = clash(ask, og, ig, &p, from_bar, bv);
+            if bad <= MAX_CLASH_BARS {
+                if !any {
+                    return Some(p);
+                }
+                passing.get_or_insert(p);
+            }
+        }
+    }
+    passing
 }
 
 /// The unsynced crossfade's place (a crossfade in seconds has none)
@@ -399,6 +483,7 @@ mod tests {
                 part(Kind::Outro, 161, 201, low_outro),
             ],
             key: Some("8A".into()),
+            vocals: None,
         }
     }
 
@@ -464,9 +549,10 @@ mod tests {
         let out = Shape {
             parts: vec![part(Kind::Drop, 1, 161, 8), part(Kind::Breakdown, 161, 185, 1), part(Kind::Outro, 185, 201, 2)],
             key: None,
+            vocals: None,
         };
         // the new one drops at bar 33 (64 s)
-        let inn = Shape { parts: vec![part(Kind::Intro, 1, 33, 2), part(Kind::Drop, 33, 97, 8)], key: None };
+        let inn = Shape { parts: vec![part(Kind::Intro, 1, 33, 2), part(Kind::Drop, 33, 97, 8)], key: None, vocals: None };
         let p = pick(&ask(&out, &inn, &g, &g, &[]));
         assert_eq!(p.choice, Choice::Recipe { recipe: "cut", bars: 1, synced: true, from_bar: Some(33) });
         assert_eq!(label(&p), "drop-swap cut · 1 bar");
@@ -485,11 +571,11 @@ mod tests {
         assert_eq!(pick(&ask(&o2, &i2, &g, &g, &[])).choice.style(), "drop-swap");
         assert_ne!(pick(&ask(&o2, &i2, &g, &g, &["brake", "blend"])).choice.style(), "drop-swap");
         // a breakdown that runs to the end: its last line with a bar after it
-        let out = Shape { parts: vec![part(Kind::Drop, 1, 161, 8), part(Kind::Breakdown, 161, 201, 1)], key: None };
+        let out = Shape { parts: vec![part(Kind::Drop, 1, 161, 8), part(Kind::Breakdown, 161, 201, 1)], key: None, vocals: None };
         let p = pick(&ask(&out, &inn, &g, &g, &[]));
         assert_eq!(p.place.unwrap().start_bar, 193);
         // no drop in the new track, or a drop after the breakdown: no drop swap
-        let flat = Shape { parts: vec![part(Kind::Body, 1, 97, 5)], key: None };
+        let flat = Shape { parts: vec![part(Kind::Body, 1, 97, 5)], key: None, vocals: None };
         assert_ne!(pick(&ask(&out, &flat, &g, &g, &[])).choice.style(), "drop-swap");
         assert_ne!(pick(&ask(&usual(2), &inn, &g, &g, &[])).choice.style(), "drop-swap");
         // played past the line: no drop swap
@@ -506,22 +592,22 @@ mod tests {
     fn high_energy_on_both_sides_is_a_short_bass_swap() {
         let g = g120();
         // no outro: the mix point is bar 161 (32 before the end), inside a high drop
-        let out = Shape { parts: vec![part(Kind::Intro, 1, 17, 2), part(Kind::Drop, 17, 201, 8)], key: None };
-        let inn = Shape { parts: vec![part(Kind::Drop, 1, 65, 7)], key: None };
+        let out = Shape { parts: vec![part(Kind::Intro, 1, 17, 2), part(Kind::Drop, 17, 201, 8)], key: None, vocals: None };
+        let inn = Shape { parts: vec![part(Kind::Drop, 1, 65, 7)], key: None, vocals: None };
         let p = pick(&ask(&out, &inn, &g, &g, &[]));
         assert_eq!(label(&p), "bassswap · 16 bars");
         assert_eq!(p.place.unwrap().start_bar, 161);
         // after two of them: the other high energy one
         assert_eq!(label(&pick(&ask(&out, &inn, &g, &g, &["bassswap", "bassswap"]))), "eq-swap · 24 bars");
         // a quiet intro on the new track: not both high
-        let soft = Shape { parts: vec![part(Kind::Intro, 1, 17, 3)], key: None };
+        let soft = Shape { parts: vec![part(Kind::Intro, 1, 17, 3)], key: None, vocals: None };
         assert_eq!(label(&pick(&ask(&out, &soft, &g, &g, &[]))), "blend · 32 bars");
     }
 
     #[test]
     fn a_long_quiet_outro_gets_the_long_blend_from_its_start() {
         let g = g120();
-        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 2)], key: None };
+        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 2)], key: None, vocals: None };
         // outro from bar 161 (40 bars, low energy)
         let p = pick(&ask(&usual(2), &inn, &g, &g, &["blend"]));
         assert_eq!(label(&p), "blend · 32 bars");
@@ -551,7 +637,7 @@ mod tests {
     fn clashing_keys_never_overlap_long() {
         let g = g120();
         let out = Shape { key: Some("8A".into()), ..usual(2) };
-        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 2)], key: Some("3B".into()) };
+        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 2)], key: Some("3B".into()), vocals: None };
         let p = pick(&ask(&out, &inn, &g, &g, &[]));
         assert_eq!(label(&p), "echo-out · 8 bars");
         // from the outro's line
@@ -569,7 +655,7 @@ mod tests {
         let p = pick(&ask(&s, &s, &g, &gi, &[]));
         assert_eq!(label(&p), "filter-blend · 16 bars");
         assert_eq!(p.place.unwrap().start_bar, 161);
-        let bang = Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: None };
+        let bang = Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: None, vocals: None };
         let p = pick(&ask(&s, &bang, &g, &gi, &[]));
         assert_eq!(label(&p), "brake · 2 bars");
         // a brake lands at its end: on the line, two bars after the start
@@ -608,7 +694,7 @@ mod tests {
     #[test]
     fn the_same_inputs_give_the_same_pick() {
         let g = g120();
-        let (out, inn) = (usual(2), Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: Some("2B".into()) });
+        let (out, inn) = (usual(2), Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: Some("2B".into()), vocals: None });
         let recent = ["blend", "eq-swap"];
         assert_eq!(pick(&ask(&out, &inn, &g, &g, &recent)), pick(&ask(&out, &inn, &g, &g, &recent)));
     }
@@ -617,7 +703,7 @@ mod tests {
     fn dj_automix_goes_on_the_next_line_and_a_brake_lands_on_it() {
         let g = g120();
         let gi = grid(130., 0., 0);
-        let bang = Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: None };
+        let bang = Shape { parts: vec![part(Kind::Drop, 1, 65, 8)], key: None, vocals: None };
         let s = Shape::default();
         let mut a = ask(&s, &bang, &g, &gi, &[]);
         a.now_s = Some(19.); // bar 10.5
@@ -656,6 +742,7 @@ mod tests {
                 Part { end_s: 198., ..at(&cg, Kind::Outro, 121, 132, [3, 2, 1]) },
             ],
             key: Some("10A".into()),
+            vocals: None,
         };
         // Hola Sensei: 159 BPM, a nearly silent 16 bar intro, the energy arrives at bar 17
         let hg = grid(159., 0., 0);
@@ -667,6 +754,7 @@ mod tests {
                 at(&hg, Kind::Drop, 97, 113, [8, 7, 7]),
             ],
             key: Some("10A".into()),
+            vocals: None,
         };
         let mut a = ask(&cadillac, &hola, &cg, &hg, &[]);
         a.length_s = 198.;
@@ -721,9 +809,96 @@ mod tests {
         let out = Shape {
             parts: vec![part(Kind::Intro, 1, 17, 2), part(Kind::Drop, 17, 169, 8), part(Kind::Body, 169, 201, 5)],
             key: None,
+            vocals: None,
         };
         let p = pick(&ask(&out, &Shape::default(), &g, &g, &[]));
         assert_eq!(label(&p), "blend · 32 bars");
         assert_eq!(p.place.unwrap().start_bar, 169);
+    }
+
+    /// Vocal spans from bars `a..b` (as a sheet writes them) on grid `g`
+    fn sung(g: &Grid, bars: &[(u32, u32)]) -> Option<Vec<(f64, f64)>> {
+        Some(bars.iter().map(|&(a, b)| (bar_secs(g, a), bar_secs(g, b))).collect())
+    }
+
+    /// Cadillac into Hola Sensei with the vocals the Demucs scan wrote in their sheets: Hola
+    /// sings from its bar 1 (1..3, 5..11, 13..34, ...), Cadillac only at bars 19..20
+    #[test]
+    fn a_vocal_intro_never_runs_under_an_energetic_part() {
+        let cg = grid(160., 0., 0);
+        let hg = grid(159., 0., 0);
+        let cadillac = Shape {
+            parts: vec![
+                at(&cg, Kind::Intro, 1, 17, [0, 2, 1]),
+                at(&cg, Kind::Body, 17, 25, [6, 5, 4]),
+                at(&cg, Kind::Build, 25, 33, [6, 6, 6]),
+                at(&cg, Kind::Drop, 33, 65, [8, 6, 6]),
+                at(&cg, Kind::Build, 65, 81, [6, 6, 6]),
+                at(&cg, Kind::Drop, 81, 113, [8, 7, 7]),
+                at(&cg, Kind::Body, 113, 121, [8, 6, 5]),
+                Part { end_s: 198., ..at(&cg, Kind::Outro, 121, 132, [3, 2, 1]) },
+            ],
+            key: Some("10A".into()),
+            vocals: sung(&cg, &[(19, 20)]),
+        };
+        let hola = Shape {
+            parts: vec![
+                at(&hg, Kind::Intro, 1, 17, [0, 1, 0]),
+                at(&hg, Kind::Body, 17, 33, [6, 7, 6]),
+                at(&hg, Kind::Body, 33, 97, [6, 6, 6]),
+                at(&hg, Kind::Drop, 97, 113, [8, 7, 7]),
+            ],
+            key: Some("10A".into()),
+            vocals: sung(&hg, &[(1, 3), (5, 11), (13, 34), (40, 48), (64, 72)]),
+        };
+        let mut a = ask(&cadillac, &hola, &cg, &hg, &[]);
+        a.length_s = 198.;
+        let p = pick(&a);
+        // the aligned blend from bar 113 would have Hola sing over Cadillac's body2 (low 8): a
+        // phrase later, over the quiet outro, cut to what is left of the track
+        assert_eq!(p.choice, Choice::Recipe { recipe: "blend", bars: 12, synced: true, from_bar: Some(9) });
+        assert_eq!(p.place.unwrap().start_bar, 121);
+        // without vocal data: as before
+        let hola_unknown = Shape { vocals: None, ..hola.clone() };
+        let mut a = ask(&cadillac, &hola_unknown, &cg, &hg, &[]);
+        a.length_s = 198.;
+        assert_eq!(pick(&a).place.unwrap().start_bar, 113);
+    }
+
+    #[test]
+    fn two_voices_never_overlap_for_long() {
+        let g = g120();
+        // the old track sings all through its outro (bars 161..201)
+        let out = Shape { vocals: sung(&g, &[(150, 201)]), ..usual(2) };
+        // the new one from its first bar
+        let inn = Shape {
+            parts: vec![part(Kind::Intro, 1, 17, 3), part(Kind::Body, 17, 65, 6)],
+            key: None,
+            vocals: sung(&g, &[(1, 64)]),
+        };
+        // every blend, eq-swap and bass swap would put two voices together: the echo-out hands
+        // over on one beat
+        let p = pick(&ask(&out, &inn, &g, &g, &[]));
+        assert_eq!(label(&p), "echo-out · 8 bars");
+        assert_eq!(p.why, "variety");
+        // after two of those: the loop roll
+        assert_eq!(label(&pick(&ask(&out, &inn, &g, &g, &["echo-out", "echo-out"]))), "loop-roll · 8 bars");
+        // an instrumental old track: no clash over its quiet outro, the long blend stays
+        let quiet = Shape { vocals: Some(vec![]), ..usual(2) };
+        assert_eq!(label(&pick(&ask(&quiet, &inn, &g, &g, &[]))), "blend · 32 bars");
+    }
+
+    #[test]
+    fn the_new_tracks_first_vocal_comes_after_the_mix_when_it_can() {
+        let g = g120();
+        let out = Shape { vocals: Some(vec![]), ..usual(2) };
+        // sings from its bar 25: a 32 bar blend from bar 161 would have it sing from bar 185
+        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 3)], key: None, vocals: sung(&g, &[(25, 40)]) };
+        let p = pick(&ask(&out, &inn, &g, &g, &[]));
+        assert_eq!(label(&p), "blend · 16 bars");
+        assert_eq!(p.place.unwrap().start_bar, 161);
+        // singing from bar 1 it can't: the long blend over the quiet outro is fine
+        let early = Shape { vocals: sung(&g, &[(1, 40)]), ..inn.clone() };
+        assert_eq!(label(&pick(&ask(&out, &early, &g, &g, &[]))), "blend · 32 bars");
     }
 }
