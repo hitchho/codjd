@@ -331,7 +331,9 @@ fn voices(ask: &Ask, og: &Grid, recipe: &str, place: Place, from_bar: Option<u32
             continue;
         }
         for &bars in &lengths {
-            let Some(p) = fit(og, ask.length_s, start as u32, bars, min) else { continue };
+            // the place as given keeps its length; a moved or shortened one is a phrase at least
+            let least = if off == 0 && bars == place.bars { min } else { floor };
+            let Some(p) = fit(og, ask.length_s, start as u32, bars, least) else { continue };
             let (bad, any) = clash(ask, og, ig, &p, from_bar, bv);
             if bad <= MAX_CLASH_BARS {
                 if !any {
@@ -887,7 +889,8 @@ mod tests {
         assert_eq!(p.why, "variety");
         // after two of those: the loop roll
         assert_eq!(label(&pick(&ask(&out, &inn, &g, &g, &["echo-out", "echo-out"]))), "loop-roll · 8 bars");
-        // shortening stops at a phrase: a 16 bar bass swap is not cut to 4 to dodge a voice
+        // shortening stops at a phrase: a 16 bar bass swap is not cut (or moved to the end of the
+        // track and cut) to 4 to dodge a voice
         let mut tail = out.clone();
         tail.vocals = sung(&g, &[(169, 201)]);
         let p = pick(&ask(&tail, &inn, &g, &g, &["blend"]));
@@ -909,5 +912,20 @@ mod tests {
         // singing from bar 1 it can't: the long blend over the quiet outro is fine
         let early = Shape { vocals: sung(&g, &[(1, 40)]), ..inn.clone() };
         assert_eq!(label(&pick(&ask(&out, &early, &g, &g, &[]))), "blend · 32 bars");
+    }
+
+    #[test]
+    fn a_mix_moved_for_the_vocals_is_never_squeezed_into_the_last_bars() {
+        let g = g120();
+        // a 165 bar track: the 16 bar line 32 before the end is bar 129; a move by 16 lands on
+        // bar 161, with 5 bars left
+        let out = Shape { parts: vec![part(Kind::Body, 1, 166, 4)], key: None, vocals: sung(&g, &[(120, 160)]) };
+        let inn = Shape { parts: vec![part(Kind::Intro, 1, 17, 3)], key: None, vocals: sung(&g, &[(1, 40)]) };
+        let mut a = ask(&out, &inn, &g, &g, &["blend"]);
+        a.length_s = 2. * 165.;
+        let p = pick(&a);
+        if overlaps(p.choice.style()) {
+            assert!(p.place.unwrap().bars >= 8, "{p:?}");
+        }
     }
 }
