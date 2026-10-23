@@ -74,12 +74,14 @@ async fn exec_into(codjd: &Codjd, binary: &std::path::Path) -> std::io::Error {
     let snap = codjd
         .call(|e| {
             e.save_state();
-            e.resume_snapshot()
+            (e.resume_snapshot(), e.automix_state().0, e.autoplay_state().0)
         })
-        .await
-        .flatten();
-    if let (Some((path, at, playing)), Some(file)) = (snap, resume_file()) {
-        let json = serde_json::json!({ "path": path, "at": at, "playing": playing, "saved": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) });
+        .await;
+    if let (Some((track, automix, autoplay)), Some(file)) = (snap, resume_file()) {
+        // the switches as they are now, also when nothing plays: a restart must not turn them off
+        let (path, at, playing) = track.map_or((None, 0., false), |(p, a, pl)| (Some(p), a, pl));
+        let json = serde_json::json!({ "path": path, "at": at, "playing": playing, "automix": automix, "autoplay": autoplay,
+            "saved": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) });
         if let Err(e) = std::fs::write(&file, json.to_string()) {
             warn!(error = %e, "can't save what plays for the restart");
         }
@@ -105,6 +107,17 @@ pub async fn carry_on(codjd: &Codjd) {
     if now.saturating_sub(v["saved"].as_u64().unwrap_or(0)) > 60 {
         return;
     }
+    let (automix, autoplay) = (v["automix"].as_bool(), v["autoplay"].as_bool());
+    codjd
+        .call(move |e| {
+            if let Some(on) = automix {
+                e.set_automix(on);
+            }
+            if let Some(on) = autoplay {
+                e.set_autoplay(on);
+            }
+        })
+        .await;
     let (Some(path), Some(at), Some(playing)) = (v["path"].as_str(), v["at"].as_f64(), v["playing"].as_bool()) else { return };
     let path = PathBuf::from(path);
     codjd.call(move |e| e.resume_after_restart(&path, at, playing)).await;
