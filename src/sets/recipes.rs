@@ -201,7 +201,9 @@ pub fn groups(recipe: &Recipe, c: &Ctx, bars: f64) -> Vec<Group> {
             // timed on the incoming deck; the roll keeps its volume, the filter thins it
             let end = bars;
             let bar = |beats: f64| beats / c.beats_per_bar;
-            let (l4, l2, l1, lh, off) = (end - bar(8.), end - bar(4.), end - bar(2.), end - bar(1.), end - bar(0.5));
+            // the roll builds over the last 4 bars: 2 bars of the 4 beat loop, a bar of 2, half a
+            // bar of 1, half a bar of 1/2
+            let (l4, l2, l1, lh, off) = (end - bar(16.), end - bar(8.), end - bar(4.), end - bar(2.), end - bar(0.5));
             let sweep = (bars / 2.).floor().min(l4);
             vec![
                 g(

@@ -1117,13 +1117,13 @@ fn loop_roll_halves_one_loop_down_to_half_a_beat_and_lands_on_the_downbeat() {
             _ => None,
         })
         .collect();
-    assert_eq!(loops.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), [(24., 4.), (28., 2.), (30., 1.), (31., 0.5)]);
+    assert_eq!(loops.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), [(16., 4.), (24., 2.), (28., 1.), (30., 0.5)]);
     assert!(loops.iter().all(|l| l.2 == loops[0].2), "{loops:?}");
     // the loop ends half a beat before the stop, the clock moves to the incoming deck at the
     // first loop, the filter rises from the middle
     assert!(p.items.contains(&PlanItem::LoopOff { deck: Out, at_beat_rel: 31.5 }));
     assert!(p.items.contains(&PlanItem::Pause { deck: Out, at_beat_rel: 32. }));
-    assert_eq!(p.in_clock.as_ref().map(|c| c.after), Some(24.));
+    assert_eq!(p.in_clock.as_ref().map(|c| c.after), Some(16.));
     assert!(p.items.contains(&ramp(Out, Control::Filter, Some(0.), 0.7, 16., 31.5, Curve::Exp)));
     // the new track runs silently and jumps back to its first downbeat at full volume
     assert!(p.items.contains(&PlanItem::Set { deck: In, control: Control::Fader, value: 0., at_beat_rel: 0. }));

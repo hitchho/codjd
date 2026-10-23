@@ -53,12 +53,13 @@ impl State {
     }
 }
 
-/// One song whatever the copy: title, artist and length to 3 s
+/// One song whatever the copy: the title and the length to 6 s. Not the artist: the same release
+/// is credited "Aasi" in one copy and "Aasi & Olympe 4000" in another
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SongKey(String, String, u64);
+pub struct SongKey(String, u64);
 
 pub fn song_key(m: &Music) -> SongKey {
-    SongKey(m.title.trim().to_lowercase(), m.artist.trim().to_lowercase(), m.length.as_secs() / 3)
+    SongKey(m.title.trim().to_lowercase(), (m.length.as_secs() + 3) / 6)
 }
 
 /// What the picker knows about a track
@@ -204,7 +205,16 @@ mod tests {
     use super::*;
 
     fn c(index: u32, title: &str, bpm: f64, key: &str) -> Candidate {
-        Candidate { index, key: SongKey(title.into(), "a".into(), 100), bpm, camelot: key.into(), steady: true, length: Duration::from_secs(300) }
+        Candidate { index, key: SongKey(title.into(), 50), bpm, camelot: key.into(), steady: true, length: Duration::from_secs(300) }
+    }
+
+    #[test]
+    fn copies_with_other_credits_are_one_song() {
+        let m = |title: &str, artist: &str, secs: u64| Music { title: title.into(), artist: artist.into(), length: Duration::from_secs(secs), ..Default::default() };
+        assert_eq!(song_key(&m("We Never Work", "Aasi", 297)), song_key(&m("We Never Work", "Aasi & Olympe 4000", 297)));
+        assert_eq!(song_key(&m("We Never Work", "Aasi", 297)), song_key(&m(" we never work", "", 299)));
+        assert_ne!(song_key(&m("We Never Work", "Aasi", 297)), song_key(&m("We Never Work (Remix)", "Aasi", 297)));
+        assert_ne!(song_key(&m("Intro", "x", 60)), song_key(&m("Intro", "y", 200)), "same title, another length: another song");
     }
 
     #[test]

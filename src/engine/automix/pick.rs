@@ -19,6 +19,8 @@ const LOW_OUTRO: u8 = 4;
 const QUIET_LOW: u8 = 2;
 /// ... until the first section whose low band is at least this: where the energy arrives
 const ENERGETIC_LOW: u8 = 5;
+/// A part strong enough to land a roll, a brake or an echo-out on: the payoff after the build
+const STRONG_LOW: u8 = 7;
 /// The longest stretch of the new track's quiet intro played under the old track, in bars
 const MAX_LEAD_BARS: f64 = 16.;
 /// At most this many bars of the mix may have the new track singing over the old one singing,
@@ -247,7 +249,12 @@ pub fn pick(ask: &Ask) -> Pick {
     cands.extend([cand("bassswap", 16, "variety"), cand("filter-blend", 16, "variety"), cand("echo-out", 8, "variety"), cand("loop-roll", 8, "one voice at a time")]);
 
     for c in cands {
-        let from_bar = c.at.map(|a| a.1);
+        // the ones that hand over on one beat land the new track on its first strong part, not
+        // its intro: a roll or a brake builds up to something
+        let lands = matches!(c.recipe, "loop-roll" | "brake" | "echo-out");
+        // an overlap cues the new track so its first strong part arrives on the bass swap, not
+        // its first downbeat (many tracks open with ambience or a voice, made for listening)
+        let from_bar = c.at.map(|a| a.1).or_else(|| if lands { landing(ask) } else { cue_in(ask, c.recipe, c.bars) });
         let choice = Choice::Recipe { recipe: c.recipe, bars: c.bars, synced: true, from_bar };
         if !varied(choice.style(), c.clear, ask.recent) {
             continue;
@@ -264,6 +271,41 @@ pub fn pick(ask: &Ask) -> Pick {
     }
     // nothing fits in what is left of the track
     Pick { choice: Choice::Fade { secs: FADE_S }, place: None, why: "too short" }
+}
+
+/// Where a recipe that hands over on one beat lands the new track: its first strong part (low band
+/// `STRONG_LOW` or more) with no voice in its first two bars, within its first 64 bars. None: its
+/// first downbeat, as before (no structure known, or the track starts strong anyway)
+fn landing(ask: &Ask) -> Option<u32> {
+    let ig = ask.inn.grid?;
+    let inn = ask.inn.shape;
+    let two_bars = 2. * ig.beats_per_bar as f64 * 60. / ig.bpm;
+    let no_voice = |t0: f64| inn.vocals.as_deref().is_none_or(|v| !v.iter().any(|(a, b)| *a < t0 + two_bars && *b > t0));
+    let part = inn.trusted().find(|p| p.low().is_some_and(|l| l >= STRONG_LOW) && no_voice(p.start_s))?;
+    let bar = bar_at(ig, part.start_s).round();
+    (bar > 1. && bar <= 64.).then_some(bar as u32)
+}
+
+/// The bar of an overlapping recipe where the bass changes hands: half way, two thirds for the
+/// three band swap (lows last)
+fn swap_bar(recipe: &str, bars: u32) -> Option<u32> {
+    match recipe {
+        "blend" | "bassswap" | "filter-blend" => Some((bars / 2).max(1)),
+        "eq-swap" => Some(2 * (bars / 3).max(1)),
+        _ => None,
+    }
+}
+
+/// Where the new track starts in an overlap: so that its first part with real low end (low band
+/// `ENERGETIC_LOW` or more) lands on the bass swap. None: from its first downbeat, as before
+/// (that part comes early enough, or the structure is not known)
+fn cue_in(ask: &Ask, recipe: &str, bars: u32) -> Option<u32> {
+    let ig = ask.inn.grid?;
+    let swap = swap_bar(recipe, bars)?;
+    let strong = ask.inn.shape.trusted().find(|p| p.low().is_some_and(|l| l >= ENERGETIC_LOW))?;
+    let strong_bar = bar_at(ig, strong.start_s).round() as u32;
+    let from = strong_bar.checked_sub(swap)?;
+    (from > 1).then_some(from)
 }
 
 /// Recipes during which both tracks sound together (the others hand over on one beat: `cut`,
@@ -507,6 +549,24 @@ mod tests {
 
     fn label(p: &Pick) -> String {
         p.choice.label()
+    }
+
+    #[test]
+    fn an_overlap_cues_the_new_track_so_its_strength_meets_the_swap() {
+        let g = grid(120., 0., 0);
+        let out = usual(3);
+        // a long listening intro: the low end only arrives at bar 49
+        let mut inn = usual(3);
+        inn.parts = vec![part(Kind::Intro, 1, 49, 4), part(Kind::Drop, 49, 113, 8), part(Kind::Outro, 113, 161, 3)];
+        let p = pick(&ask(&out, &inn, &g, &g, &[]));
+        let Choice::Recipe { recipe, bars, from_bar, .. } = p.choice else { panic!("{:?}", p.choice) };
+        let swap = swap_bar(recipe, bars).unwrap();
+        assert_eq!(from_bar, Some(49 - swap), "{recipe} {bars}: the drop lands on the swap");
+        // strength early enough: from the first downbeat, as before
+        let mut early = usual(3);
+        early.parts = vec![part(Kind::Intro, 1, 9, 4), part(Kind::Drop, 9, 113, 8), part(Kind::Outro, 113, 161, 3)];
+        let p = pick(&ask(&out, &early, &g, &g, &[]));
+        assert!(matches!(p.choice, Choice::Recipe { from_bar: None, .. }), "{:?}", p.choice);
     }
 
     #[test]
