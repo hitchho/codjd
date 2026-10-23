@@ -190,6 +190,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         if tracks == 0 { " (empty: set `path` in ~/.config/codjd/config.toml)" } else { "" }
     );
 
+    // after a restart: carry on with what played
+    crate::upgrade::carry_on(&codjd).await;
     // a newer build installed later takes over by itself once nothing plays
     crate::upgrade::spawn(codjd.clone());
 

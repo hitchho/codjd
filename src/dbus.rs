@@ -945,6 +945,17 @@ impl Bus {
         }).await)
     }
 
+    /// Restarts as the installed binary now (`codjd -r`), carrying on with the playing track from
+    /// where it is; replies first
+    async fn restart(&self) -> String {
+        let codjd = self.codjd.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            crate::upgrade::restart_now(codjd).await;
+        });
+        "ok restarting".into()
+    }
+
     /// (on, the last pick and why: "Defuse: 155 BPM, 5A after 152 BPM, 5A")
     async fn autoplay_state(&self) -> (bool, String) {
         self.ask(|e| e.autoplay_state()).await

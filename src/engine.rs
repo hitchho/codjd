@@ -309,6 +309,11 @@ impl Engine {
 
     /// Starts the playlist track at `index`
     fn start(&mut self, index: u32) {
+        self.start_at(index, 0.);
+    }
+
+    /// Starts the playlist track at `index` from `at` seconds
+    fn start_at(&mut self, index: u32, at: f64) {
         let Some(music) = self.playlist.musics.get(index as usize) else {
             warn!(index, "no such track");
             return;
@@ -318,7 +323,7 @@ impl Engine {
         self.automix_abort();
         let deck = self.player_deck;
         self.automix_untouch(deck);
-        match self.audio.load(deck, &path, 0., true) {
+        match self.audio.load(deck, &path, at.max(0.), true) {
             Ok(generation) => {
                 self.generation = generation;
                 self.deck_gen[deck] = generation;
@@ -1241,6 +1246,31 @@ impl Engine {
         if let Err(e) = self.playlist.save(self.store.path()) {
             warn!("failed to save playlist: {}", e);
         }
+    }
+
+    /// What the player plays, for a restart to carry on with: (file, seconds in, playing)
+    pub fn resume_snapshot(&self) -> Option<(std::path::PathBuf, f64, bool)> {
+        let playing = match self.status() {
+            PlayingStatus::Playing => true,
+            PlayingStatus::Pausing => false,
+            PlayingStatus::Stopped => return None,
+        };
+        let m = self.playlist.musics.get(self.playlist.playing_index as usize)?;
+        Some((<&std::path::Path>::from(&m.path).to_path_buf(), self.position().as_secs_f64(), playing))
+    }
+
+    /// After a restart: the track that played, from where it was, playing or paused as it was
+    pub fn resume_after_restart(&mut self, path: &std::path::Path, at: f64, playing: bool) {
+        let Some(index) = self.playlist.musics.iter().position(|m| <&std::path::Path>::from(&m.path) == path) else {
+            warn!(path = %path.display(), "the track that played before the restart is gone");
+            return;
+        };
+        self.playlist.playing_index = index as u32;
+        self.start_at(index as u32, at);
+        if !playing {
+            self.pause();
+        }
+        info!(path = %path.display(), at, playing, "carrying on after the restart");
     }
 
     /// `[record] dir`: where recorded mixes go
