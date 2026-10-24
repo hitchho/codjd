@@ -566,7 +566,18 @@ impl Engine {
         gain_db: Option<f64>,
     ) -> Result<(), String> {
         check_deck(deck)?;
+        if crate::source::is_spotify(path) && self.audio.record_state().on {
+            // a Spotify track is never recorded (docs/spotify.md)
+            let s = self.audio.record_stop();
+            warn!(path = %s.path, "recording stopped: a Spotify track was loaded");
+        }
         let generation = self.audio.load(deck, path, at.max(0.), false)?;
+        if crate::source::is_spotify(path) {
+            // its grid, key and waveform come from the stream, like a file's
+            if let Some(a) = &self.analyzer {
+                a.enqueue([path.to_path_buf()]);
+            }
+        }
         self.rec_loaded(deck);
         self.deck_gen[deck] = generation;
         self.owner[deck] = self.loading_as;
@@ -656,6 +667,10 @@ impl Engine {
     /// Title, artist and length (0 if unknown): the library's entry, else the file's tags, else
     /// the file name
     fn tags_of(&self, path: &Path) -> (String, String, f64) {
+        #[cfg(feature = "spotify")]
+        if let Some(t) = path.to_str().and_then(crate::spotify::tags) {
+            return t;
+        }
         let known = self.playlist.musics.iter().find(|m| <&Path>::from(&m.path) == path);
         let (mut title, mut artist, length) = match known {
             Some(m) => (m.title.clone(), m.artist.clone(), m.length.as_secs_f64()),
@@ -1301,6 +1316,9 @@ impl Engine {
     /// `RecordAudio`: on starts writing the master to a new file in the record folder and
     /// returns its path; off stops and returns the path and length
     pub fn record_audio(&mut self, on: bool) -> Result<String, String> {
+        if on && self.meta.iter().any(|m| m.path.as_deref().is_some_and(crate::source::is_spotify)) {
+            return Err("a Spotify track is on a deck: Spotify tracks are never recorded".into());
+        }
         if on {
             let dir = self.record_dir.clone().ok_or("no record folder")?;
             let path = (0..100)

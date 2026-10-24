@@ -634,6 +634,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn stat(path: &Path) -> Option<(u64, u64)> {
+    // a Spotify track never changes: its analysis is always current
+    if crate::source::is_spotify(path) {
+        return Some((0, 0));
+    }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some((meta.len(), mtime))

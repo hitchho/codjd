@@ -105,6 +105,9 @@ impl Engine {
     fn chop_sample(&self, s: &NodeSpec) -> Result<Option<Arc<Sample>>, String> {
         let Some(track) = s.text("track").filter(|t| !t.is_empty()) else { return Ok(None) };
         let path = PathBuf::from(shellexpand_home(track));
+        if crate::source::is_spotify(&path) {
+            return Err("a chop cuts from library files, never from Spotify streams".into());
+        }
         let bar = s.num("bar").unwrap_or(1.).max(1.).round() as u32;
         let bars = s.num("bars").unwrap_or(1.);
         let key = (path.clone(), bar, (bars * 1000.).round() as u32);

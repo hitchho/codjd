@@ -15,6 +15,9 @@ mod net;
 mod server;
 mod sets;
 mod slsk;
+mod source;
+#[cfg(feature = "spotify")]
+mod spotify;
 mod soulseek;
 mod tracks;
 mod types;

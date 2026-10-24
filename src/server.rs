@@ -46,6 +46,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let codjd = Codjd::start(config)?;
     let analysis = Analyzer::start();
+    // a saved Spotify login comes back by itself (the `spotify` feature)
+    #[cfg(feature = "spotify")]
+    crate::spotify::resume();
     {
         let analysis = Arc::clone(&analysis);
         codjd.tell(move |e| e.set_analyzer(analysis));

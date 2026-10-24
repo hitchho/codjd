@@ -6,7 +6,6 @@
 //! never allocates or frees (dropping the last `Arc<Track>` happens off the audio thread).
 
 use std::{
-    fs::File,
     path::Path,
     ptr,
     sync::{
@@ -19,7 +18,7 @@ use symphonia::{
     core::{
         codecs::audio::AudioDecoderOptions,
         errors::Error,
-        formats::{probe::Hint, TrackType},
+        formats::TrackType,
         io::{MediaSourceStream, MediaSourceStreamOptions},
         meta::MetadataOptions,
     },
@@ -59,12 +58,8 @@ impl Track {
     /// Opens `path` and starts decoding it on its own thread; frames become readable as they're
     /// decoded. Fails only if the file can't be opened or has no playable audio.
     pub fn open(path: &Path) -> Result<Arc<Track>, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
+        let (source, hint) = crate::source::open(path)?;
+        let mss = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
         let mut format = get_probe()
             .probe(&hint, mss, Default::default(), MetadataOptions::default())
             .map_err(|e| e.to_string())?;

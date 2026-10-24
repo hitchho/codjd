@@ -436,6 +436,51 @@ impl Bus {
         reply(result)
     }
 
+    // ---- Spotify (docs/spotify.md; a codjd built without the feature says so) ----
+
+    /// Opens Spotify's login in the browser; `SpotifyStatus` tells when it is done
+    async fn spotify_login(&self) -> String {
+        #[cfg(feature = "spotify")]
+        return crate::spotify::login();
+        #[cfg(not(feature = "spotify"))]
+        return NO_SPOTIFY.into();
+    }
+
+    async fn spotify_logout(&self) -> String {
+        #[cfg(feature = "spotify")]
+        {
+            crate::spotify::logout();
+            return "ok".into();
+        }
+        #[cfg(not(feature = "spotify"))]
+        return NO_SPOTIFY.into();
+    }
+
+    /// (logged in, what is going on: "logged in as x", "waiting for the browser login", ...)
+    async fn spotify_status(&self) -> (bool, String) {
+        #[cfg(feature = "spotify")]
+        return crate::spotify::status();
+        #[cfg(not(feature = "spotify"))]
+        return (false, NO_SPOTIFY.into());
+    }
+
+    /// Tracks of the catalog: (uri, title, artist, album, duration ms). `DjLoad` takes the uri.
+    async fn spotify_search(&self, query: String, limit: u32) -> zbus::fdo::Result<Vec<(String, String, String, String, u32)>> {
+        #[cfg(feature = "spotify")]
+        {
+            let found = tokio::task::spawn_blocking(move || crate::spotify::search(&query, limit))
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .map_err(zbus::fdo::Error::Failed)?;
+            return Ok(found.into_iter().map(|f| (f.uri, f.title, f.artist, f.album, f.duration_ms)).collect());
+        }
+        #[cfg(not(feature = "spotify"))]
+        {
+            let _ = (query, limit);
+            Err(zbus::fdo::Error::Failed(NO_SPOTIFY.into()))
+        }
+    }
+
     async fn dj_play(&self, deck: u32) -> String {
         reply(self.codjd.call(move |e| e.deck_play(deck as usize)).await)
     }
@@ -1251,3 +1296,6 @@ mod tests {
         assert_eq!(key_reply(Some(&k)), ("8A".into(), "A minor".into(), true));
     }
 }
+
+#[cfg(not(feature = "spotify"))]
+const NO_SPOTIFY: &str = "this codjd is built without Spotify (cargo install --features spotify)";

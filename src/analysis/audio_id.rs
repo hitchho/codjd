@@ -17,7 +17,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     path::{Path, PathBuf},
 };
 
@@ -26,7 +25,7 @@ use sha2::{Digest, Sha256};
 use symphonia::{
     core::{
         codecs::audio::AudioCodecParameters,
-        formats::{probe::Hint, TrackType},
+        formats::TrackType,
         io::{MediaSourceStream, MediaSourceStreamOptions},
         meta::MetadataOptions,
     },
@@ -73,12 +72,8 @@ impl IdHasher {
 /// The AudioId of `path`, demuxing only (no decoding). Stops at the end of the stream or at a
 /// demuxer error after the first packet, like the analysis pass.
 pub fn compute(path: &Path) -> Result<String, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
+    let (source, hint) = crate::source::open(path)?;
+    let mss = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
     let mut format = get_probe()
         .probe(&hint, mss, Default::default(), MetadataOptions::default())
         .map_err(|e| e.to_string())?;
