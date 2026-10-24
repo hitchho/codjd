@@ -41,6 +41,7 @@ pub enum NodeKind {
     Tom,
     Pan,
     Mix4,
+    Chop,
     AudioOut,
     Notes,
 }
@@ -92,6 +93,7 @@ impl NodeKind {
         NodeKind::Tom,
         NodeKind::Pan,
         NodeKind::Mix4,
+        NodeKind::Chop,
         NodeKind::AudioOut,
         NodeKind::Notes,
     ];
@@ -149,6 +151,11 @@ impl NodeKind {
                     ("g2", 1.),
                     ("g3", 1.),
                 ],
+                OUT,
+            ),
+            Chop => s(
+                "Chop",
+                &[("clock", 0.), ("trig", 0.), ("slice", 0.), ("rate", 1.), ("level", 1.)],
                 OUT,
             ),
             AudioOut => s("AudioOut", &[("left", 0.), ("right", 0.)], &[]),

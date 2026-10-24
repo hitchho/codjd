@@ -263,6 +263,13 @@ fn param_specs(kind: NodeKind) -> Vec<P> {
             P { name: "patterns", ty: Ty::Patterns, default: None },
         ],
         Notes => vec![P { name: "text", ty: Ty::Text, default: None }],
+        Chop => vec![
+            P { name: "track", ty: Ty::Text, default: None },
+            num("bar", 1., 100_000., true, 1.),
+            num("bars", 0.25, 16., false, 1.),
+            num("slices", 1., 256., true, 16.),
+            P { name: "order", ty: Ty::Text, default: None },
+        ],
         _ => vec![],
     }
 }

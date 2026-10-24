@@ -9,9 +9,10 @@
 //! dependence on their input and runs early, the *write* half runs late. That is what lets a
 //! feedback cycle pass through them. Their output is the state as of the start of the sample.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::{
+    chop::Sample,
     graph::{Input, NodeKind, PatchGraph},
     nodes::{id_hash, ClockInfo, Dsp, Env, Ins, Phase, NIN, NO_KNOB},
     seq::NONE,
@@ -121,6 +122,15 @@ fn bad(id: &str, msg: impl std::fmt::Display) -> String {
 /// Compiles a validated graph for `sample_rate`. Errors name the node (`<id>: message`).
 // called by the document layer, which lands separately
 pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> {
+    compile_with(graph, sample_rate, &|_| Ok(None))
+}
+
+/// Cuts a `Chop` node's audio from its params (`track`, `bar`, `bars`), or None for a chop
+/// without a track. The engine's reads the library; a check (`PatchCheck`) cuts nothing.
+pub type ChopSource<'a> = &'a dyn Fn(&super::graph::NodeSpec) -> Result<Option<Arc<Sample>>, String>;
+
+/// [`compile`] with the audio of the `Chop` nodes
+pub fn compile_with(graph: &PatchGraph, sample_rate: u32, chops: ChopSource) -> Result<Program, String> {
     if sample_rate < 8000 {
         return Err("sample rate too low".into());
     }
@@ -344,7 +354,7 @@ pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> 
 
     // ---- sequencers and clock dividers find their Clock ----
     for i in 0..n {
-        if !matches!(graph.nodes[i].kind, NodeKind::MonoSeq | NodeKind::GateSeq | NodeKind::ClockDiv) {
+        if !matches!(graph.nodes[i].kind, NodeKind::MonoSeq | NodeKind::GateSeq | NodeKind::ClockDiv | NodeKind::Chop) {
             continue;
         }
         let (mut clock, mut div) = (None, 1i64);
@@ -373,6 +383,12 @@ pub fn compile(graph: &PatchGraph, sample_rate: u32) -> Result<Program, String> 
             div = 1;
         }
         nodes[i].set_clock_source(clock, div);
+        if graph.nodes[i].kind == NodeKind::Chop {
+            // the clock's own steps: `nominal_len` is per step of the Clock node, dividers or not
+            let spb = clock.and_then(|c| nodes[c].clock_spb()).unwrap_or(4.);
+            let sample = chops(&graph.nodes[i]).map_err(|e| bad(&graph.nodes[i].id, e))?;
+            nodes[i].set_chop(sample, spb);
+        }
     }
 
     // ---- knobs ----

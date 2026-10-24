@@ -81,8 +81,35 @@ Signals: inputs default as listed; all outputs `out` unless named.
 | `Kick` `Snare` `Clap` `HatClosed` `HatOpen` `Rim` `Tom` | trig, level (1), tune (0), decay (0) | out | – | synthesized 808/909-style one-shots, retrigger on rising edge |
 | `Pan` | in, pos (0) | left, right | – | equal-power |
 | `Mix4` | in0..in3, g0..g3 (1) | out | – | |
+| `Chop` | clock, trig (0), slice (0), rate (1), level (1) | out | track (path), bar (1), bars (1, 0.25..16), slices (16, ≤ 256), order (text) | a stretch of a library track cut into slices; see below |
 | `AudioOut` | left, right | – | – | the slot's output |
 | `Notes` | – | – | text | comment, ignored |
+
+### `Chop`
+
+`bars` bars of `track` from bar `bar` (bar 1 = the track's first downbeat, as in sets, on its
+analyzed grid with any `DjGridScale` correction), mixed to mono and cut into `slices` equal
+slices. The track must be analyzed. The audio is cut when the patch compiles (the first time the
+file is decoded up to there, which holds codjd for a moment; then it is cached by track, bar and
+bars) and the audio thread only reads the finished buffer.
+
+- **Tempo**: a slice plays at the patch's tempo: the `Clock` the chop's `clock` input comes from
+  (through `ClockDiv`s), else the deck on air, else the track's own. Like a record sped up to
+  match, the pitch moves with the tempo. `rate` multiplies the speed (0.05..8).
+- **`order`**: one token per step of the clock, counted from a bar start like the sequencers:
+  a slice number, `.` a rest (stops the slice), `-` plays on into the audio after the slice. `|`
+  is ignored (for the eye). At most 64 steps; an order of N steps repeats every N steps.
+- **`trig`/`slice`**: a rising edge of `trig` plays slice `floor(slice) mod slices`; the edge's
+  height is the hit's velocity. Both ways work together.
+- A slice starts from silence with a 2 ms ramp and ends with one, so cuts do not click.
+
+```json
+"1": { "type": "Clock", "params": { "source": "master", "steps_per_beat": 4 } },
+"2": { "type": "Chop", "name": "amen", "ins": { "clock": ["1", "out"] },
+       "params": { "track": "~/Music/jungle/Jungle Classics.flac", "bar": 97, "bars": 2, "slices": 32,
+                   "order": "0 1 2 3 4 5 6 7 | 0 1 2 3 0 1 . 3 | 16 17 18 19 4 - - - | 0 . 0 1 28 29 30 31" } },
+"3": { "type": "AudioOut", "ins": { "left": ["2", "out"], "right": ["2", "out"] } }
+```
 
 ## Engine boundary (Rust)
 

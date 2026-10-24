@@ -1108,3 +1108,64 @@ fn patch_cpu() {
         );
     }
 }
+
+/// A one-bar break at 120 BPM where slice `i` (of 16) is the constant `(i + 1) / 100`, so the
+/// output says which slice plays
+fn ladder() -> std::sync::Arc<super::chop::Sample> {
+    let data: Box<[f32]> = (0..96_000).map(|f| ((f / 6000) + 1) as f32 / 100.).collect();
+    std::sync::Arc::new(super::chop::Sample { data, rate: 48_000, bpm: 120. })
+}
+
+fn chop_patch(order: &str) -> Program {
+    let mut b = B::new();
+    let clock = b.add(NodeKind::Clock, &[], &[t("source", "master"), n("steps_per_beat", 4.)]);
+    let ch = b.add(NodeKind::Chop, &[("clock", from(clock))], &[t("track", "x"), n("slices", 16.), t("order", order)]);
+    b.out_mono(ch);
+    let sample = ladder();
+    super::program::compile_with(&b.build(), 48_000, &|_| Ok(Some(sample.clone()))).unwrap()
+}
+
+#[test]
+fn a_chop_plays_its_order_one_slice_per_step() {
+    // 120 BPM, 4 steps a beat: a step is 6000 frames, as long as a slice
+    let mut p = chop_patch("3 . 15 0");
+    let o = left(&render(&mut p, 48_000, steady(120.)));
+    let mid = |step: usize| o[step * 6000 + 3000];
+    assert!((mid(0) - 0.04).abs() < 1e-3, "slice 3: {}", mid(0));
+    assert!(mid(1).abs() < 1e-3, "a rest: {}", mid(1));
+    assert!((mid(2) - 0.16).abs() < 1e-3, "slice 15: {}", mid(2));
+    assert!((mid(3) - 0.01).abs() < 1e-3, "slice 0: {}", mid(3));
+    // the order repeats every 4 steps
+    assert!((mid(4) - 0.04).abs() < 1e-3, "again slice 3: {}", mid(4));
+    // `-` plays on: slice 3, then the audio after it (slice 4), then a rest
+    let mut p = chop_patch("3 - . .");
+    let o = left(&render(&mut p, 24_000, steady(120.)));
+    assert!((o[9000] - 0.05).abs() < 1e-3, "played on into slice 4: {}", o[9000]);
+    assert!(o[15000].abs() < 1e-3, "then the rest: {}", o[15000]);
+}
+
+#[test]
+fn a_chop_follows_the_tempo_like_a_record_sped_up() {
+    // twice the tempo: a slice plays in half the frames, so the next slice's audio would show
+    // if it did not keep up; each step still hears its own slice
+    let mut p = chop_patch("5 6 7 8");
+    let o = left(&render(&mut p, 24_000, steady(240.)));
+    for (step, want) in [(0, 0.06), (1, 0.07), (2, 0.08), (3, 0.09)] {
+        let v = o[step * 3000 + 1500];
+        assert!((v - want).abs() < 1e-3, "step {step}: {v}");
+    }
+}
+
+#[test]
+fn a_chop_without_audio_is_silent_and_a_bad_order_is_refused() {
+    let mut b = B::new();
+    let ch = b.add(NodeKind::Chop, &[("trig", c(1.))], &[n("slices", 8.)]);
+    b.out_mono(ch);
+    let mut p = compile(&b.build());
+    assert_eq!(peak(&left(&render(&mut p, 4800, stopped()))), 0.);
+    let mut b = B::new();
+    let ch = b.add(NodeKind::Chop, &[], &[n("slices", 8.), t("order", "0 8")]);
+    b.out_mono(ch);
+    let e = super::program::compile(&b.build(), 48_000).err().unwrap();
+    assert!(e.contains("slice 8 out of range"), "{e}");
+}

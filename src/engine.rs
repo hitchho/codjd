@@ -200,6 +200,8 @@ pub struct Engine {
     knobs: [DeckKnobs; crate::audio::DECKS],
     /// what the audio thread has in each patch slot (`rt_patch_*`)
     patch_rt: [PatchMeta; PATCH_SLOTS],
+    /// the audio cut for `Chop` nodes, by (track, bar, bars): a recompile does not decode again
+    pub(crate) chop_cache: crate::patch::engine_host::ChopCache,
     mixer: MixerKnobs,
     hotcues: HotcueStore,
     /// hand corrections of detected tempos (half/double/triplet mistakes)
@@ -264,6 +266,7 @@ impl Engine {
             record_dir: None,
             analyzer: None,
             tracks: None,
+            chop_cache: Default::default(),
             meta: Default::default(),
             knobs: Default::default(),
             patch_rt: Default::default(),
@@ -878,6 +881,11 @@ impl Engine {
     }
 
     /// The saved tempo correction of a track (1 = none)
+    /// The analysis cache, once it has started
+    pub(crate) fn analyzer(&self) -> Option<&Arc<Analyzer>> {
+        self.analyzer.as_ref()
+    }
+
     pub fn grid_factor(&self, path: &Path) -> f64 {
         self.gridfix.factor(path)
     }

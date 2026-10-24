@@ -7,6 +7,7 @@
 use std::f64::consts::PI;
 
 use super::{
+    chop::{self, Chop, Sample},
     drums::{Drum, DrumKind},
     graph::{NodeKind, NodeSpec},
     program::{ClockFeed, DeckClock, KnobRt},
@@ -445,6 +446,7 @@ pub enum Dsp {
     Drum(Box<Drum>),
     Pan(Pan),
     Mix4,
+    Chop(Box<Chop>),
 }
 
 /// Index meaning "this knob node is not exposed"
@@ -545,6 +547,22 @@ impl Dsp {
             K::Tom => Dsp::Drum(Box::new(Drum::new(DrumKind::Tom, s.id.as_str()))),
             K::Pan => Dsp::Pan(Pan { pos: f32::NAN, l: 0.7071, r: 0.7071 }),
             K::Mix4 => Dsp::Mix4,
+            K::Chop => {
+                let slices = num(s, "slices", 16.).round();
+                if !(1. ..=256.).contains(&slices) {
+                    return Err(format!("{}: slices must be 1..256", s.id));
+                }
+                let bars = num(s, "bars", 1.);
+                if !(bars.is_finite() && (0.25..=16.).contains(&bars)) {
+                    return Err(format!("{}: bars must be 0.25..16", s.id));
+                }
+                if !num(s, "bar", 1.).is_finite() || num(s, "bar", 1.) < 1. {
+                    return Err(format!("{}: bar counts from 1", s.id));
+                }
+                let order = chop::parse_order(s.text("order").unwrap_or(""), slices as u32).map_err(|e| format!("{}: {e}", s.id))?;
+                // the audio comes later: the compiler's caller cuts it (`program::compile_with`)
+                Dsp::Chop(Box::new(Chop::new(None, slices as u32, order, sr)))
+            }
         })
     }
 
@@ -608,6 +626,7 @@ impl Dsp {
             }
             (Dsp::Seq(n), Dsp::Seq(o)) => n.adopt(o),
             (Dsp::Drum(n), Dsp::Drum(o)) => n.adopt(o),
+            (Dsp::Chop(n), Dsp::Chop(o)) => n.adopt(o),
             _ => {}
         }
     }
@@ -792,6 +811,10 @@ impl Dsp {
                 }
                 v[out] = s;
             }
+            Dsp::Chop(c) => {
+                let (clock, trig, slice, rate, level) = (inp(v, 0), inp(v, 1), inp(v, 2), inp(v, 3), inp(v, 4));
+                v[out] = c.tick(clock, trig, slice, rate, level, env);
+            }
         }
     }
 
@@ -820,7 +843,24 @@ impl Dsp {
                 d.clock = clock;
                 d.up = div.max(1);
             }
+            Dsp::Chop(c) => c.clock = clock,
             _ => {}
+        }
+    }
+
+    /// A `Chop`'s audio and the steps per beat of the `Clock` it hangs off (compiler)
+    pub fn set_chop(&mut self, sample: Option<std::sync::Arc<Sample>>, steps_per_beat: f64) {
+        if let Dsp::Chop(c) = self {
+            c.sample = sample;
+            c.steps_per_beat = steps_per_beat;
+        }
+    }
+
+    /// The steps per beat of a `Clock`
+    pub fn clock_spb(&self) -> Option<f64> {
+        match self {
+            Dsp::Clock(c) => Some(c.spb),
+            _ => None,
         }
     }
 

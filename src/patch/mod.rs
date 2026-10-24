@@ -13,6 +13,7 @@
 //! `nodes`, `drums` and `seq`; `engine_host` implements `host::PatchHost` for the `Engine`.
 
 pub mod actions;
+pub mod chop;
 pub mod doc;
 pub mod drums;
 pub mod engine_host;
