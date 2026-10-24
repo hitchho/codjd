@@ -883,11 +883,13 @@ impl Bus {
         self.ask(|e| e.mixer_info()).await
     }
 
-    /// "internal" (codj mixes: master + headphones) or "external" (deck A and B outputs)
+    /// "internal" (codj mixes: master + headphones), "external" (deck A and B outputs) or
+    /// "split" (codj mixes, one pair of headphones: master left, cue right)
     async fn dj_mode(&self, mode: String) -> String {
         let mode = match mode.as_str() {
             "internal" => crate::audio::Mode::Internal,
             "external" => crate::audio::Mode::External,
+            "split" => crate::audio::Mode::Split,
             other => return format!("unknown mode {other}"),
         };
         reply(self.codjd.call(move |e| Ok(e.set_audio_mode(mode))).await)

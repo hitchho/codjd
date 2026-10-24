@@ -71,12 +71,17 @@ fn main_bus(mode: Mode, b: &Buses) -> (f32, f32) {
     match mode {
         Mode::Internal => b.master,
         Mode::External => b.decks[0],
+        Mode::Split => (mono(b.master), mono(b.cue)),
     }
+}
+
+fn mono((l, r): (f32, f32)) -> f32 {
+    0.5 * (l + r)
 }
 
 fn second_bus(mode: Mode, b: &Buses) -> (f32, f32) {
     match mode {
-        Mode::Internal => b.cue,
+        Mode::Internal | Mode::Split => b.cue,
         Mode::External => b.decks[1],
     }
 }
@@ -213,4 +218,19 @@ pub fn start(
         rate,
         recorder,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_puts_the_master_left_and_the_cue_right() {
+        let b = Buses { master: (0.2, 0.4), cue: (-0.6, 0.0), decks: [(0.9, 0.9), (0.8, 0.8)] };
+        let (l, r) = main_bus(Mode::Split, &b);
+        assert!((l - 0.3).abs() < 1e-6 && (r + 0.3).abs() < 1e-6, "{l} {r}");
+        assert_eq!(main_bus(Mode::Internal, &b), (0.2, 0.4));
+        assert_eq!(main_bus(Mode::External, &b), (0.9, 0.9));
+        assert!(Mode::Split.mixes() && Mode::Internal.mixes() && !Mode::External.mixes());
+    }
 }

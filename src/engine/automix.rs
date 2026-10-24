@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use super::{Engine, Event, Pick, Transport};
 use crate::{
     analysis::Grid,
-    audio::{sync_plan, Mode, DECKS},
+    audio::{sync_plan, DECKS},
     sets::{runtime::Runtime, Env, LibTrack},
 };
 
@@ -409,6 +409,36 @@ impl Engine {
         }
     }
 
+    /// The DJ changed their mind about a transition that is running: it is undone. The old track
+    /// plays on alone with its strip back to neutral (fader up, EQ and filter flat, no loop, its
+    /// own tempo), the new one stops, and the player is back on the old track. The track it was
+    /// mixing into is not mixed into again; it starts when the old one ends.
+    pub(crate) fn automix_rollback(&mut self) -> bool {
+        let Some(m) = self.amix.mix.take_if(|m| m.started) else { return false };
+        self.with_automix(|rt, h| rt.disarm(h));
+        let (from, to) = (m.from, m.to);
+        self.audio.pause(to);
+        self.audio.set_loop(from, 0.);
+        self.neutral_strip(from, true);
+        if !self.audio.deck_states()[from].playing {
+            // an echo-out or a brake had stopped it
+            self.audio.play(from);
+        }
+        self.amix.glide = [false; DECKS];
+        if self.player_deck == to && self.owner[to] == Owner::Player {
+            self.player_deck = from;
+            self.generation = self.deck_gen[from];
+            self.owner[from] = Owner::Player;
+            if let Some(i) = self.meta[from].path.as_deref().and_then(|p| self.playlist_index_of_path(p)) {
+                self.playlist.playing_index = i;
+            }
+            self.emit(Event::MusicPlayed);
+        }
+        self.amix.failed_gen = self.generation;
+        info!(from, to, "the running transition was rolled back");
+        true
+    }
+
     /// The primitive: plans the mix from `from` into `to_path` (loaded on `to` here), and arms it.
     /// `at_end`: the player's place near the end of the track, else the next phrase. Returns the
     /// label, the start bar (None for a crossfade in seconds) and the set text.
@@ -583,7 +613,7 @@ impl Engine {
     fn hook_may_act(&self) -> bool {
         self.amix.on
             && self.transport == Transport::Playing
-            && self.audio.mode() == Mode::Internal
+            && self.audio.mode().mixes()
             && !self.setrt.is_active()
             && !self.setrt.is_armed()
     }

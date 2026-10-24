@@ -256,7 +256,7 @@ impl Engine {
         .map_err(|e| std::io::Error::other(format!("can't open the audio output: {e}")))?;
         let volume = config.volume.clamp(0., 1.);
         apply_volume(&mut audio, 0, volume);
-        let master = if audio.mode() == Mode::Internal { volume as f64 } else { 1. };
+        let master = if audio.mode().mixes() { volume as f64 } else { 1. };
         audio.set_patch_external_out(match config.patches.external_out {
             crate::patch::ExternalOut::A => 0,
             crate::patch::ExternalOut::B => 1,
@@ -1101,6 +1101,7 @@ impl Engine {
             mode: match self.audio.mode() {
                 Mode::Internal => "internal",
                 Mode::External => "external",
+                Mode::Split => "split",
             }
             .to_string(),
             quantize: self.mixer.quantize,
@@ -1116,7 +1117,7 @@ impl Engine {
     /// The player volume goes to the audio thread, and the mixer knob mirror follows
     fn push_volume(&mut self) {
         apply_volume(&mut self.audio, self.player_deck, self.volume);
-        self.mixer.master = if self.audio.mode() == Mode::Internal { self.volume as f64 } else { 1. };
+        self.mixer.master = if self.audio.mode().mixes() { self.volume as f64 } else { 1. };
     }
 
     // ---- sets (docs/dj-api.md, "Set runtime") ----
@@ -1145,8 +1146,10 @@ impl Engine {
 
     pub fn set_disarm(&mut self) {
         self.with_runtime(|rt, h| rt.disarm(h));
-        // also a planned automix or DJ transition that has not started (a running one plays out)
-        self.automix_cancel_pending();
+        // also a planned automix or DJ transition; a running one is rolled back
+        if !self.automix_rollback() {
+            self.automix_cancel_pending();
+        }
     }
 
     pub fn set_auto(&mut self, on: bool) {
@@ -1365,6 +1368,10 @@ impl Engine {
     }
 
     /// Position of a track in the current playlist (a queued one may have been removed since)
+    pub(crate) fn playlist_index_of_path(&self, path: &Path) -> Option<u32> {
+        self.playlist.musics.iter().position(|m| <&Path>::from(&m.path) == path).map(|i| i as u32)
+    }
+
     fn playlist_index_of(&self, music: &Music) -> Option<u32> {
         self.playlist
             .musics
@@ -1732,7 +1739,7 @@ fn log_err(result: std::io::Result<()>) {
 /// (the club mixer has it), so it trims the player's deck
 fn apply_volume(audio: &mut Audio, player_deck: usize, volume: f32) {
     match audio.mode() {
-        Mode::Internal => audio.set_master(volume),
+        Mode::Internal | Mode::Split => audio.set_master(volume),
         Mode::External => audio.set_gain(player_deck, volume),
     }
 }

@@ -46,6 +46,16 @@ pub enum Mode {
     Internal,
     /// codj is only the decks: each deck has its own output, the club mixer mixes
     External,
+    /// codj mixes as in `Internal`, for one pair of headphones: the master in the left ear, the
+    /// cue in the right (each summed to mono), on the main device. Mixing without speakers.
+    Split,
+}
+
+impl Mode {
+    /// codj does the mixing (a master bus and a cue bus)
+    pub fn mixes(self) -> bool {
+        self != Mode::External
+    }
 }
 
 pub enum Cmd {
@@ -2033,7 +2043,7 @@ impl Mixer {
             let (l, r) = (soft_limit(l), soft_limit(r));
             if s.live {
                 match mode {
-                    Mode::Internal => {
+                    Mode::Internal | Mode::Split => {
                         out.master.0 += l * fader;
                         out.master.1 += r * fader;
                     }
