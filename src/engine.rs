@@ -741,7 +741,29 @@ impl Engine {
         self.deck_start(deck)?;
         let pos = self.audio.deck_states()[deck].position;
         self.rec_play(deck, pos);
+        self.adopt_if_alone(deck);
         Ok(())
+    }
+
+    /// A deck started by hand while the player plays nothing becomes the player's: automix mixes
+    /// out of it and autoplay keeps the queue going, so the music does not stop when the track
+    /// ends. Mixing by hand (the player busy on the other deck) or a set running: left alone.
+    fn adopt_if_alone(&mut self, deck: usize) {
+        let player_on_air = self.transport == Transport::Playing
+            && self.player_deck != deck
+            && self.audio.deck_states()[self.player_deck].playing;
+        if !self.amix.on || self.setrt.is_active() || player_on_air || self.owner[deck] == Owner::Player && self.transport == Transport::Playing {
+            return;
+        }
+        self.player_deck = deck;
+        self.owner[deck] = Owner::Player;
+        self.generation = self.deck_gen[deck];
+        self.transport = Transport::Playing;
+        if let Some(i) = self.meta[deck].path.clone().and_then(|p| self.playlist_index_of_path(&p)) {
+            self.playlist.playing_index = i;
+        }
+        info!(deck, "the player follows the deck started by hand");
+        self.emit(Event::MusicPlayed);
     }
 
     /// Starts a deck without telling the recording (the set runtime's own starts)
