@@ -125,6 +125,26 @@ pub async fn carry_on(codjd: &Codjd) {
 
 /// `codjd -r`: asks the running codjd to restart as the installed binary and waits for it to be
 /// back. Ok(false) when none is running (the caller then starts one).
+/// `codjd -q`: stops the running codjd (SIGTERM to the process that owns the bus name, which
+/// shuts down cleanly). False when none was running.
+pub async fn request_quit() -> Result<bool, String> {
+    let conn = zbus::Connection::session().await.map_err(|e| format!("no session bus: {e}"))?;
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await.map_err(|e| e.to_string())?;
+    let name = zbus::names::BusName::try_from(crate::server::BUS_NAME).map_err(|e| e.to_string())?;
+    let Ok(pid) = dbus.get_connection_unix_process_id(name.clone()).await else { return Ok(false) };
+    let ok = std::process::Command::new("kill").arg(pid.to_string()).status().map_err(|e| e.to_string())?.success();
+    if !ok {
+        return Err(format!("could not stop codjd (pid {pid})"));
+    }
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if dbus.get_name_owner(name.clone()).await.is_err() {
+            return Ok(true);
+        }
+    }
+    Err(format!("codjd (pid {pid}) did not stop within 10 s"))
+}
+
 pub async fn request_restart() -> Result<bool, String> {
     let conn = zbus::Connection::session().await.map_err(|e| format!("no session bus: {e}"))?;
     let dbus = zbus::fdo::DBusProxy::new(&conn).await.map_err(|e| e.to_string())?;

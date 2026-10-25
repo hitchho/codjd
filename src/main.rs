@@ -36,6 +36,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().nth(1).as_deref() == Some("fetch-models") {
         std::process::exit(analysis::fetch_models());
     }
+    // `codjd -q`: stop the running codjd (the music stops)
+    if matches!(std::env::args().nth(1).as_deref(), Some("-q" | "--quit" | "quit" | "stop")) {
+        match upgrade::request_quit().await {
+            Ok(true) => eprintln!("codjd stopped"),
+            Ok(false) => eprintln!("codjd was not running"),
+            Err(e) => {
+                eprintln!("codjd: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // `codjd -r`: the running codjd becomes the installed binary and plays on; none running: start
     if matches!(std::env::args().nth(1).as_deref(), Some("-r" | "--restart" | "restart")) {
         match upgrade::request_restart().await {
