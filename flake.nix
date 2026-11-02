@@ -1,6 +1,7 @@
 {
+  description = "codjd - the codj DJ/player daemon";
+
   inputs = {
-    naersk.url = "github:nix-community/naersk/master";
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     utils.url = "github:numtide/flake-utils";
   };
@@ -10,46 +11,59 @@
       self,
       nixpkgs,
       utils,
-      naersk,
     }:
-    utils.lib.eachDefaultSystem (
+    let
+      codjdFor =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "codjd";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+          src = pkgs.lib.cleanSource ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.rustPlatform.bindgenHook # cpal's pipewire backend (libspa-sys)
+          ];
+          buildInputs = [
+            pkgs.alsa-lib
+            pkgs.pipewire
+          ];
+          # tests want a session bus and an audio device
+          doCheck = false;
+          meta = {
+            description = "codjd - the codj DJ/player daemon";
+            homepage = "https://github.com/hitchho/codjd";
+            license = pkgs.lib.licenses.gpl3Plus;
+            mainProgram = "codjd";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
+    in
+    {
+      overlays.default = final: _prev: { codjd = codjdFor final; };
+    }
+    // utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
       let
-        naersk-lib = pkgs.callPackage naersk { };
-        rust_overlay = import (
-          builtins.fetchTarball "https://github.com/oxalica/rust-overlay/archive/master.tar.gz"
-        );
-        pkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
-        rustVersion = "1.86.0";
-        rust = pkgs.rust-bin.stable.${rustVersion}.default.override {
-          extensions = [
-            "rust-src" # for rust-analyzer
-            "rust-analyzer"
-            "rustc"
-            "cargo"
-          ];
-        };
+        pkgs = nixpkgs.legacyPackages.${system};
+        codjd = codjdFor pkgs;
       in
       {
-        defaultPackage = naersk-lib.buildPackage {
-          name = "codjd";
-          src = ./.;
-          buildInputs = with pkgs; [
-            pkg-config
-            alsa-lib
+        packages = {
+          inherit codjd;
+          default = codjd;
+        };
+        apps.default = utils.lib.mkApp { drv = codjd; };
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [ codjd ];
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.rustfmt
+            pkgs.clippy
+            pkgs.rust-analyzer
           ];
         };
-        devShell =
-          with pkgs;
-          mkShell {
-            buildInputs = [
-              rust
-              pkg-config
-              alsa-lib
-              fish
-              bashInteractive
-            ];
-          };
       }
     );
 }
