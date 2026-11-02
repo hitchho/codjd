@@ -1,6 +1,6 @@
 <h1 align="center">codjd</h1>
 
-**codjd** is a music player daemon with built-in [Soulseek](https://www.slsknet.org) search and downloads, written in [Rust](https://www.rust-lang.org) and controlled over [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/#whatisd-bus) (`net.rotko.Codj`). [**codj**](https://github.com/yassinebenarbia/mplayer-client) is its terminal UI, but anything that speaks D-Bus can drive it (see [DOCS.md](./DOCS.md)).
+**codjd** is a music player daemon with built-in [Soulseek](https://www.slsknet.org) search and downloads, written in [Rust](https://www.rust-lang.org) and controlled over [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/#whatisd-bus) (`net.rotko.Codj`). [**codj**](https://github.com/hitchho/codj) is its terminal UI, but anything that speaks D-Bus can drive it (see [DOCS.md](./DOCS.md)).
 
 It is becoming the engine of a keyboard-driven DJ system (two decks, mixer, beat analysis; see [docs/dj-mode.md](./docs/dj-mode.md)). It was called *musad* before; configs in `~/.config/musad` and `~/.config/mplayer-server` and the cache in `~/.cache/musad` are still picked up.
 
@@ -15,6 +15,12 @@ It analyzes the library in the background (tempo, loudness and a timbre/chroma f
 # Usage:
 
 ## Installation
+Arch (AUR): `yay -S codjd` (or `yay -S codj` for the TUI too).
+
+Nix: `nix run github:hitchho/codjd`, or `inputs.codjd.url = "github:hitchho/codjd"` and `codjd.packages.${system}.default` / `codjd.overlays.default`.
+
+Prebuilt x86_64 Linux binaries: [releases](https://github.com/hitchho/codjd/releases).
+
 From this repo, with [cargo](https://doc.rust-lang.org/cargo/):
 ```bash
 cargo install --features "debug" --path .

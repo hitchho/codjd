@@ -9,7 +9,7 @@ version = "0.2.0"
 edition = "2021"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/yassinebenarbia/mplayer-server"
+repository = "https://github.com/hitchho/codjd"
 description = "codjd: music player daemon with built-in Soulseek, controlled over D-Bus"
 keywords = ["music", "daemon", "soulseek", "dbus", "audio"]
 
